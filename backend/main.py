@@ -212,19 +212,20 @@ async def lifespan(app: FastAPI):
     loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=64))
     logger.info("Lineage Explorer starting up — thread pool set to 64 workers, clearing stale caches")
     invalidate_cache()
-    # Pre-fetch serverless list price in background so it's ready for first lineage load
-    from backend.lineage_service import _get_serverless_price, _get_client
+    # Pre-fetch per-entity cost cache in background so first lineage load shows cost.
+    # The aggregation can take a few minutes against busy system.billing — it must
+    # never run on the lineage hot path, only here and via the stale-cache tickler.
+    from backend.lineage_service import _refresh_cost_cache, _get_client
     prefetch_task: asyncio.Task | None = None
-    async def _prefetch_price():
+    async def _prefetch_cost():
         try:
             client = _get_client()
-            await asyncio.to_thread(_get_serverless_price, client)
-            logger.info("Serverless list price pre-fetched at startup")
+            await asyncio.to_thread(_refresh_cost_cache, client)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning(f"Failed to pre-fetch serverless price (will retry on first lineage load): {e}")
-    prefetch_task = asyncio.create_task(_prefetch_price())
+            logger.warning(f"Failed to pre-fetch cost cache (will retry on first lineage load): {e}")
+    prefetch_task = asyncio.create_task(_prefetch_cost())
     try:
         yield
     finally:
@@ -519,9 +520,11 @@ async def api_list_schemas(catalog: str = Query(...)):
 
 
 @app.get("/api/lineage")
-async def api_get_lineage(request: Request, catalog: str = Query(...), schema: str = Query(...), live: bool = Query(False)):
+async def api_get_lineage(request: Request, catalog: str = Query(...), schema: str | None = Query(None), live: bool = Query(False)):
     catalog = _validate_identifier(catalog, "catalog")
-    schema = _validate_identifier(schema, "schema")
+    # schema is optional: omitting it builds catalog-wide lineage across all schemas
+    if schema is not None:
+        schema = _validate_identifier(schema, "schema")
     # Only admins can bypass cache with live mode
     if live:
         _, is_admin = await asyncio.to_thread(_get_user_info, request)
@@ -529,9 +532,13 @@ async def api_get_lineage(request: Request, catalog: str = Query(...), schema: s
             live = False
     try:
         if live:
-            logger.info(f"LIVE MODE: Serving lineage for {catalog}.{schema} direct from system tables")
+            scope = f"{catalog}.{schema}" if schema else f"{catalog} (catalog-wide)"
+            logger.info(f"LIVE MODE: Serving lineage for {scope} direct from system tables")
         return await asyncio.to_thread(get_table_lineage, catalog, schema, live)
     except Exception as e:
+        # Catalog-wide size cap is a client-actionable condition, not a server fault.
+        if "exceeding the" in str(e) and "catalog-wide lineage" in str(e):
+            raise HTTPException(status_code=413, detail=str(e))
         logger.error(f"Error getting lineage: {e}")
         raise HTTPException(status_code=500, detail=_safe_error(e))
 

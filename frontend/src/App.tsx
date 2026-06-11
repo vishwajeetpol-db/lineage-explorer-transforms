@@ -20,6 +20,7 @@ export default function App() {
   const route = useRouter();
   const { addRecent } = useRecents();
   const focusTable = useLineageStore((s) => s.focusTable);
+  const scope = useLineageStore((s) => s.scope);
   const catalog = useLineageStore((s) => s.catalog);
   const schema = useLineageStore((s) => s.schema);
   const liveMode = useLineageStore((s) => s.liveMode);
@@ -66,7 +67,8 @@ export default function App() {
     loadTables();
   }, [loadTables]);
 
-  // Fetch lineage for a catalog/schema. Cancels any in-flight request so quick switches don't race.
+  // Fetch lineage for a catalog/schema. An empty schema fetches catalog-wide
+  // lineage across every schema. Cancels any in-flight request so quick switches don't race.
   const fetchLineage = useCallback(async (cat: string, sch: string) => {
     setLiveMode(useLineageStore.getState().liveMode);
     lineageAbortRef.current?.abort();
@@ -74,7 +76,9 @@ export default function App() {
     lineageAbortRef.current = controller;
     useLineageStore.setState({ loading: true, error: null });
     try {
-      const data = await api.getLineage(cat, sch, controller.signal);
+      const data = sch
+        ? await api.getLineage(cat, sch, controller.signal)
+        : await api.getCatalogLineage(cat, controller.signal);
       if (controller.signal.aborted) return;
       useLineageStore.getState().setLineageData({
         nodes: data.nodes,
@@ -90,29 +94,44 @@ export default function App() {
     }
   }, []);
 
-  // Sync focusTable from route. Handles deep links, back/forward, and any URL-driven nav.
-  const lineageTable = route.view === "lineage" ? route.table : null;
+  // Sync the rendered graph from the route. Handles deep links, back/forward,
+  // table-focused lineage, whole-schema lineage, and whole-catalog lineage.
   useEffect(() => {
-    if (lineageTable) {
-      if (focusTable !== lineageTable) {
-        useLineageStore.getState().setFocusTable(lineageTable);
-        addRecent(lineageTable);
-        const parts = lineageTable.split(".");
+    const store = useLineageStore.getState();
+    if (route.view === "lineage") {
+      if (store.focusTable !== route.table) {
+        store.setFocusTable(route.table);
+        addRecent(route.table);
+        const parts = route.table.split(".");
         fetchLineage(parts[0], parts[1]);
       }
-    } else if (focusTable) {
-      useLineageStore.getState().setFocusTable(null);
+    } else if (route.view === "schemaLineage") {
+      const matches = store.scope === "schema" && !store.focusTable
+        && store.catalog === route.catalog && store.schema === route.schema;
+      if (!matches) {
+        store.enterScopeLineage("schema", route.catalog, route.schema);
+        fetchLineage(route.catalog, route.schema);
+      }
+    } else if (route.view === "catalogLineage") {
+      const matches = store.scope === "catalog" && !store.focusTable
+        && store.catalog === route.catalog;
+      if (!matches) {
+        store.enterScopeLineage("catalog", route.catalog, "");
+        fetchLineage(route.catalog, "");
+      }
+    } else if (store.focusTable) {
+      store.setFocusTable(null);
     }
-  }, [lineageTable, focusTable, addRecent, fetchLineage]);
+  }, [route, focusTable, addRecent, fetchLineage]);
 
-  // Re-fetch lineage when live mode is toggled (if a table is selected)
+  // Re-fetch lineage when live mode is toggled (if a graph is currently loaded)
   const prevLiveMode = useRef(liveMode);
   useEffect(() => {
-    if (prevLiveMode.current !== liveMode && focusTable && catalog && schema) {
+    if (prevLiveMode.current !== liveMode && catalog && (schema || focusTable || scope === "catalog")) {
       fetchLineage(catalog, schema);
     }
     prevLiveMode.current = liveMode;
-  }, [liveMode, focusTable, catalog, schema, fetchLineage]);
+  }, [liveMode, focusTable, catalog, schema, scope, fetchLineage]);
 
   // Navigation handler called by Landing / search / drill-down / etc.
   const handleSelectTable = useCallback((fqdn: string) => {
@@ -140,7 +159,7 @@ export default function App() {
     return <AdminDashboard open={true} onClose={() => window.close()} />;
   }
 
-  if (route.view === "lineage") {
+  if (route.view === "lineage" || route.view === "schemaLineage" || route.view === "catalogLineage") {
     return (
       <>
         <ReactFlowProvider>

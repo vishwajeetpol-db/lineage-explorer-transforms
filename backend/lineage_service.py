@@ -66,6 +66,11 @@ CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "28800"))  # default
 CACHE_MAX_ENTRIES = int(os.environ.get("CACHE_MAX_ENTRIES", "20000"))  # secondary safety valve
 CACHE_MAX_MEMORY_MB = int(os.environ.get("CACHE_MAX_MEMORY_MB", "250"))  # primary limit
 SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")  # max 50s per Databricks API limit (0s or 5-50s)
+# Safety cap for catalog-wide lineage: a catalog with thousands of tables would
+# produce a graph too large to lay out in the browser and too big for the cache.
+# When the in-scope table count exceeds this, we refuse rather than melt the
+# warehouse/browser. Schema-scoped requests are never capped.
+LINEAGE_MAX_NODES = int(os.environ.get("LINEAGE_MAX_NODES", "2500"))
 
 _CACHE_MAX_BYTES = CACHE_MAX_MEMORY_MB * 1024 * 1024
 
@@ -225,43 +230,115 @@ def get_cache_snapshot() -> tuple[list[tuple[str, float, float, int]], int, list
         inflight_keys = [k for k, lock in _keyed_locks.items() if lock.locked()]
     return entries, total_bytes, inflight_keys
 
-# Serverless list price per DBU — cached globally (24h TTL, rarely changes)
-_serverless_price_per_dbu: float = 0.0
-_serverless_price_fetched_at: float = 0.0
-_PRICE_CACHE_TTL = 86400  # 24 hours
+# ---------------------------------------------------------------------------
+# Per-entity cost cache — refreshed in background, read O(1) from the hot path.
+#
+# Cost is computed by JOINing system.billing.usage to system.billing.list_prices
+# on (sku_name, usage_unit, usage_start_time ∈ [price_start_time, price_end_time)),
+# so every serverless SKU is priced correctly across regions and tiers (16+
+# JOBS_SERVERLESS SKUs at $0.20–$0.59/DBU). The single global aggregation can
+# take 1–4 min in busy workspaces, so it runs in the background only — the
+# lineage request reads from a dict and never executes SQL for cost.
+#
+# Job SKU filter: '%JOBS_SERVERLESS%' only. Classic-compute jobs are
+# intentionally excluded — interactive clusters can run many jobs concurrently
+# and attribution rules differ (divide-by-N, percentile, etc.), so we don't
+# guess. DLT pipelines are unfiltered: DLT compute is dedicated per pipeline.
+# ---------------------------------------------------------------------------
+_cost_by_job_id: dict[str, float] = {}
+_cost_by_pipeline_id: dict[str, float] = {}
+_cost_cache_fetched_at: float = 0.0
+_cost_cache_lock = threading.Lock()
+_COST_CACHE_TTL = 3600          # 1 hour — system.billing rolls up daily
+_COST_WINDOW_DAYS = 30          # 30-day cost shown on each entity
+_COST_REFRESH_BUDGET_S = 600    # max time for one background refresh
 
 
-def _get_serverless_price(client) -> float:
-    """Get the current serverless list price per DBU. Cached for 24 hours.
-    Called at startup (background) and on lineage load (non-blocking check)."""
-    global _serverless_price_per_dbu, _serverless_price_fetched_at
-    now = time.time()
-    if _serverless_price_per_dbu > 0 and (now - _serverless_price_fetched_at) < _PRICE_CACHE_TTL:
-        return _serverless_price_per_dbu
+def _execute_sql_long(client: WorkspaceClient, sql: str, max_wait_s: int) -> list[dict]:
+    """Like _execute_sql but polls past the 50s wait_timeout cap of the API.
+    For background refresh of expensive system.billing queries only — never
+    call from the lineage hot path."""
+    warehouse_id = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
+    if not warehouse_id:
+        raise RuntimeError("No SQL warehouse available. Set DATABRICKS_WAREHOUSE_ID.")
+    resp = client.statement_execution.execute_statement(
+        statement=sql, warehouse_id=warehouse_id, wait_timeout="50s",
+    )
+    deadline = time.time() + max_wait_s
+    while resp.status.state in (StatementState.PENDING, StatementState.RUNNING):
+        if time.time() > deadline:
+            raise RuntimeError(f"SQL exceeded {max_wait_s}s budget: statement_id={resp.statement_id}")
+        time.sleep(5)
+        resp = client.statement_execution.get_statement(resp.statement_id)
+    if resp.status.state != StatementState.SUCCEEDED:
+        err = resp.status.error.message if resp.status.error else resp.status.state
+        raise RuntimeError(f"SQL failed: {err}")
+    if not resp.result or not resp.result.data_array:
+        return []
+    columns = [col.name for col in resp.manifest.schema.columns]
+    return [dict(zip(columns, row)) for row in resp.result.data_array]
+
+
+def _refresh_cost_cache(client: WorkspaceClient) -> None:
+    """Refresh per-job and per-pipeline cost dicts from system.billing.
+    Single global aggregation; safe to call from multiple threads (non-blocking
+    lock — concurrent callers no-op rather than queue)."""
+    global _cost_by_job_id, _cost_by_pipeline_id, _cost_cache_fetched_at
+    if not _cost_cache_lock.acquire(blocking=False):
+        return
     try:
-        price_sql = """
-        SELECT pricing.effective_list.default AS price_per_dbu
-        FROM system.billing.list_prices
-        WHERE sku_name LIKE '%JOBS_SERVERLESS%'
-            AND price_end_time IS NULL
-        LIMIT 1
+        job_sql = f"""
+        SELECT u.usage_metadata.job_id AS id,
+               ROUND(SUM(u.usage_quantity * lp.pricing.effective_list.default), 2) AS cost_usd
+        FROM system.billing.usage u
+        JOIN system.billing.list_prices lp
+          ON u.sku_name = lp.sku_name
+         AND u.usage_unit = lp.usage_unit
+         AND u.usage_start_time >= lp.price_start_time
+         AND (lp.price_end_time IS NULL OR u.usage_start_time < lp.price_end_time)
+        WHERE u.usage_metadata.job_id IS NOT NULL
+          AND u.sku_name LIKE '%JOBS_SERVERLESS%'
+          AND u.usage_date > current_date() - INTERVAL {_COST_WINDOW_DAYS} DAYS
+        GROUP BY u.usage_metadata.job_id
         """
-        rows = _execute_sql(client, price_sql)
-        if rows:
-            _serverless_price_per_dbu = float(rows[0]["price_per_dbu"])
-            _serverless_price_fetched_at = now
-            logger.info(f"Serverless list price: ${_serverless_price_per_dbu}/DBU (cached for 24h)")
-    except Exception as e:
-        logger.warning(f"list_prices query failed — serverless cost will not be shown: {e}")
-    return _serverless_price_per_dbu
-
-
-def _get_serverless_price_cached() -> float:
-    """Non-blocking: return cached price or 0 if not yet fetched.
-    Never blocks the lineage request — cost shows on next load after price is cached."""
-    if _serverless_price_per_dbu > 0 and (time.time() - _serverless_price_fetched_at) < _PRICE_CACHE_TTL:
-        return _serverless_price_per_dbu
-    return 0.0
+        pipeline_sql = f"""
+        SELECT u.usage_metadata.dlt_pipeline_id AS id,
+               ROUND(SUM(u.usage_quantity * lp.pricing.effective_list.default), 2) AS cost_usd
+        FROM system.billing.usage u
+        JOIN system.billing.list_prices lp
+          ON u.sku_name = lp.sku_name
+         AND u.usage_unit = lp.usage_unit
+         AND u.usage_start_time >= lp.price_start_time
+         AND (lp.price_end_time IS NULL OR u.usage_start_time < lp.price_end_time)
+        WHERE u.usage_metadata.dlt_pipeline_id IS NOT NULL
+          AND u.usage_date > current_date() - INTERVAL {_COST_WINDOW_DAYS} DAYS
+        GROUP BY u.usage_metadata.dlt_pipeline_id
+        """
+        try:
+            jobs = {
+                str(r["id"]): float(r["cost_usd"])
+                for r in _execute_sql_long(client, job_sql, _COST_REFRESH_BUDGET_S)
+            }
+        except Exception as e:
+            logger.warning(f"Job cost refresh failed (need SELECT on system.billing): {e}")
+            return
+        try:
+            pipes = {
+                str(r["id"]): float(r["cost_usd"])
+                for r in _execute_sql_long(client, pipeline_sql, _COST_REFRESH_BUDGET_S)
+            }
+        except Exception as e:
+            logger.warning(f"Pipeline cost refresh failed: {e}")
+            return
+        _cost_by_job_id = jobs
+        _cost_by_pipeline_id = pipes
+        _cost_cache_fetched_at = time.time()
+        logger.info(
+            f"Cost cache refreshed: {len(jobs)} jobs (serverless), "
+            f"{len(pipes)} pipelines, {_COST_WINDOW_DAYS}d window"
+        )
+    finally:
+        _cost_cache_lock.release()
 
 
 def _execute_sql(client: WorkspaceClient, sql: str, catalog: str = None) -> list[dict]:
@@ -424,8 +501,11 @@ def _wrap_with_cache_metadata(
     return result.model_copy(update=updates) if updates else result
 
 
-def get_table_lineage(catalog: str, schema: str, skip_cache: bool = False) -> LineageResponse:
-    cache_key = f"lineage:{catalog}.{schema}"
+def get_table_lineage(catalog: str, schema: str | None = None, skip_cache: bool = False) -> LineageResponse:
+    """Build a lineage graph for one schema, or for an entire catalog when
+    schema is None. Catalog-wide graphs span every accessible schema in the
+    catalog and can be large — see LINEAGE_MAX_NODES for the safety cap."""
+    cache_key = f"lineage:{catalog}.{schema}" if schema else f"lineage:{catalog}"
 
     if not skip_cache:
         cached = _cache_get(cache_key)
@@ -483,14 +563,27 @@ def _parse_lineage_ref(table_full_name: str | None, path: str | None, ref_type: 
     return None, None
 
 
-def _fetch_table_lineage(catalog: str, schema: str, cache_key: str) -> LineageResponse:
-    """Actual DBSQL fetch — called by at most one thread per cache key at a time."""
-    client = _get_client()
-    full_schema = f"{catalog}.{schema}"
+def _fetch_table_lineage(catalog: str, schema: str | None, cache_key: str) -> LineageResponse:
+    """Actual DBSQL fetch — called by at most one thread per cache key at a time.
 
-    # Get all tables/views in the schema
+    When schema is None the graph spans the entire catalog (every accessible
+    schema). Catalog-wide tables can collide on bare table_name across schemas,
+    so columns and lookups are keyed by (schema, table_name), never table_name
+    alone.
+    """
+    client = _get_client()
+
+    # Schema predicate shared by the tables + columns queries. Catalog-wide
+    # excludes the noise schemas; schema-scoped pins to the one schema.
+    if schema is not None:
+        schema_filter = f"table_schema = '{schema}'"
+    else:
+        schema_filter = "table_schema NOT IN ('information_schema', 'default')"
+
+    # Get all tables/views in scope
     tables_sql = f"""
     SELECT
+        table_schema,
         table_name,
         table_type,
         table_owner,
@@ -498,48 +591,78 @@ def _fetch_table_lineage(catalog: str, schema: str, cache_key: str) -> LineageRe
         created,
         last_altered
     FROM `{catalog}`.information_schema.tables
-    WHERE table_schema = '{schema}'
-    ORDER BY table_name
+    WHERE {schema_filter}
+    ORDER BY table_schema, table_name
     """
     table_rows = _execute_sql(client, tables_sql, catalog=catalog)
 
-    # Get columns for all tables
+    # Guard: refuse catalog-wide graphs that are too large to lay out / cache.
+    if schema is None and len(table_rows) > LINEAGE_MAX_NODES:
+        raise RuntimeError(
+            f"Catalog '{catalog}' has {len(table_rows)} tables, exceeding the "
+            f"{LINEAGE_MAX_NODES}-table limit for catalog-wide lineage. "
+            f"Explore by schema instead."
+        )
+
+    # Get columns for all tables in scope
     columns_sql = f"""
     SELECT
+        table_schema,
         table_name,
         column_name,
         data_type,
         is_nullable,
         ordinal_position
     FROM `{catalog}`.information_schema.columns
-    WHERE table_schema = '{schema}'
-    ORDER BY table_name, ordinal_position
+    WHERE {schema_filter}
+    ORDER BY table_schema, table_name, ordinal_position
     """
     column_rows = _execute_sql(client, columns_sql, catalog=catalog)
 
-    # Group columns by table
-    columns_by_table: dict[str, list[dict]] = {}
+    # Group columns by (schema, table_name) — bare table_name collides across
+    # schemas in catalog-wide mode.
+    columns_by_table: dict[tuple[str, str], list[dict]] = {}
     for col in column_rows:
-        tname = col["table_name"]
-        if tname not in columns_by_table:
-            columns_by_table[tname] = []
-        columns_by_table[tname].append({
+        key = (col["table_schema"], col["table_name"])
+        if key not in columns_by_table:
+            columns_by_table[key] = []
+        columns_by_table[key].append({
             "name": col["column_name"],
             "type": col["data_type"],
             "nullable": col["is_nullable"] == "YES",
         })
 
     # Cache columns separately for the lazy /api/columns endpoint
-    for tname, cols in columns_by_table.items():
-        _cache_set(f"columns:{catalog}.{schema}.{tname}", cols)
+    for (sch, tname), cols in columns_by_table.items():
+        _cache_set(f"columns:{catalog}.{sch}.{tname}", cols)
 
-    # Pre-build schema_tables set for lineage filtering
+    # Pre-build in-scope tables set for lineage filtering
     schema_tables = set()
     for t in table_rows:
-        schema_tables.add(f"{catalog}.{schema}.{t['table_name']}")
+        schema_tables.add(f"{catalog}.{t['table_schema']}.{t['table_name']}")
 
     # Get lineage edges from system tables (with entity info for pipeline nodes).
     # Includes PATH entries (volumes, cloud storage) alongside table references.
+    if schema is not None:
+        lineage_scope_filter = f"""
+        (target_table_catalog = '{catalog}' AND target_table_schema = '{schema}')
+        OR
+        (source_table_catalog = '{catalog}' AND source_table_schema = '{schema}')
+        OR
+        (source_path LIKE '/Volumes/{catalog}/{schema}/%')
+        OR
+        (target_path LIKE '/Volumes/{catalog}/{schema}/%')
+        """
+    else:
+        lineage_scope_filter = f"""
+        (target_table_catalog = '{catalog}')
+        OR
+        (source_table_catalog = '{catalog}')
+        OR
+        (source_path LIKE '/Volumes/{catalog}/%')
+        OR
+        (target_path LIKE '/Volumes/{catalog}/%')
+        """
     lineage_sql = f"""
     SELECT
         source_table_full_name,
@@ -554,13 +677,7 @@ def _fetch_table_lineage(catalog: str, schema: str, cache_key: str) -> LineageRe
         created_by
     FROM system.access.table_lineage
     WHERE (
-        (target_table_catalog = '{catalog}' AND target_table_schema = '{schema}')
-        OR
-        (source_table_catalog = '{catalog}' AND source_table_schema = '{schema}')
-        OR
-        (source_path LIKE '/Volumes/{catalog}/{schema}/%')
-        OR
-        (target_path LIKE '/Volumes/{catalog}/{schema}/%')
+        {lineage_scope_filter}
     )
     AND event_time > current_date() - INTERVAL 90 DAYS
     """
@@ -573,7 +690,8 @@ def _fetch_table_lineage(catalog: str, schema: str, cache_key: str) -> LineageRe
     # Build table node map
     nodes_map: dict[str, TableNode | EntityNode] = {}
     for t in table_rows:
-        table_id = f"{catalog}.{schema}.{t['table_name']}"
+        sch = t["table_schema"]
+        table_id = f"{catalog}.{sch}.{t['table_name']}"
         nodes_map[table_id] = TableNode(
             id=table_id,
             name=t["table_name"],
@@ -581,7 +699,7 @@ def _fetch_table_lineage(catalog: str, schema: str, cache_key: str) -> LineageRe
             table_type=t["table_type"] or "TABLE",
             owner=t.get("table_owner"),
             comment=t.get("comment"),
-            columns=columns_by_table.get(t["table_name"], []),
+            columns=columns_by_table.get((sch, t["table_name"]), []),
             created_at=t.get("created"),
             updated_at=t.get("last_altered"),
         )
@@ -818,70 +936,26 @@ def _fetch_table_lineage(catalog: str, schema: str, cache_key: str) -> LineageRe
             owner=info["owner"],
         )
 
-    # Fetch compute costs from system.billing (30-day window).
-    # Covers both JOB entities (usage_metadata.job_id) and PIPELINE entities
-    # (usage_metadata.dlt_pipeline_id). Classic compute is excluded by SKU filter.
-    # Cost = DBUs * list price per DBU (per official Databricks docs).
-    #   https://docs.databricks.com/aws/en/admin/usage/system-tables
-    #
-    # Performance: list price is cached globally (24h TTL) and pre-fetched
-    # at startup. Use the non-blocking accessor here so the hot lineage path
-    # never stalls on a cold price cache; cost simply renders on the next
-    # load after the background prefetch completes.
-    price_per_dbu = _get_serverless_price_cached()
+    # Annotate JOB and PIPELINE nodes with cost from the pre-aggregated cache.
+    # See _refresh_cost_cache — no SQL on this hot path. Classic-compute jobs
+    # are intentionally unpriced (shared-cluster attribution is ambiguous).
+    for entity_key, info in entity_map.items():
+        if info["type"] == "JOB":
+            c = _cost_by_job_id.get(info["id"])
+        elif info["type"] == "PIPELINE":
+            c = _cost_by_pipeline_id.get(info["id"])
+        else:
+            continue
+        if c is not None:
+            nodes_map[entity_key].cost_usd = c
 
-    # Job costs (serverless)
-    job_ids = [info["id"] for info in entity_map.values() if info["type"] == "JOB"]
-    if job_ids and price_per_dbu > 0:
-        job_id_list = ",".join(f"'{jid}'" for jid in job_ids)
-        dbu_sql = f"""
-        SELECT
-            usage_metadata.job_id AS job_id,
-            SUM(usage_quantity) AS total_dbu
-        FROM system.billing.usage
-        WHERE sku_name LIKE '%SERVERLESS%'
-            AND usage_metadata.job_id IN ({job_id_list})
-            AND usage_date > current_date() - INTERVAL 30 DAYS
-        GROUP BY usage_metadata.job_id
-        """
-        try:
-            dbu_rows = _execute_sql(client, dbu_sql)
-            cost_by_job: dict[str, float] = {}
-            for cr in dbu_rows:
-                dbu = float(cr["total_dbu"])
-                cost_by_job[str(cr["job_id"])] = round(dbu * price_per_dbu, 2)
-
-            for entity_key, info in entity_map.items():
-                if info["type"] == "JOB" and info["id"] in cost_by_job:
-                    nodes_map[entity_key].cost_usd = cost_by_job[info["id"]]
-        except Exception as e:
-            logger.warning(f"Serverless job cost query failed (ensure SELECT on system.billing is granted): {e}")
-
-    # Pipeline (DLT) costs — uses usage_metadata.dlt_pipeline_id
-    pipeline_ids = [info["id"] for info in entity_map.values() if info["type"] == "PIPELINE"]
-    if pipeline_ids and price_per_dbu > 0:
-        pipeline_id_list = ",".join(f"'{pid}'" for pid in pipeline_ids)
-        dlt_dbu_sql = f"""
-        SELECT
-            usage_metadata.dlt_pipeline_id AS pipeline_id,
-            SUM(usage_quantity) AS total_dbu
-        FROM system.billing.usage
-        WHERE usage_metadata.dlt_pipeline_id IN ({pipeline_id_list})
-            AND usage_date > current_date() - INTERVAL 30 DAYS
-        GROUP BY usage_metadata.dlt_pipeline_id
-        """
-        try:
-            dlt_rows = _execute_sql(client, dlt_dbu_sql)
-            cost_by_pipeline: dict[str, float] = {}
-            for cr in dlt_rows:
-                dbu = float(cr["total_dbu"])
-                cost_by_pipeline[str(cr["pipeline_id"])] = round(dbu * price_per_dbu, 2)
-
-            for entity_key, info in entity_map.items():
-                if info["type"] == "PIPELINE" and info["id"] in cost_by_pipeline:
-                    nodes_map[entity_key].cost_usd = cost_by_pipeline[info["id"]]
-        except Exception as e:
-            logger.warning(f"DLT pipeline cost query failed (ensure SELECT on system.billing is granted): {e}")
+    # If the cost cache is stale and no refresh is in flight, kick one off in
+    # the background so the *next* lineage load reflects current cost. Never
+    # blocks the current response.
+    if (time.time() - _cost_cache_fetched_at) >= _COST_CACHE_TTL:
+        threading.Thread(
+            target=_refresh_cost_cache, args=(client,), daemon=True,
+        ).start()
 
     # Build edges: routed through entity nodes + direct edges
     edge_set: set[tuple[str, str]] = set()

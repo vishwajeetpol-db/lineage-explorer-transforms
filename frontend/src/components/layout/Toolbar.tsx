@@ -1,9 +1,10 @@
 import { memo, useCallback, useEffect, useState, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { GitBranch, Search, ChevronDown, Columns3, Zap, Info, Lock, AlertTriangle, ArrowLeft, Percent } from "lucide-react";
+import { GitBranch, Search, ChevronDown, Columns3, Zap, Info, Lock, AlertTriangle, ArrowLeft, Percent, FolderTree, Layers, Download } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
 import { api, setLiveMode } from "../../api/client";
-import { goLanding } from "../../hooks/useRouter";
+import { goLanding, goSchemas, goCatalogs } from "../../hooks/useRouter";
+import { exportLineageToExcel } from "../../lib/exportLineage";
 import HeaderMenu from "./HeaderMenu";
 
 interface Props {
@@ -12,7 +13,7 @@ interface Props {
 
 function Toolbar({ onGenerate }: Props) {
   const {
-    catalog, schema, focusTable, lineageView, lineageDepth, columnLineageEnabled, liveMode, isAdmin,
+    catalog, schema, focusTable, scope, lineageView, lineageDepth, columnLineageEnabled, liveMode, isAdmin,
     catalogs, schemas, loading, cached, cachedAt, cacheExpiresAt, fetchDurationMs,
     setCatalog, setSchema, setFocusTable, setLineageView, setLineageDepth, setColumnLineageEnabled, setLiveMode: setStoreLiveMode,
     setCatalogs, setSchemas, setSearchOpen, discountPercent, setDiscountPercent,
@@ -21,6 +22,11 @@ function Toolbar({ onGenerate }: Props) {
   const nodes = useLineageStore((s) => s.nodes);
   const [toast, setToast] = useState<string | null>(null);
   const orphanCount = useMemo(() => nodes.filter((n) => n.node_type === "table" && n.lineage_status === "orphan").length, [nodes]);
+
+  // Whole-schema / whole-catalog lineage: no focused table, but a scope is active.
+  const isScopeLineage = !focusTable && (scope === "schema" || scope === "catalog");
+  // Column lineage is per-schema; catalog-wide scope has no single schema to trace.
+  const columnsDisabled = lineageView === "pipeline" || (isScopeLineage && scope === "catalog");
 
   const handleLiveModeToggle = useCallback(() => {
     if (!isAdmin) {
@@ -62,6 +68,29 @@ function Toolbar({ onGenerate }: Props) {
   const handleGenerate = useCallback(() => {
     if (catalog && schema) onGenerate();
   }, [catalog, schema, onGenerate]);
+
+  // Export the currently rendered graph to a multi-sheet .xlsx (client-side).
+  const handleExport = useCallback(() => {
+    const s = useLineageStore.getState();
+    if (!s.nodes.length) {
+      setToast("Nothing to export yet — generate a lineage graph first.");
+      return;
+    }
+    try {
+      exportLineageToExcel({
+        nodes: s.nodes,
+        edges: s.edges,
+        columnEdges: s.columnEdges,
+        scope: s.scope,
+        catalog: s.catalog,
+        schema: s.schema,
+        focusTable: s.focusTable,
+      });
+    } catch (e) {
+      console.error("Export failed:", e);
+      setToast("Export failed — see console for details.");
+    }
+  }, []);
 
   return (
     <>
@@ -112,6 +141,26 @@ function Toolbar({ onGenerate }: Props) {
           <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-accent/[0.06] border border-accent/20">
             <div className="w-1.5 h-1.5 rounded-full bg-accent shadow-[0_0_6px] shadow-accent/40" />
             <span className="font-mono text-[12px] text-accent-light tracking-tight">{focusTable}</span>
+          </div>
+        </>
+      ) : isScopeLineage ? (
+        <>
+          <button
+            onClick={() => (scope === "catalog" ? goCatalogs() : goSchemas(catalog))}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] border border-white/[0.06] hover:border-white/[0.12] transition-all duration-200 group"
+            title="Back to browse"
+          >
+            <ArrowLeft size={13} className="text-slate-500 group-hover:text-slate-300 transition-colors" />
+            <span className="text-[11px] text-slate-500 group-hover:text-slate-300 font-medium transition-colors">Back</span>
+          </button>
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-accent/[0.06] border border-accent/20">
+            {scope === "catalog" ? <FolderTree size={13} className="text-accent-light" /> : <Layers size={13} className="text-accent-light" />}
+            <span className="text-[9px] font-semibold uppercase tracking-wider text-accent-light/70">
+              {scope === "catalog" ? "Catalog" : "Schema"}
+            </span>
+            <span className="font-mono text-[12px] text-accent-light tracking-tight">
+              {scope === "catalog" ? catalog : `${catalog}.${schema}`}
+            </span>
           </div>
         </>
       ) : (
@@ -201,17 +250,17 @@ function Toolbar({ onGenerate }: Props) {
         </div>
       )}
 
-      {/* Column Lineage — disabled in pipeline-only mode */}
-      <div className={`flex items-center gap-2.5 px-3 py-1.5 rounded-lg bg-white/[0.02] border border-white/[0.04] ${lineageView === "pipeline" ? "opacity-30 pointer-events-none" : ""}`}>
+      {/* Column Lineage — disabled in pipeline-only mode and catalog-wide scope */}
+      <div className={`flex items-center gap-2.5 px-3 py-1.5 rounded-lg bg-white/[0.02] border border-white/[0.04] ${columnsDisabled ? "opacity-30 pointer-events-none" : ""}`}>
         <Columns3 size={13} className="text-slate-500" />
         <span className="text-[11px] text-slate-500 font-medium">Columns</span>
         <button
-          onClick={() => lineageView !== "pipeline" && setColumnLineageEnabled(!columnLineageEnabled)}
-          disabled={lineageView === "pipeline"}
+          onClick={() => !columnsDisabled && setColumnLineageEnabled(!columnLineageEnabled)}
+          disabled={columnsDisabled}
           className={`
             relative w-8 h-[18px] rounded-full transition-all duration-300
-            ${lineageView === "pipeline" ? "cursor-not-allowed" : ""}
-            ${columnLineageEnabled && lineageView !== "pipeline"
+            ${columnsDisabled ? "cursor-not-allowed" : ""}
+            ${columnLineageEnabled && !columnsDisabled
               ? "bg-gradient-to-r from-accent to-purple-500 shadow-[0_0_10px_rgba(99,102,241,0.3)]"
               : "bg-white/[0.06]"
             }
@@ -253,8 +302,8 @@ function Toolbar({ onGenerate }: Props) {
         </button>
       </div>
 
-      {/* Generate — only shown when using catalog/schema dropdowns (no focusTable) */}
-      {!focusTable && (
+      {/* Generate — only shown when using catalog/schema dropdowns (no focusTable, no active scope) */}
+      {!focusTable && !isScopeLineage && (
         <button
           onClick={handleGenerate}
           disabled={!catalog || !schema || loading}
@@ -281,6 +330,18 @@ function Toolbar({ onGenerate }: Props) {
 
       {/* Spacer */}
       <div className="flex-1" />
+
+      {/* Export to Excel — only when a graph is loaded */}
+      {nodes.length > 0 && (
+        <button
+          onClick={handleExport}
+          className="flex items-center gap-1.5 px-3 py-1.5 flex-shrink-0 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/25 text-emerald-300 hover:text-emerald-200 text-[11px] font-medium transition-all duration-200"
+          title="Export this lineage to an Excel file"
+        >
+          <Download size={13} />
+          Export
+        </button>
+      )}
 
       {/* Search — compact icon button */}
       <button

@@ -1,8 +1,8 @@
 import { memo, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import { Search, Layers, ChevronRight } from "lucide-react";
+import { Search, Layers, ChevronRight, GitBranch, FolderTree } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
-import { goTables } from "../../hooks/useRouter";
+import { goTables, goSchemaLineage, goCatalogLineage } from "../../hooks/useRouter";
 import Breadcrumb from "./Breadcrumb";
 import PageShell from "./PageShell";
 
@@ -65,15 +65,25 @@ function SchemaListView({ catalog }: Props) {
           </h2>
         </div>
 
-        <div className="relative w-72">
-          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
-          <input
-            type="text"
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            placeholder="Filter schemas..."
-            className="w-full pl-9 pr-3 py-2 bg-surface-50/80 border border-white/[0.06] rounded-lg text-[13px] text-slate-200 placeholder:text-slate-600 outline-none focus:border-accent/40 transition-colors font-mono"
-          />
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => goCatalogLineage(catalog)}
+            className="flex items-center gap-2 px-3.5 py-2 rounded-lg bg-accent/10 hover:bg-accent/20 border border-accent/25 text-accent-light text-[12px] font-medium transition-all duration-200 whitespace-nowrap"
+            title="Visualize lineage for every table in this catalog"
+          >
+            <FolderTree size={14} />
+            View catalog lineage
+          </button>
+          <div className="relative w-72">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+            <input
+              type="text"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="Filter schemas..."
+              className="w-full pl-9 pr-3 py-2 bg-surface-50/80 border border-white/[0.06] rounded-lg text-[13px] text-slate-200 placeholder:text-slate-600 outline-none focus:border-accent/40 transition-colors font-mono"
+            />
+          </div>
         </div>
       </div>
 
@@ -90,26 +100,38 @@ function SchemaListView({ catalog }: Props) {
           {filtered.map((s, i) => {
             const style = s.medallion ? MEDALLION_STYLES[s.medallion] : null;
             return (
-              <motion.button
+              <motion.div
                 key={s.schema}
                 initial={{ opacity: 0, x: -4 }}
                 animate={{ opacity: 1, x: 0 }}
                 transition={{ delay: Math.min(i * 0.015, 0.1) }}
-                onClick={() => goTables(catalog, s.schema)}
-                className="group w-full flex items-center gap-4 px-5 py-4 bg-surface-50/60 hover:bg-surface-50/90 border border-white/[0.06] hover:border-accent/30 rounded-xl transition-all duration-200"
+                className="group flex items-center gap-2 pl-5 pr-3 py-4 bg-surface-50/60 hover:bg-surface-50/90 border border-white/[0.06] hover:border-accent/30 rounded-xl transition-all duration-200"
               >
-                <Layers size={16} className={style?.icon ?? "text-slate-500"} />
-                <span className="font-mono text-[14px] text-slate-200 font-medium">{s.schema}</span>
-                {style && (
-                  <span className={`text-[9px] font-medium tracking-wider uppercase px-1.5 py-0.5 rounded border ${style.badge}`}>
-                    {s.medallion}
+                <button
+                  onClick={() => goTables(catalog, s.schema)}
+                  className="flex items-center gap-4 flex-1 min-w-0 text-left"
+                  title="Browse tables"
+                >
+                  <Layers size={16} className={style?.icon ?? "text-slate-500"} />
+                  <span className="font-mono text-[14px] text-slate-200 font-medium truncate">{s.schema}</span>
+                  {style && (
+                    <span className={`text-[9px] font-medium tracking-wider uppercase px-1.5 py-0.5 rounded border ${style.badge}`}>
+                      {s.medallion}
+                    </span>
+                  )}
+                  <span className="ml-auto text-[12px] text-slate-500 font-mono whitespace-nowrap">
+                    {s.tableCount.toLocaleString()} table{s.tableCount !== 1 && "s"}
                   </span>
-                )}
-                <span className="ml-auto text-[12px] text-slate-500 font-mono">
-                  {s.tableCount.toLocaleString()} table{s.tableCount !== 1 && "s"}
-                </span>
-                <ChevronRight size={14} className="text-slate-600 group-hover:text-accent-light transition-colors" />
-              </motion.button>
+                </button>
+                <button
+                  onClick={() => goSchemaLineage(catalog, s.schema)}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/[0.03] hover:bg-accent/15 border border-white/[0.06] hover:border-accent/30 text-slate-400 hover:text-accent-light text-[11px] font-medium transition-all duration-200 whitespace-nowrap flex-shrink-0"
+                  title="Visualize lineage for every table in this schema"
+                >
+                  <GitBranch size={12} />
+                  Lineage
+                </button>
+              </motion.div>
             );
           })}
         </div>

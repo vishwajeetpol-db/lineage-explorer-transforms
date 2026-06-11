@@ -301,21 +301,26 @@ function LineageCanvas() {
   // runs client-side on real UC column edges — not name-matching heuristics.
   const [schemaColEdges, setSchemaColEdges] = useState<{ source_table: string; source_column: string; target_table: string; target_column: string }[]>([]);
 
-  // Fetch all column edges for the schema when column mode is enabled
+  // Fetch all column edges for the schema when column mode is enabled.
+  // Works for a focused table and for whole-schema scope (derives catalog/schema
+  // from the store). Catalog-wide scope has no single schema, so it's skipped.
+  const storeCatalog = useLineageStore((s) => s.catalog);
+  const storeSchema = useLineageStore((s) => s.schema);
+  const scope = useLineageStore((s) => s.scope);
   useEffect(() => {
-    if (!columnLineageEnabled || !focusTable) {
+    const cat = focusTable ? focusTable.split(".")[0] : storeCatalog;
+    const sch = focusTable ? focusTable.split(".")[1] : storeSchema;
+    if (!columnLineageEnabled || scope === "catalog" || !cat || !sch) {
       setSchemaColEdges([]);
       return;
     }
-    const parts = focusTable.split(".");
-    if (parts.length !== 3) return;
 
     let cancelled = false;
-    api.getSchemaColumnLineage(parts[0], parts[1])
+    api.getSchemaColumnLineage(cat, sch)
       .then((resp) => { if (!cancelled) setSchemaColEdges(resp.edges); })
       .catch(() => { if (!cancelled) setSchemaColEdges([]); });
     return () => { cancelled = true; };
-  }, [columnLineageEnabled, focusTable]);
+  }, [columnLineageEnabled, focusTable, storeCatalog, storeSchema, scope]);
 
   // Build adjacency maps for O(1) column lineage traversal (computed once when edges change)
   const colAdjacency = useMemo(() => {

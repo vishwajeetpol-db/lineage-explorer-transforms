@@ -1,9 +1,14 @@
 import { create } from "zustand";
 import type { GraphNode, LineageEdge, ColumnLineageEdge, TableSearchItem } from "../api/client";
 
+export type LineageScope = "table" | "schema" | "catalog";
+
 interface LineageState {
   // Table-focused landing
   focusTable: string | null; // FQDN of selected table
+  // Scope of the currently rendered graph. "table" = focused on focusTable's
+  // lineage path; "schema" = whole schema; "catalog" = whole catalog.
+  scope: LineageScope;
   allTables: TableSearchItem[];
   allTablesLoading: boolean;
 
@@ -43,6 +48,9 @@ interface LineageState {
 
   // Actions
   setFocusTable: (fqdn: string | null) => void;
+  // Enter a non-table scope (whole schema or whole catalog). Clears focusTable
+  // and the current graph so the canvas renders the full unfiltered graph.
+  enterScopeLineage: (scope: "schema" | "catalog", catalog: string, schema: string) => void;
   setAllTables: (tables: TableSearchItem[]) => void;
   setAllTablesLoading: (loading: boolean) => void;
   setCatalog: (catalog: string) => void;
@@ -78,6 +86,7 @@ interface LineageState {
 
 export const useLineageStore = create<LineageState>((set) => ({
   focusTable: null,
+  scope: "table",
   allTables: [],
   allTablesLoading: false,
   catalog: "",
@@ -109,12 +118,29 @@ export const useLineageStore = create<LineageState>((set) => ({
 
   setFocusTable: (fqdn) => {
     if (!fqdn) {
-      set({ focusTable: null, catalog: "", schema: "", nodes: [], edges: [], columnEdges: [], expandedNodes: new Set(), selectedNode: null, selectedColumn: null, cached: false, cachedAt: null, cacheExpiresAt: null, fetchDurationMs: null });
+      set({ focusTable: null, scope: "table", catalog: "", schema: "", nodes: [], edges: [], columnEdges: [], expandedNodes: new Set(), selectedNode: null, selectedColumn: null, cached: false, cachedAt: null, cacheExpiresAt: null, fetchDurationMs: null });
     } else {
       const parts = fqdn.split(".");
-      set({ focusTable: fqdn, catalog: parts[0], schema: parts[1] });
+      set({ focusTable: fqdn, scope: "table", catalog: parts[0], schema: parts[1] });
     }
   },
+  enterScopeLineage: (scope, catalog, schema) =>
+    set({
+      scope,
+      focusTable: null,
+      catalog,
+      schema,
+      nodes: [],
+      edges: [],
+      columnEdges: [],
+      expandedNodes: new Set(),
+      selectedNode: null,
+      selectedColumn: null,
+      cached: false,
+      cachedAt: null,
+      cacheExpiresAt: null,
+      fetchDurationMs: null,
+    }),
   setAllTables: (tables) => set({ allTables: tables, allTablesLoading: false }),
   setAllTablesLoading: (loading) => set({ allTablesLoading: loading }),
   setCatalog: (catalog) => set({ catalog, schema: "", schemas: [], nodes: [], edges: [], columnEdges: [], expandedNodes: new Set(), selectedNode: null, selectedColumn: null, cached: false, cachedAt: null, cacheExpiresAt: null, fetchDurationMs: null }),

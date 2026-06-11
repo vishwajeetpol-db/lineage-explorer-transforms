@@ -111,6 +111,13 @@ export const api = {
       signal,
     ),
 
+  // Catalog-wide lineage — omit schema to span every schema in the catalog.
+  getCatalogLineage: (catalog: string, signal?: AbortSignal) =>
+    fetchJson<LineageResponse>(
+      `${BASE}/lineage?catalog=${encodeURIComponent(catalog)}`,
+      signal,
+    ),
+
   getColumnLineage: (catalog: string, schema: string, table: string, column: string) =>
     fetchJson<ColumnLineageResponse>(
       `${BASE}/column-lineage?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}&column=${encodeURIComponent(column)}`
