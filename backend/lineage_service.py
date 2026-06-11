@@ -1160,3 +1160,57 @@ def get_column_lineage(catalog: str, schema: str, table: str, column: str, skip_
     return ColumnLineageResponse(edges=filtered)
 
 
+def get_table_edges(catalog: str, schema: str | None = None, skip_cache: bool = False) -> list[dict]:
+    """Return the REAL recorded table→table lineage pairs for a scope.
+
+    Each row of system.access.table_lineage is an actual (source_table,
+    target_table) dependency captured from a query — so distinct pairs here are
+    the true table-level edges, with the mediating entity. This is what the
+    Excel export's Lineage sheet should use, instead of reconstructing edges by
+    cross-producting a job's source set × target set (which fabricates pairs
+    that never ran — e.g. a job reading {A,B} and writing {C,D} does not imply
+    A→D). Omit schema for catalog-wide scope.
+    """
+    cache_key = f"table_edges:{catalog}.{schema}" if schema else f"table_edges:{catalog}"
+
+    def _fetch() -> list[dict]:
+        client = _get_client()
+        if schema is not None:
+            scope = (
+                f"(target_table_catalog = '{catalog}' AND target_table_schema = '{schema}') "
+                f"OR (source_table_catalog = '{catalog}' AND source_table_schema = '{schema}')"
+            )
+        else:
+            scope = f"target_table_catalog = '{catalog}' OR source_table_catalog = '{catalog}'"
+        sql = f"""
+        SELECT DISTINCT
+            source_table_full_name AS source,
+            target_table_full_name AS target,
+            entity_type,
+            entity_id
+        FROM system.access.table_lineage
+        WHERE ({scope})
+          AND source_table_full_name IS NOT NULL
+          AND target_table_full_name IS NOT NULL
+          AND source_table_full_name != target_table_full_name
+          AND event_time > current_date() - INTERVAL 90 DAYS
+        LIMIT 100000
+        """
+        try:
+            rows = _execute_sql(client, sql)
+        except Exception as e:
+            logger.warning(f"table_edges query failed (need SELECT on system.access): {e}")
+            return []
+        return [
+            {
+                "source": r["source"],
+                "target": r["target"],
+                "entity_type": r.get("entity_type"),
+                "entity_id": r.get("entity_id"),
+            }
+            for r in rows
+        ]
+
+    return _cached_fetch(cache_key, _fetch, skip_cache=skip_cache)
+
+

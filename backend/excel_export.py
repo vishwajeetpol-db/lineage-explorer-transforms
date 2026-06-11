@@ -159,10 +159,64 @@ def _layer_nodes(ids, edges):
 
 _ENTITY_FILL = "E0E7FF"   # light indigo for job/pipeline boxes
 _ENTITY_FONT = "3730A3"
+_MAX_SCHEMA_MAPS = 12     # cap map sheets so a many-schema catalog stays sane
 
 
-def _build_lineage_map_sheet(wb, all_nodes, raw_edges, entity_names=None) -> None:
-    """Append a 'Lineage Map' sheet that mirrors the app: tables AND pipeline/
+def _schema_of(full_name: str) -> str:
+    parts = full_name.split(".")
+    return parts[1] if len(parts) == 3 else ""
+
+
+def _add_per_schema_maps(wb, all_nodes, raw_edges, entity_names) -> None:
+    """For catalog scope: one lineage-map sheet per schema (largest first),
+    instead of a single dozens-of-columns-wide grid that interleaves unrelated
+    schemas. Each map's subgraph = the schema's tables + the pipelines that
+    touch them + every table those pipelines read/write. Schemas with no flow
+    are skipped; capped at _MAX_SCHEMA_MAPS."""
+    id_node = {n.id: n for n in all_nodes}
+    is_entity = lambda i: i.startswith("entity:")
+
+    adj = defaultdict(set)  # undirected, for subgraph expansion
+    for s, t in raw_edges:
+        if s in id_node and t in id_node:
+            adj[s].add(t)
+            adj[t].add(s)
+
+    by_schema = defaultdict(list)
+    for n in all_nodes:
+        if getattr(n, "node_type", None) == "table":
+            by_schema[_schema_of(n.full_name)].append(n.id)
+
+    used_names: set[str] = set()
+    made = 0
+    for sch in sorted(by_schema, key=lambda s: -len(by_schema[s])):
+        if made >= _MAX_SCHEMA_MAPS:
+            break
+        tids = by_schema[sch]
+        include = set(tids)
+        # pipelines touching this schema's tables + all tables they touch
+        for tid in tids:
+            for nb in adj.get(tid, ()):
+                include.add(nb)
+                if is_entity(nb):
+                    include.update(adj.get(nb, ()))
+        sub_edges = [(s, t) for s, t in raw_edges if s in include and t in include]
+        if not sub_edges:
+            continue  # nothing to draw (all-orphan schema)
+        sub_nodes = [id_node[i] for i in include if i in id_node]
+        name = f"Map · {sch}"[:31]
+        base = name
+        k = 2
+        while name.lower() in used_names:
+            name = f"{base[:28]}_{k}"
+            k += 1
+        used_names.add(name.lower())
+        _build_lineage_map_sheet(wb, sub_nodes, sub_edges, entity_names, name)
+        made += 1
+
+
+def _build_lineage_map_sheet(wb, all_nodes, raw_edges, entity_names=None, sheet_name="Lineage Map") -> None:
+    """Append a lineage-map sheet that mirrors the app: tables AND pipeline/
     job nodes are drawn as boxes, placed in columns by dependency depth
     (sources left → downstream right). Uses the RAW edges (not a collapsed
     table→table graph) so fan-out jobs don't explode into cyclic cross-products.
@@ -180,7 +234,7 @@ def _build_lineage_map_sheet(wb, all_nodes, raw_edges, entity_names=None) -> Non
 
     layers_map, orphans, adj_down = _layer_nodes(ids, raw_edges)
 
-    ws = wb.create_sheet("Lineage Map")
+    ws = wb.create_sheet(sheet_name[:31])
     ws.sheet_view.showGridLines = False
 
     thin = Side(style="thin", color="94A3B8")
@@ -272,11 +326,15 @@ def _build_lineage_map_sheet(wb, all_nodes, raw_edges, entity_names=None) -> Non
         ws.column_dimensions[get_column_letter(col)].width = 4 if is_spacer else 9
 
 
-def build_lineage_workbook(catalog: str, schema: str | None, result, column_edges=None, entity_names=None) -> bytes:
+def build_lineage_workbook(catalog: str, schema: str | None, result, column_edges=None,
+                           entity_names=None, table_edges=None) -> bytes:
     """Build a styled .xlsx (bytes) from a LineageResponse.
 
-    entity_names maps entity node id → resolved display name (job/pipeline name),
-    used to label the boxes on the Lineage Map sheet.
+    entity_names maps entity node id → resolved display name (job/pipeline name).
+    table_edges is the list of REAL recorded table→table pairs (from
+    get_table_edges): [{source, target, entity_type, entity_id}, ...]. The
+    Lineage sheet uses these directly rather than cross-producting a job's
+    sources × targets (which fabricates pairs).
 
     Raises ImportError if openpyxl is unavailable (handled by the caller).
     """
@@ -284,23 +342,26 @@ def build_lineage_workbook(catalog: str, schema: str | None, result, column_edge
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
+    entity_names = entity_names or {}
+    real_edges = table_edges or []
+
     header_font = Font(bold=True, color="FFFFFF", size=11)
     header_fill = PatternFill("solid", fgColor=_INDIGO)
     header_align = Alignment(horizontal="left", vertical="center")
     header_border = Border(bottom=Side(style="thin", color="CBD5E1"))
     title_font = Font(bold=True, size=15, color=_INDIGO)
     label_font = Font(bold=True, color="334155")
+    note_font = Font(italic=True, size=10, color="64748B")
     mono_font = Font(name="Consolas", size=10)
 
     table_nodes = [n for n in result.nodes if getattr(n, "node_type", None) == "table"]
     entity_nodes = [n for n in result.nodes if getattr(n, "node_type", None) == "entity"]
-    table_edges = _collapse_edges(result.edges)
     orphan_count = sum(1 for t in table_nodes if t.lineage_status == "orphan")
 
-    scope = "schema" if schema else "catalog"
-    scope_label = f"{catalog}.{schema}" if schema else catalog
-
-    wb = Workbook()
+    def via_label(etype, eid):
+        if not etype or not eid:
+            return "—"
+        return entity_names.get(f"entity:{etype}:{eid}") or f"{etype} {eid[:8]}"
 
     def style_header(ws, ncols: int):
         for c in range(1, ncols + 1):
@@ -324,6 +385,11 @@ def build_lineage_workbook(catalog: str, schema: str | None, result, column_edge
             width = min(maxs.get(i, 60), max(mins.get(i, 10), width + 2))
             ws.column_dimensions[get_column_letter(i + 1)].width = width
 
+    scope = "schema" if schema else "catalog"
+    scope_label = f"{catalog}.{schema}" if schema else catalog
+
+    wb = Workbook()
+
     # --- Summary ---
     ws = wb.active
     ws.title = "Summary"
@@ -336,18 +402,75 @@ def build_lineage_workbook(catalog: str, schema: str | None, result, column_edge
         ("", ""),
         ("Tables", len(table_nodes)),
         ("Pipelines / entities", len(entity_nodes)),
-        ("Lineage edges (table → table)", len(table_edges)),
+        ("Lineage edges (table → table)", len(real_edges)),
         ("Column lineage edges", len(column_edges.edges) if column_edges else 0),
         ("Tables without lineage (orphan)", orphan_count),
     ]
-    for r, (label, value) in enumerate(summary, start=3):
+    r = 3
+    for label, value in summary:
         ws.cell(row=r, column=1, value=label).font = label_font
         if value != "":
             ws.cell(row=r, column=2, value=value)
         if label == "Target":
             ws.cell(row=r, column=2).font = mono_font
-    ws.column_dimensions["A"].width = 32
-    ws.column_dimensions["B"].width = 48
+        r += 1
+
+    # Notes — explain what lineage does and doesn't cover.
+    r += 1
+    ws.cell(row=r, column=1, value="Notes").font = label_font
+    r += 1
+    notes = [
+        "Lineage reflects the last 90 days of query-captured activity in Unity Catalog.",
+        "Only tables read/written by a tracked query appear connected; others show as 'orphan'.",
+        "Edges are the real recorded source→target pairs (with the job/pipeline that ran them).",
+        "Column lineage is included for single-schema exports only (empty for catalog scope).",
+        "Lineage Map sheets render the flow per schema (sources left → downstream right).",
+    ]
+    for n in notes:
+        ws.cell(row=r, column=1, value="• " + n).font = note_font
+        r += 1
+
+    # Legend — status colors used on the Tables sheet and Lineage Map.
+    r += 1
+    ws.cell(row=r, column=1, value="Legend").font = label_font
+    r += 1
+    legend = [("root", "source — no upstream"), ("connected", "has upstream & downstream"),
+              ("leaf", "sink — no downstream"), ("orphan", "no recorded lineage")]
+    for status, desc in legend:
+        c = ws.cell(row=r, column=1, value=status)
+        c.fill = PatternFill("solid", fgColor=_STATUS_FILL[status])
+        c.font = Font(bold=True, color=_STATUS_FONT[status])
+        ws.cell(row=r, column=2, value=desc).font = note_font
+        r += 1
+    c = ws.cell(row=r, column=1, value="pipeline/job")
+    c.fill = PatternFill("solid", fgColor=_ENTITY_FILL)
+    c.font = Font(bold=True, color=_ENTITY_FONT)
+    ws.cell(row=r, column=2, value="a job, pipeline or query that moves data").font = note_font
+    r += 2
+
+    # Per-schema breakdown.
+    ws.cell(row=r, column=1, value="Per-schema breakdown").font = label_font
+    r += 1
+    hdr = ws.cell(row=r, column=1, value="Schema"); hdr.font = label_font
+    ws.cell(row=r, column=2, value="Tables").font = label_font
+    ws.cell(row=r, column=3, value="Orphans").font = label_font
+    r += 1
+    per_schema = defaultdict(lambda: [0, 0])
+    for t in table_nodes:
+        _, sch = _split_fqdn(t.full_name)
+        per_schema[sch][0] += 1
+        if t.lineage_status == "orphan":
+            per_schema[sch][1] += 1
+    for sch in sorted(per_schema, key=lambda s: -per_schema[s][0]):
+        cnt, orph = per_schema[sch]
+        ws.cell(row=r, column=1, value=sch).font = mono_font
+        ws.cell(row=r, column=2, value=cnt)
+        ws.cell(row=r, column=3, value=orph)
+        r += 1
+
+    ws.column_dimensions["A"].width = 40
+    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 12
 
     # --- Tables ---
     ws = wb.create_sheet("Tables")
@@ -375,16 +498,20 @@ def build_lineage_workbook(catalog: str, schema: str | None, result, column_edge
     style_header(ws, len(headers))
     autosize(ws, headers, rows, mins={0: 30, 10: 20}, maxs={0: 60, 5: 36, 10: 60})
 
-    # --- Lineage (table → table) ---
+    # --- Lineage (real table → table pairs, with the job/pipeline that ran them) ---
     ws = wb.create_sheet("Lineage")
-    ws.append(["Source", "Target"])
-    le_rows = [[s, t] for s, t in sorted(table_edges)]
+    headers = ["Source", "Via (pipeline / job)", "Target"]
+    ws.append(headers)
+    le_rows = sorted(
+        ([e["source"], via_label(e.get("entity_type"), e.get("entity_id")), e["target"]] for e in real_edges),
+        key=lambda r: (r[0], r[2], r[1]),
+    )
     for r in le_rows:
         ws.append(r)
         ws.cell(row=ws.max_row, column=1).font = mono_font
-        ws.cell(row=ws.max_row, column=2).font = mono_font
-    style_header(ws, 2)
-    autosize(ws, ["Source", "Target"], le_rows, mins={0: 30, 1: 30}, maxs={0: 60, 1: 60})
+        ws.cell(row=ws.max_row, column=3).font = mono_font
+    style_header(ws, len(headers))
+    autosize(ws, headers, le_rows, mins={0: 30, 1: 22, 2: 30}, maxs={0: 60, 1: 40, 2: 60})
 
     # --- Pipelines ---
     if entity_nodes:
@@ -393,8 +520,9 @@ def build_lineage_workbook(catalog: str, schema: str | None, result, column_edge
         ws.append(headers)
         pr_rows = []
         for en in entity_nodes:
+            name = en.display_name or entity_names.get(en.id, "")
             pr_rows.append([
-                en.entity_type, en.display_name or "", en.entity_id,
+                en.entity_type, name, en.entity_id,
                 en.last_run or "", en.owner or "", en.cost_usd if en.cost_usd is not None else "",
             ])
         for r in pr_rows:
@@ -419,11 +547,16 @@ def build_lineage_workbook(catalog: str, schema: str | None, result, column_edge
         style_header(ws, len(headers))
         autosize(ws, headers, cl_rows, mins={0: 28, 2: 28}, maxs={0: 54, 1: 36, 2: 54, 3: 36})
 
-    # --- Lineage Map (last sheet): layered colored boxes, left → right flow ---
-    # Uses ALL nodes (tables + job/pipeline entities) and the RAW edges.
+    # --- Lineage Map(s): layered colored boxes, left → right flow ---
+    # Schema scope → one map. Catalog scope → one map PER SCHEMA (a single
+    # catalog-wide grid is dozens of columns wide and interleaves unrelated
+    # schemas). Uses ALL nodes (tables + entities) and the RAW edges.
     try:
         raw_edges = [(e.source, e.target) for e in result.edges]
-        _build_lineage_map_sheet(wb, result.nodes, raw_edges, entity_names)
+        if schema is not None:
+            _build_lineage_map_sheet(wb, result.nodes, raw_edges, entity_names, "Lineage Map")
+        else:
+            _add_per_schema_maps(wb, result.nodes, raw_edges, entity_names)
     except Exception as map_err:
         # Never let the visual map break the rest of the workbook.
         logger.warning(f"Lineage Map sheet skipped: {map_err}")

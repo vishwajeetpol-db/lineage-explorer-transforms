@@ -91,7 +91,11 @@ def test_build_workbook_has_all_sheets_including_map():
         LineageEdge(source="c.s.clean", target="c.s.gold"),
     ]
     result = LineageResponse(nodes=nodes, edges=edges)
-    data = build_lineage_workbook("c", "s", result, None)
+    # Real recorded pairs are passed in explicitly (not derived by cross-product).
+    table_edges = [{"source": "c.s.raw", "target": "c.s.clean",
+                    "entity_type": "PIPELINE", "entity_id": "p1"}]
+    entity_names = {"entity:PIPELINE:p1": "Clean & Ingest"}
+    data = build_lineage_workbook("c", "s", result, None, entity_names, table_edges)
     assert data[:2] == b"PK"  # zip signature
 
     wb = load_workbook(BytesIO(data))
@@ -99,9 +103,8 @@ def test_build_workbook_has_all_sheets_including_map():
     assert "Tables" in wb.sheetnames
     assert "Lineage" in wb.sheetnames
     assert "Pipelines" in wb.sheetnames
-    assert "Lineage Map" in wb.sheetnames  # the new sheet, appended last
-    assert wb.sheetnames[-1] == "Lineage Map"
+    assert "Lineage Map" in wb.sheetnames  # single-schema scope → one map sheet
 
-    # The pipeline-mediated edge raw -> p1 -> clean must collapse to raw -> clean
-    lineage_vals = {(r[0].value, r[1].value) for r in wb["Lineage"].iter_rows(min_row=2)}
-    assert ("c.s.raw", "c.s.clean") in lineage_vals
+    # Lineage sheet: Source | Via (pipeline) | Target — using the real pair.
+    rows = [(r[0].value, r[1].value, r[2].value) for r in wb["Lineage"].iter_rows(min_row=2)]
+    assert ("c.s.raw", "Clean & Ingest", "c.s.clean") in rows

@@ -43,6 +43,7 @@ from backend.lineage_service import (
     get_column_lineage,
     get_schema_column_lineage,
     get_columns,
+    get_table_edges,
     resolve_entity_name,
     invalidate_cache,
     evict_cache_entry,
@@ -625,25 +626,44 @@ async def api_export_lineage(
         schema = _validate_identifier(schema, "schema")
     try:
         result = await asyncio.to_thread(get_table_lineage, catalog, schema, False)
+        # Real recorded table→table pairs (with mediating entity) — accurate edges
+        # for the Lineage sheet, instead of a cross-product reconstruction.
+        table_edges = await asyncio.to_thread(get_table_edges, catalog, schema, False)
         column_edges = None
         if schema is not None:
             try:
                 column_edges = await asyncio.to_thread(get_schema_column_lineage, catalog, schema, False)
             except Exception as ce:
                 logger.warning(f"Column lineage unavailable for export {catalog}.{schema}: {ce}")
-        # Resolve job/pipeline display names for the Lineage Map boxes.
+
+        # Resolve job/pipeline display names (for Lineage Map boxes + the "Via"
+        # column). Cover entities from the graph AND from the real edge pairs.
         entity_names: dict[str, str] = {}
+        entity_keys: set[tuple[str, str]] = set()
         for n in result.nodes:
             if getattr(n, "node_type", None) == "entity":
-                nm = n.display_name
-                if not nm:
-                    try:
-                        nm = (await asyncio.to_thread(resolve_entity_name, n.entity_type, n.entity_id)).get("name")
-                    except Exception:
-                        nm = None
-                entity_names[n.id] = nm or f"{n.entity_type} {n.entity_id[:8]}"
+                if n.display_name:
+                    entity_names[n.id] = n.display_name
+                else:
+                    entity_keys.add((n.entity_type, n.entity_id))
+        for e in table_edges:
+            if e.get("entity_type") and e.get("entity_id"):
+                entity_keys.add((e["entity_type"], e["entity_id"]))
+        for etype, eid in entity_keys:
+            key = f"entity:{etype}:{eid}"
+            if key in entity_names:
+                continue
+            nm = None
+            try:
+                nm = (await asyncio.to_thread(resolve_entity_name, etype, eid)).get("name")
+            except Exception:
+                nm = None
+            entity_names[key] = nm or f"{etype} {eid[:8]}"
+
         from backend.excel_export import build_lineage_workbook
-        data = await asyncio.to_thread(build_lineage_workbook, catalog, schema, result, column_edges, entity_names)
+        data = await asyncio.to_thread(
+            build_lineage_workbook, catalog, schema, result, column_edges, entity_names, table_edges
+        )
     except ImportError:
         logger.error("openpyxl not installed — cannot build Excel export")
         raise HTTPException(status_code=503, detail="Excel export is temporarily unavailable on the server.")
