@@ -145,3 +145,12 @@
 ::selection {
   background: rgba(99, 102, 241, 0.3);
 }
+
+/* ---- Hidden scrollbar (used by the toolbar's scrollable middle controls) ---- */
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}

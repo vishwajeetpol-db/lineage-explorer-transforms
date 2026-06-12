@@ -92,7 +92,7 @@ function Toolbar({ onGenerate }: Props) {
       {/* Logo — clickable, returns to home */}
       <button
         onClick={goLanding}
-        className="flex items-center gap-2.5 mr-1 hover:opacity-90 transition-opacity"
+        className="flex items-center gap-2.5 mr-1 flex-shrink-0 hover:opacity-90 transition-opacity"
         title="Back to home"
         aria-label="Back to home"
       >
@@ -109,23 +109,27 @@ function Toolbar({ onGenerate }: Props) {
         </div>
       </button>
 
+      {/* Middle controls — scroll horizontally if they don't fit, so the
+          right-side actions (Export / search / menu) are never pushed off-screen. */}
+      <div className="flex items-center gap-4 flex-1 min-w-0 overflow-x-auto no-scrollbar">
+
       {/* Divider */}
-      <div className="w-px h-8 bg-white/[0.06]" />
+      <div className="w-px h-8 bg-white/[0.06] flex-shrink-0" />
 
       {/* Back button + focused table */}
       {focusTable ? (
         <>
           <button
             onClick={() => setFocusTable(null)}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] border border-white/[0.06] hover:border-white/[0.12] transition-all duration-200 group"
+            className="flex items-center gap-1.5 px-2.5 py-1.5 flex-shrink-0 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] border border-white/[0.06] hover:border-white/[0.12] transition-all duration-200 group"
             title="Back to search"
           >
             <ArrowLeft size={13} className="text-slate-500 group-hover:text-slate-300 transition-colors" />
             <span className="text-[11px] text-slate-500 group-hover:text-slate-300 font-medium transition-colors">Back</span>
           </button>
-          <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-accent/[0.06] border border-accent/20">
-            <div className="w-1.5 h-1.5 rounded-full bg-accent shadow-[0_0_6px] shadow-accent/40" />
-            <span className="font-mono text-[12px] text-accent-light tracking-tight">{focusTable}</span>
+          <div className="flex items-center gap-2 px-3 py-1.5 flex-shrink-0 max-w-[340px] rounded-lg bg-accent/[0.06] border border-accent/20" title={focusTable}>
+            <div className="w-1.5 h-1.5 rounded-full bg-accent shadow-[0_0_6px] shadow-accent/40 flex-shrink-0" />
+            <span className="font-mono text-[12px] text-accent-light tracking-tight truncate">{focusTable}</span>
           </div>
         </>
       ) : isScopeLineage ? (
@@ -313,9 +317,10 @@ function Toolbar({ onGenerate }: Props) {
         </button>
       )}
 
-      {/* Spacer */}
-      <div className="flex-1" />
+      </div>{/* end scrollable middle controls */}
 
+      {/* Right actions — pinned, always visible (never scrolled off / clipped) */}
+      <div className="flex items-center gap-4 flex-shrink-0">
       {/* Export to Excel — only when a graph is loaded */}
       {nodes.length > 0 && (
         <button
@@ -339,6 +344,7 @@ function Toolbar({ onGenerate }: Props) {
 
       {/* Shared menu */}
       <HeaderMenu />
+      </div>{/* end pinned right actions */}
     </motion.header>
     {/* Cache status banner */}
     {nodes.length > 0 && (
