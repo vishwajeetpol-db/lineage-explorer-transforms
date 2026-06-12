@@ -137,9 +137,11 @@ function Toolbar({ onGenerate }: Props) {
         </div>
       </button>
 
-      {/* Middle controls — scroll horizontally if they don't fit, so the
-          right-side actions (Export / search / menu) are never pushed off-screen. */}
-      <div className="flex items-center gap-4 flex-1 min-w-0 overflow-x-auto no-scrollbar">
+      {/* Middle controls. NOTE: must NOT set overflow here — overflow-x:auto
+          forces overflow-y to compute as auto, which clips the dropdown/popover
+          menus that open below the bar. The compact controls fit without it;
+          flex-1 + min-w-0 keeps the right-side actions pinned and visible. */}
+      <div className="flex items-center gap-4 flex-1 min-w-0">
 
       {/* Divider */}
       <div className="w-px h-8 bg-white/[0.06] flex-shrink-0" />
