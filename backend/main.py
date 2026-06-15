@@ -8,7 +8,7 @@ import hashlib
 import logging
 import resource
 import threading
-from collections import defaultdict, deque, OrderedDict
+from collections import deque, OrderedDict
 
 APP_VERSION = "1.3.0"
 
