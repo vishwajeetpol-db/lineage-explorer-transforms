@@ -17,6 +17,7 @@ from actual query execution. No inference, no heuristics, no regex parsing.
 
 import json
 import os
+import re
 import sys
 import time
 import logging
@@ -34,6 +35,9 @@ from backend.models import (
     ColumnLineageEdge,
     LineageResponse,
     ColumnLineageResponse,
+    SharedOutEntry,
+    ForeignCatalogEntry,
+    SharingOverlay,
 )
 
 T = TypeVar("T")
@@ -75,6 +79,33 @@ LINEAGE_MAX_NODES = int(os.environ.get("LINEAGE_MAX_NODES", "2500"))
 # but the app only surfaces those within this window; older-only tables show as
 # orphan. Configurable so aged demos/datasets can still be visualized.
 LINEAGE_WINDOW_DAYS = int(os.environ.get("LINEAGE_WINDOW_DAYS", "90"))
+
+# Lakeflow/DLT pipelines create internal backing tables alongside each
+# materialized view / streaming table (`__materialization_mat_*`, `event_log_*`,
+# `__apply_changes*`). They aren't user assets and have no real lineage, so
+# they'd otherwise render as orphan noise nodes. Exclude them from every table
+# listing. The lineage edges themselves reference the real MV/ST names, so this
+# only filters the information_schema.tables enumeration.
+_INTERNAL_TABLE_FILTER = (
+    "table_name NOT RLIKE '^(__materialization_mat_|event_log_|__apply_changes)'"
+)
+
+# Conservative whitelist for entity ids interpolated into system-table queries
+# (job ids, pipeline/notebook/dashboard ids, notebook paths). No quotes/semicolons.
+_SAFE_ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9_./@ +:-]{1,512}$")
+
+# Same exclusion, applied to the lineage query's full-name columns — these
+# internal tables also appear as source/target of pipeline write events, so they
+# leak into the graph as edge-derived nodes unless filtered here too. Matches the
+# internal prefix in the final name segment (after the last dot).
+_INTERNAL_NAME_RE = r"[.](__materialization_mat_|event_log_|__apply_changes)"
+
+
+def _internal_lineage_filter() -> str:
+    return (
+        f"(source_table_full_name IS NULL OR source_table_full_name NOT RLIKE '{_INTERNAL_NAME_RE}') "
+        f"AND (target_table_full_name IS NULL OR target_table_full_name NOT RLIKE '{_INTERNAL_NAME_RE}')"
+    )
 
 _CACHE_MAX_BYTES = CACHE_MAX_MEMORY_MB * 1024 * 1024
 
@@ -253,8 +284,11 @@ _cost_by_job_id: dict[str, float] = {}
 _cost_by_pipeline_id: dict[str, float] = {}
 _cost_cache_fetched_at: float = 0.0
 _cost_cache_lock = threading.Lock()
-_COST_CACHE_TTL = 3600          # 1 hour — system.billing rolls up daily
-_COST_WINDOW_DAYS = 30          # 30-day cost shown on each entity
+# system.billing rolls up at most daily, and the account-wide aggregation is the
+# single most expensive system query (1–4 min on large accounts). Refreshing it
+# hourly just burns warehouse time for no fresher data — default to 6h, tunable.
+_COST_CACHE_TTL = int(os.environ.get("COST_CACHE_TTL_SECONDS", "21600"))  # 6 hours
+_COST_WINDOW_DAYS = int(os.environ.get("COST_WINDOW_DAYS", "30"))         # cost window per entity
 _COST_REFRESH_BUDGET_S = 600    # max time for one background refresh
 
 
@@ -422,6 +456,7 @@ def list_all_tables() -> list[dict]:
                 SELECT table_name, table_type, table_schema
                 FROM `{cat}`.information_schema.tables
                 WHERE table_schema NOT IN ('information_schema', 'default')
+                  AND {_INTERNAL_TABLE_FILTER}
                 ORDER BY table_schema, table_name
                 """
                 rows = _execute_sql(client, sql, catalog=cat)
@@ -524,10 +559,277 @@ def get_table_lineage(catalog: str, schema: str | None = None, skip_cache: bool 
                 return _wrap_with_cache_metadata(cached, cache_key, from_cache=True, fetch_ms=0)
 
         fetch_start = time.time()
-        result = _fetch_table_lineage(catalog, schema, cache_key)
+        result, lineage_ok = _fetch_table_lineage(catalog, schema, cache_key)
+        fetch_ms = int((time.time() - fetch_start) * 1000)
+        if lineage_ok:
+            _cache_set(cache_key, result)
+        return _wrap_with_cache_metadata(result, cache_key, from_cache=False, fetch_ms=fetch_ms)
+
+
+def get_lineage_trace(seed_full_name: str, skip_cache: bool = False) -> LineageResponse:
+    """End-to-end lineage trace from a single seed table, ACROSS all catalogs.
+
+    Unlike get_table_lineage (scoped to one schema/catalog with 1-hop stubs for
+    cross-scope neighbors), this walks system.access.table_lineage breadth-first
+    from the seed in both directions, following edges into any catalog/schema,
+    and returns only the connected component. This is what surfaces a full
+    cross-catalog medallion chain (e.g. shared source → bronze → silver → gold in
+    another catalog → mart) — with the mediating pipeline/job entity nodes — from
+    a single clicked table. Metastore-wide; no workspace/catalog scoping.
+    """
+    cache_key = f"trace:{seed_full_name}"
+    if not skip_cache:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return _wrap_with_cache_metadata(cached, cache_key, from_cache=True, fetch_ms=0)
+
+    lock = _get_keyed_lock(cache_key)
+    with lock:
+        if not skip_cache:
+            cached = _cache_get(cache_key)
+            if cached is not None:
+                return _wrap_with_cache_metadata(cached, cache_key, from_cache=True, fetch_ms=0)
+        fetch_start = time.time()
+        result = _fetch_lineage_trace(seed_full_name)
         fetch_ms = int((time.time() - fetch_start) * 1000)
         _cache_set(cache_key, result)
         return _wrap_with_cache_metadata(result, cache_key, from_cache=False, fetch_ms=fetch_ms)
+
+
+def _fetch_lineage_trace(seed_full_name: str) -> LineageResponse:
+    """DIRECTIONAL BFS over system.access.table_lineage from the seed, across all
+    catalogs. Ancestors are found by following target→source only; descendants by
+    source→target only. This is essential: a shared source table (e.g.
+    samples.tpch.orders) is read by many unrelated pipelines account-wide, so a
+    bidirectional walk would fan out through it into every sibling consumer. By
+    keeping each direction pure, the trace stays within the seed's own lineage
+    cone (its true ancestors + descendants)."""
+    client = _get_client()
+
+    MAX_ITERS = 16
+    NODE_CAP = LINEAGE_MAX_NODES
+    lineage_rows: list[dict] = []
+    row_keys: set[tuple] = set()
+    seen_all: set[str] = {seed_full_name}
+    truncated = {"hit": False}
+
+    def _collect(rows: list[dict]):
+        for r in rows:
+            k = (r.get("source_table_full_name"), r.get("target_table_full_name"),
+                 r.get("source_path"), r.get("target_path"), r.get("entity_id"))
+            if k not in row_keys:
+                row_keys.add(k)
+                lineage_rows.append(r)
+
+    def _walk(direction: str):
+        # direction "up": match target IN frontier, expand by sources (ancestors).
+        # direction "down": match source IN frontier, expand by targets (descendants).
+        match_col = "target_table_full_name" if direction == "up" else "source_table_full_name"
+        next_col = "source_table_full_name" if direction == "up" else "target_table_full_name"
+        frontier = {seed_full_name}
+        for _ in range(MAX_ITERS):
+            if len(seen_all) > NODE_CAP:
+                truncated["hit"] = True
+                break
+            if not frontier:
+                break
+            in_list = ",".join("'" + t.replace("'", "''") + "'" for t in frontier)
+            sql = f"""
+            SELECT source_table_full_name, target_table_full_name, source_type, target_type,
+                   source_path, target_path, entity_type, entity_id, event_time, created_by
+            FROM system.access.table_lineage
+            WHERE {match_col} IN ({in_list})
+              AND event_time > current_date() - INTERVAL {LINEAGE_WINDOW_DAYS} DAYS
+              AND {_internal_lineage_filter()}
+            """
+            try:
+                rows = _execute_sql(client, sql)
+            except Exception as e:
+                logger.warning(f"Trace query failed (need SELECT on system.access): {e}")
+                break
+            _collect(rows)
+            nxt: set[str] = set()
+            for r in rows:
+                fn = r.get(next_col)
+                if fn and fn not in seen_all:
+                    seen_all.add(fn)
+                    nxt.add(fn)
+            frontier = nxt
+        # Frontier still non-empty after MAX_ITERS hops → the chain is deeper than
+        # we walked; the graph is partial. Surface it (don't present it as complete).
+        if frontier:
+            truncated["hit"] = True
+
+    _walk("up")
+    _walk("down")
+    return _build_graph_from_rows(client, lineage_rows, truncated=truncated["hit"])
+
+
+# --- Shared graph-assembly helpers (used by BOTH the trace builder and the
+# schema/catalog builder, so the two can't drift) ---------------------------
+
+def _entity_cost(entity_type: str, entity_id: str) -> float | None:
+    """30-day serverless cost for a JOB/PIPELINE entity from the cost cache."""
+    if entity_type == "JOB":
+        return _cost_by_job_id.get(entity_id)
+    if entity_type == "PIPELINE":
+        return _cost_by_pipeline_id.get(entity_id)
+    return None
+
+
+def _maybe_refresh_cost_cache(client: WorkspaceClient) -> None:
+    """Kick a background cost refresh if the cache is stale. Non-blocking; the
+    refresh's own non-blocking lock means concurrent callers no-op rather than pile up."""
+    if (time.time() - _cost_cache_fetched_at) >= _COST_CACHE_TTL:
+        threading.Thread(target=_refresh_cost_cache, args=(client,), daemon=True).start()
+
+
+def _classify_table_nodes(nodes_map: dict, edge_set: set) -> None:
+    """Set upstream/downstream counts + lineage_status on every TableNode in place.
+    Entity (job/pipeline) intermediaries don't count toward table connectivity."""
+    table_ids = {nid for nid, n in nodes_map.items() if isinstance(n, TableNode)}
+    up: dict[str, int] = {}
+    down: dict[str, int] = {}
+    for s, t in edge_set:
+        if s in table_ids:
+            down[s] = down.get(s, 0) + 1
+        if t in table_ids:
+            up[t] = up.get(t, 0) + 1
+    for nid, node in nodes_map.items():
+        if not isinstance(node, TableNode):
+            continue
+        node.upstream_count = up.get(nid, 0)
+        node.downstream_count = down.get(nid, 0)
+        if node.upstream_count == 0 and node.downstream_count == 0:
+            node.lineage_status = "orphan"
+        elif node.upstream_count == 0:
+            node.lineage_status = "root"
+        elif node.downstream_count == 0:
+            node.lineage_status = "leaf"
+        else:
+            node.lineage_status = "connected"
+
+
+def _build_graph_from_rows(client: WorkspaceClient, lineage_rows: list[dict], truncated: bool = False) -> LineageResponse:
+    """Build a LineageResponse (table + entity nodes, routed edges, counts, cost)
+    from a flat list of system.access.table_lineage rows. Shared by the trace path.
+    Table nodes are lightweight (no columns/owner) — columns lazy-load via /api/columns."""
+    nodes_map: dict[str, TableNode | EntityNode] = {}
+    entity_map: dict[str, dict] = {}
+    direct_pairs: set[tuple[str, str]] = set()
+
+    def _ensure_table(ref: str, rtype: str | None):
+        if ref in nodes_map:
+            return
+        if rtype == "PATH":
+            raw = ref.removeprefix("path:")
+            name = raw.split("://", 1)[-1].split("/")[0] if "://" in raw else raw
+        else:
+            name = ref.split(".")[-1]
+        nodes_map[ref] = TableNode(
+            id=ref, name=name, full_name=ref,
+            table_type=rtype or "TABLE", owner=None, comment=None,
+            columns=[], created_at=None, updated_at=None,
+        )
+
+    for r in lineage_rows:
+        sref, stype = _parse_lineage_ref(r.get("source_table_full_name"), r.get("source_path"), r.get("source_type"))
+        tref, ttype = _parse_lineage_ref(r.get("target_table_full_name"), r.get("target_path"), r.get("target_type"))
+        if sref:
+            _ensure_table(sref, stype)
+        if tref:
+            _ensure_table(tref, ttype)
+        etype, eid = r.get("entity_type"), r.get("entity_id")
+        if etype and eid:
+            key = f"entity:{etype}:{eid}"
+            info = entity_map.setdefault(key, {"type": etype, "id": eid, "sources": set(), "targets": set(), "last_run": None, "owner": r.get("created_by")})
+            if sref:
+                info["sources"].add(sref)
+            if tref:
+                info["targets"].add(tref)
+            et = r.get("event_time")
+            if et and (info["last_run"] is None or str(et) > str(info["last_run"])):
+                info["last_run"] = et
+        elif sref and tref:
+            direct_pairs.add((sref, tref))
+
+    # Populate columns (batched, one query per catalog) so table nodes are
+    # expandable for column lineage. Lightweight nodes start with columns=[];
+    # special catalogs without information_schema (e.g. samples) just stay empty.
+    tables_by_cat: dict[str, set[tuple[str, str]]] = {}
+    for ref, node in nodes_map.items():
+        if isinstance(node, TableNode) and node.table_type not in ("VOLUME", "PATH"):
+            parts = ref.split(".")
+            if len(parts) == 3:
+                tables_by_cat.setdefault(parts[0], set()).add((parts[1], parts[2]))
+    for cat, pairs in tables_by_cat.items():
+        sch_in = ",".join("'" + s.replace("'", "''") + "'" for s in {s for s, _ in pairs})
+        tbl_in = ",".join("'" + t.replace("'", "''") + "'" for t in {t for _, t in pairs})
+        sql = f"""
+        SELECT table_schema, table_name, column_name, data_type, is_nullable, ordinal_position
+        FROM `{cat}`.information_schema.columns
+        WHERE table_schema IN ({sch_in}) AND table_name IN ({tbl_in})
+        ORDER BY table_schema, table_name, ordinal_position
+        """
+        try:
+            crows = _execute_sql(client, sql, catalog=cat)
+        except Exception as e:
+            logger.warning(f"Trace column fetch failed for catalog {cat}: {e}")
+            continue
+        cols_by_t: dict[tuple[str, str], list[dict]] = {}
+        for c in crows:
+            cols_by_t.setdefault((c["table_schema"], c["table_name"]), []).append({
+                "name": c["column_name"], "type": c["data_type"], "nullable": c["is_nullable"] == "YES",
+            })
+        for (sch, tname), cols in cols_by_t.items():
+            n = nodes_map.get(f"{cat}.{sch}.{tname}")
+            if isinstance(n, TableNode):
+                n.columns = cols
+            _cache_set(f"columns:{cat}.{sch}.{tname}", cols)
+
+    for key, info in entity_map.items():
+        nodes_map[key] = EntityNode(id=key, entity_type=info["type"], entity_id=info["id"],
+                                    last_run=info["last_run"], owner=info["owner"])
+        c = _entity_cost(info["type"], info["id"])
+        if c is not None:
+            nodes_map[key].cost_usd = c
+
+    _maybe_refresh_cost_cache(client)
+
+    # Build edges, breaking the FALSE self-cycle that arises when one pipeline
+    # writes a table and then reads it back to build another output (e.g. the gold
+    # pipeline writes gold_customer_revenue, then reads it to build
+    # gold_region_summary). Routing both through the single entity node would add
+    # entity→T and T→entity. Fix: a table the entity WRITES is never also drawn as
+    # feeding that entity — its read-after-write is shown as a direct table→table
+    # edge instead. The result stays acyclic.
+    targets_by_entity: dict[str, set[str]] = {
+        key: set(info["targets"]) for key, info in entity_map.items()
+    }
+    edge_set: set[tuple[str, str]] = set()
+    for r in lineage_rows:
+        sref, _ = _parse_lineage_ref(r.get("source_table_full_name"), r.get("source_path"), r.get("source_type"))
+        tref, _ = _parse_lineage_ref(r.get("target_table_full_name"), r.get("target_path"), r.get("target_type"))
+        etype, eid = r.get("entity_type"), r.get("entity_id")
+        if etype and eid:
+            key = f"entity:{etype}:{eid}"
+            if tref:
+                edge_set.add((key, tref))
+            if sref:
+                if sref in targets_by_entity.get(key, set()):
+                    # internal read-after-write → direct edge, no back-edge to entity
+                    if tref:
+                        edge_set.add((sref, tref))
+                else:
+                    edge_set.add((sref, key))
+        elif sref and tref:
+            edge_set.add((sref, tref))
+
+    _classify_table_nodes(nodes_map, edge_set)
+
+    return LineageResponse(nodes=list(nodes_map.values()),
+                           edges=[LineageEdge(source=s, target=t) for s, t in edge_set],
+                           truncated=truncated)
 
 
 def _parse_lineage_ref(table_full_name: str | None, path: str | None, ref_type: str | None) -> tuple[str | None, str | None]:
@@ -567,7 +869,7 @@ def _parse_lineage_ref(table_full_name: str | None, path: str | None, ref_type: 
     return None, None
 
 
-def _fetch_table_lineage(catalog: str, schema: str | None, cache_key: str) -> LineageResponse:
+def _fetch_table_lineage(catalog: str, schema: str | None, cache_key: str) -> tuple[LineageResponse, bool]:
     """Actual DBSQL fetch — called by at most one thread per cache key at a time.
 
     When schema is None the graph spans the entire catalog (every accessible
@@ -596,6 +898,7 @@ def _fetch_table_lineage(catalog: str, schema: str | None, cache_key: str) -> Li
         last_altered
     FROM `{catalog}`.information_schema.tables
     WHERE {schema_filter}
+      AND {_INTERNAL_TABLE_FILTER}
     ORDER BY table_schema, table_name
     """
     table_rows = _execute_sql(client, tables_sql, catalog=catalog)
@@ -684,12 +987,15 @@ def _fetch_table_lineage(catalog: str, schema: str | None, cache_key: str) -> Li
         {lineage_scope_filter}
     )
     AND event_time > current_date() - INTERVAL {LINEAGE_WINDOW_DAYS} DAYS
+    AND {_internal_lineage_filter()}
     """
+    lineage_ok = True
     try:
         lineage_rows = _execute_sql(client, lineage_sql)
     except Exception as e:
         logger.warning(f"System lineage table query failed (ensure SELECT on system.access is granted): {e}")
         lineage_rows = []
+        lineage_ok = False  # caller must NOT cache — a transient blip would freeze an empty graph for the whole TTL
 
     # Build table node map
     nodes_map: dict[str, TableNode | EntityNode] = {}
@@ -795,6 +1101,7 @@ def _fetch_table_lineage(catalog: str, schema: str | None, cache_key: str) -> Li
     # but an entity may write to tables in OTHER schemas (cross-schema targets).
     # Without this, pipelines that read from our schema but write elsewhere show
     # no outward edges.
+    followup_rows: list[dict] = []
     if entity_map:
         entity_ids = [info["id"] for info in entity_map.values()]
         eid_list = ",".join(f"'{eid}'" for eid in entity_ids)
@@ -813,6 +1120,7 @@ def _fetch_table_lineage(catalog: str, schema: str | None, cache_key: str) -> Li
         FROM system.access.table_lineage
         WHERE entity_id IN ({eid_list})
         AND event_time > current_date() - INTERVAL {LINEAGE_WINDOW_DAYS} DAYS
+        AND {_internal_lineage_filter()}
         """
         try:
             followup_rows = _execute_sql(client, followup_sql)
@@ -944,22 +1252,11 @@ def _fetch_table_lineage(catalog: str, schema: str | None, cache_key: str) -> Li
     # See _refresh_cost_cache — no SQL on this hot path. Classic-compute jobs
     # are intentionally unpriced (shared-cluster attribution is ambiguous).
     for entity_key, info in entity_map.items():
-        if info["type"] == "JOB":
-            c = _cost_by_job_id.get(info["id"])
-        elif info["type"] == "PIPELINE":
-            c = _cost_by_pipeline_id.get(info["id"])
-        else:
-            continue
+        c = _entity_cost(info["type"], info["id"])
         if c is not None:
             nodes_map[entity_key].cost_usd = c
 
-    # If the cost cache is stale and no refresh is in flight, kick one off in
-    # the background so the *next* lineage load reflects current cost. Never
-    # blocks the current response.
-    if (time.time() - _cost_cache_fetched_at) >= _COST_CACHE_TTL:
-        threading.Thread(
-            target=_refresh_cost_cache, args=(client,), daemon=True,
-        ).start()
+    _maybe_refresh_cost_cache(client)
 
     # Build edges: routed through entity nodes + direct edges
     edge_set: set[tuple[str, str]] = set()
@@ -982,43 +1279,39 @@ def _fetch_table_lineage(catalog: str, schema: str | None, cache_key: str) -> Li
         if (src, tgt) not in entity_covered:
             edge_set.add((src, tgt))
 
+    # Break false self-cycles: a table the entity WRITES must not also be drawn as
+    # feeding that entity. When a pipeline/job writes T then reads it back to build
+    # another output U (common in multi-step pipelines — the source of the cycles
+    # seen in lineage_stress_test/pipeline_demo), drop the (T, entity) back-edge and
+    # add the accurate direct (T, U) edge from the lineage rows. Keeps it acyclic.
+    for entity_key, info in entity_map.items():
+        for t in (info["sources"] & info["targets"]):
+            edge_set.discard((t, entity_key))
+    for row in lineage_rows + followup_rows:
+        et, eid = row.get("entity_type"), row.get("entity_id")
+        if not (et and eid):
+            continue
+        info = entity_map.get(f"entity:{et}:{eid}")
+        if not info:
+            continue
+        sref, _ = _parse_lineage_ref(row.get("source_table_full_name"), row.get("source_path"), row.get("source_type"))
+        tref, _ = _parse_lineage_ref(row.get("target_table_full_name"), row.get("target_path"), row.get("target_type"))
+        if sref and tref and sref in info["targets"]:
+            edge_set.add((sref, tref))
+
     edges = [LineageEdge(source=s, target=t) for s, t in edge_set]
 
-    # Calculate upstream/downstream counts for ALL table nodes — including the
-    # cross-schema / cross-catalog stub nodes, not just the in-scope schema.
-    # Counting only schema_tables wrongly marked an external source/target
-    # (e.g. cross_src_inventory.products feeding this schema) as an orphan with
-    # 0/0, even though it clearly has an edge in the graph. Entity (job/pipeline)
-    # intermediaries are excluded so counts reflect table connectivity.
-    table_node_ids = {nid for nid, n in nodes_map.items() if isinstance(n, TableNode)}
-    downstream_count: dict[str, int] = {}
-    upstream_count: dict[str, int] = {}
-    for s, t in edge_set:
-        if s in table_node_ids:
-            downstream_count[s] = downstream_count.get(s, 0) + 1
-        if t in table_node_ids:
-            upstream_count[t] = upstream_count.get(t, 0) + 1
-
-    for node_id, node in nodes_map.items():
-        if not isinstance(node, TableNode):
-            continue
-        node.upstream_count = upstream_count.get(node_id, 0)
-        node.downstream_count = downstream_count.get(node_id, 0)
-        if node.upstream_count == 0 and node.downstream_count == 0:
-            node.lineage_status = "orphan"
-        elif node.upstream_count == 0:
-            node.lineage_status = "root"
-        elif node.downstream_count == 0:
-            node.lineage_status = "leaf"
-        else:
-            node.lineage_status = "connected"
+    # Counts/status across ALL table nodes — including cross-schema/cross-catalog
+    # stubs — so an external source/target with a real edge isn't mis-flagged orphan.
+    _classify_table_nodes(nodes_map, edge_set)
 
     result = LineageResponse(
         nodes=list(nodes_map.values()),
         edges=edges,
     )
     # Caching of the top-level lineage response is handled by get_table_lineage.
-    return result
+    # lineage_ok=False means the lineage query failed → graph is tables-only; don't cache it.
+    return result, lineage_ok
 
 
 def resolve_entity_name(entity_type: str, entity_id: str) -> dict:
@@ -1036,6 +1329,13 @@ def resolve_entity_name(entity_type: str, entity_id: str) -> dict:
     fallback_name = f"{entity_type} {entity_id[:12]}"
     resolved = False
     result: dict = {"name": fallback_name}
+
+    # Defense-in-depth: entity_id is interpolated into SQL below. The /api/entity-name
+    # endpoint validates it, but other callers (e.g. the Excel export) pass ids straight
+    # from lineage rows — validate here too so this function is injection-safe on its own.
+    if not _SAFE_ENTITY_ID_RE.match(entity_id or ""):
+        logger.warning(f"resolve_entity_name: rejecting unsafe entity_id for {entity_type}")
+        return result
 
     client = _get_client()
     try:
@@ -1203,6 +1503,7 @@ def get_table_edges(catalog: str, schema: str | None = None, skip_cache: bool = 
           AND target_table_full_name IS NOT NULL
           AND source_table_full_name != target_table_full_name
           AND event_time > current_date() - INTERVAL {LINEAGE_WINDOW_DAYS} DAYS
+          AND {_internal_lineage_filter()}
         LIMIT 100000
         """
         try:
@@ -1219,6 +1520,226 @@ def get_table_edges(catalog: str, schema: str | None = None, skip_cache: bool = 
             }
             for r in rows
         ]
+
+    return _cached_fetch(cache_key, _fetch, skip_cache=skip_cache)
+
+
+# ---------------------------------------------------------------------------
+# Delta Sharing overlay — sharing relationships layered onto a lineage graph.
+#
+# Data comes from system.information_schema sharing views (not lineage tables —
+# UC lineage doesn't cross the metastore boundary). The frontend matches these
+# against nodes already in the graph and draws badges + synthetic boundary
+# nodes. We never raise on missing privileges: the SPN may lack visibility into
+# some sharing views, in which case the overlay is simply empty.
+# ---------------------------------------------------------------------------
+
+
+def _fetch_share_recipient_map(client: WorkspaceClient) -> dict[str, list[str]]:
+    """share_name -> [recipient_name, ...] for shares granted SELECT. Empty on error."""
+    sql = """
+    SELECT share_name, recipient_name
+    FROM system.information_schema.share_recipient_privileges
+    WHERE privilege_type = 'SELECT'
+    """
+    out: dict[str, list[str]] = {}
+    try:
+        for r in _execute_sql(client, sql):
+            out.setdefault(r["share_name"], []).append(r["recipient_name"])
+    except Exception as e:
+        logger.warning(f"share_recipient_privileges query failed: {e}")
+    return out
+
+
+def get_sharing_overlay(catalog: str, schema: str | None, audience: str = "both",
+                        skip_cache: bool = False) -> SharingOverlay:
+    """Delta Sharing overlay for a lineage scope.
+
+    audience: 'provider' (outbound only), 'recipient' (inbound only), or 'both'.
+    Outbound = my tables published into a share (table_share_usage).
+    Inbound  = local catalogs created from a Delta Share (catalog_provider_share_usage).
+    """
+    aud = audience if audience in ("provider", "recipient", "both") else "both"
+    cache_key = f"sharing_overlay:{catalog}.{schema}:{aud}"
+
+    def _fetch() -> SharingOverlay:
+        client = _get_client()
+        want_out = aud in ("provider", "both")
+        want_in = aud in ("recipient", "both")
+        any_view_read = False
+        shared_out: list[SharedOutEntry] = []
+        foreign_catalogs: list[ForeignCatalogEntry] = []
+
+        # --- Outbound: tables in this scope that are published into shares ---
+        if want_out:
+            # Metastore-wide (no catalog/schema filter): table_share_usage is tiny
+            # (only shared objects), and a cross-catalog trace needs shared-out
+            # tables from ANY catalog, not just the focused one. The frontend
+            # matches these against the nodes actually in the graph.
+            sql = """
+            SELECT catalog_name, schema_name, table_name, share_name,
+                   shared_as_schema, shared_as_table, cdf_enabled
+            FROM system.information_schema.table_share_usage
+            """
+            try:
+                rows = _execute_sql(client, sql)
+                any_view_read = True
+                recip_map = _fetch_share_recipient_map(client) if rows else {}
+                for r in rows:
+                    fq = f"{r['catalog_name']}.{r['schema_name']}.{r['table_name']}"
+                    alias = None
+                    if r.get("shared_as_table"):
+                        sa_schema = r.get("shared_as_schema") or r["schema_name"]
+                        alias = f"{sa_schema}.{r['shared_as_table']}"
+                    shared_out.append(SharedOutEntry(
+                        full_name=fq,
+                        share_name=r["share_name"],
+                        recipients=sorted(recip_map.get(r["share_name"], [])),
+                        shared_as=alias,
+                        cdf_enabled=str(r.get("cdf_enabled")).lower() == "true",
+                    ))
+            except Exception as e:
+                logger.warning(f"table_share_usage query failed: {e}")
+
+        # --- Inbound: local catalogs created from a Delta Share (metastore-wide) ---
+        if want_in:
+            sql = """
+            SELECT c.catalog_name, c.provider_name, c.share_name, p.cloud, p.region
+            FROM system.information_schema.catalog_provider_share_usage c
+            LEFT JOIN system.information_schema.providers p
+              ON c.provider_name = p.provider_name
+            """
+            try:
+                rows = _execute_sql(client, sql)
+                any_view_read = True
+                by_cat: dict[str, ForeignCatalogEntry] = {}
+                for r in rows:
+                    cat = r["catalog_name"]
+                    entry = by_cat.get(cat)
+                    if entry is None:
+                        entry = ForeignCatalogEntry(
+                            catalog_name=cat,
+                            provider_name=r.get("provider_name") or "unknown",
+                            cloud=r.get("cloud"),
+                            region=r.get("region"),
+                        )
+                        by_cat[cat] = entry
+                    if r.get("share_name") and r["share_name"] not in entry.share_names:
+                        entry.share_names.append(r["share_name"])
+                foreign_catalogs = sorted(by_cat.values(), key=lambda e: e.catalog_name)
+            except Exception as e:
+                logger.warning(f"catalog_provider_share_usage query failed: {e}")
+
+        return SharingOverlay(
+            audience=aud,
+            shared_out=shared_out,
+            foreign_catalogs=foreign_catalogs,
+            available=any_view_read,
+        )
+
+    return _cached_fetch(cache_key, _fetch, skip_cache=skip_cache)
+
+
+def get_sharing_overview(skip_cache: bool = False) -> dict:
+    """Metastore-wide Delta Sharing inventory for the landing 'Sharing overview' card.
+
+    Counts and lists of shares, recipients, providers, foreign catalogs, and the
+    tables published into shares. Each query degrades to empty on missing privileges.
+    """
+    cache_key = "sharing_overview"
+
+    def _fetch() -> dict:
+        client = _get_client()
+
+        def _rows(sql: str) -> list[dict]:
+            try:
+                return _execute_sql(client, sql)
+            except Exception as e:
+                logger.warning(f"sharing overview query failed: {e}")
+                return []
+
+        shares = _rows(
+            "SELECT share_name, share_owner, comment, created_by "
+            "FROM system.information_schema.shares ORDER BY share_name"
+        )
+        recipients = _rows(
+            "SELECT recipient_name, authentication_type, recipient_owner, comment "
+            "FROM system.information_schema.recipients ORDER BY recipient_name"
+        )
+        providers = _rows(
+            "SELECT provider_name, cloud, region, comment "
+            "FROM system.information_schema.providers ORDER BY provider_name"
+        )
+        shared_tables = _rows(
+            "SELECT catalog_name, schema_name, table_name, share_name "
+            "FROM system.information_schema.table_share_usage "
+            "ORDER BY share_name, catalog_name, schema_name, table_name"
+        )
+        foreign = _rows(
+            "SELECT catalog_name, provider_name, share_name "
+            "FROM system.information_schema.catalog_provider_share_usage "
+            "ORDER BY catalog_name"
+        )
+
+        # recipients-per-share + tables-per-share for the share list
+        recip_map = _fetch_share_recipient_map(client)
+        tables_per_share: dict[str, int] = {}
+        for t in shared_tables:
+            tables_per_share[t["share_name"]] = tables_per_share.get(t["share_name"], 0) + 1
+
+        # foreign catalogs grouped (a catalog can map to many shares)
+        fcat: dict[str, dict] = {}
+        for r in foreign:
+            cat = r["catalog_name"]
+            d = fcat.setdefault(cat, {"catalog_name": cat, "provider_name": r.get("provider_name"), "share_names": []})
+            if r.get("share_name"):
+                d["share_names"].append(r["share_name"])
+
+        return {
+            "shares": [
+                {
+                    "share_name": s["share_name"],
+                    "owner": s.get("share_owner"),
+                    "comment": s.get("comment"),
+                    "num_tables": tables_per_share.get(s["share_name"], 0),
+                    "recipients": sorted(recip_map.get(s["share_name"], [])),
+                }
+                for s in shares
+            ],
+            "recipients": [
+                {
+                    "recipient_name": r["recipient_name"],
+                    "authentication_type": r.get("authentication_type"),
+                    "owner": r.get("recipient_owner"),
+                    "comment": r.get("comment"),
+                }
+                for r in recipients
+            ],
+            "providers": [
+                {
+                    "provider_name": p["provider_name"],
+                    "cloud": p.get("cloud"),
+                    "region": p.get("region"),
+                    "comment": p.get("comment"),
+                }
+                for p in providers
+            ],
+            "foreign_catalogs": sorted(fcat.values(), key=lambda d: d["catalog_name"]),
+            "shared_tables": [
+                {
+                    "full_name": f"{t['catalog_name']}.{t['schema_name']}.{t['table_name']}",
+                    "share_name": t["share_name"],
+                }
+                for t in shared_tables
+            ],
+            "totals": {
+                "shares": len(shares),
+                "recipients": len(recipients),
+                "providers": len(providers),
+                "foreign_catalogs": len(fcat),
+                "shared_tables": len(shared_tables),
+            },
+        }
 
     return _cached_fetch(cache_key, _fetch, skip_cache=skip_cache)
 

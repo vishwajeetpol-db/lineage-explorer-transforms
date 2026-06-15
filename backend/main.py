@@ -40,10 +40,13 @@ from backend.lineage_service import (
     list_schemas,
     list_all_tables,
     get_table_lineage,
+    get_lineage_trace,
     get_column_lineage,
     get_schema_column_lineage,
     get_columns,
     get_table_edges,
+    get_sharing_overlay,
+    get_sharing_overview,
     resolve_entity_name,
     invalidate_cache,
     evict_cache_entry,
@@ -161,6 +164,7 @@ def _get_user_info(request: Request) -> tuple[str | None, bool]:
 # even though identifiers are interpolated through backticks/quotes downstream.
 # ---------------------------------------------------------------------------
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_]{1,255}$")
+_FULL_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,255}\.[A-Za-z0-9_]{1,255}\.[A-Za-z0-9_]{1,255}$")
 _JOB_ID_RE = re.compile(r"^[0-9]{1,32}$")
 _PIPELINE_ID_RE = re.compile(r"^[a-fA-F0-9-]{8,64}$")
 _NOTEBOOK_ID_RE = re.compile(r"^[A-Za-z0-9_./@ +-]{1,512}$")
@@ -544,6 +548,24 @@ async def api_get_lineage(request: Request, catalog: str = Query(...), schema: s
         raise HTTPException(status_code=500, detail=_safe_error(e))
 
 
+@app.get("/api/lineage/trace")
+async def api_lineage_trace(request: Request, table: str = Query(...), live: bool = Query(False)):
+    """End-to-end cross-catalog lineage trace from a single seed table.
+    Walks system.access.table_lineage in both directions across all catalogs."""
+    table = table.strip()
+    if not _FULL_NAME_RE.match(table):
+        raise HTTPException(status_code=400, detail="table must be a fully-qualified catalog.schema.table name")
+    if live:
+        _, is_admin = await asyncio.to_thread(_get_user_info, request)
+        if not is_admin:
+            live = False
+    try:
+        return await asyncio.to_thread(get_lineage_trace, table, live)
+    except Exception as e:
+        logger.error(f"Error tracing lineage for {table}: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
 @app.get("/api/columns")
 async def api_get_columns(
     request: Request,
@@ -686,6 +708,46 @@ async def api_export_lineage(
     )
 
 
+@app.get("/api/sharing/overlay")
+async def api_sharing_overlay(
+    request: Request,
+    catalog: str = Query(...),
+    schema: str | None = Query(None),
+    audience: str = Query("both"),
+    live: bool = Query(False),
+):
+    """Delta Sharing overlay for a lineage scope — outbound (shared tables) and/or
+    inbound (foreign catalogs). The frontend merges this onto the current graph."""
+    catalog = _validate_identifier(catalog, "catalog")
+    if schema is not None:
+        schema = _validate_identifier(schema, "schema")
+    if audience not in ("provider", "recipient", "both"):
+        audience = "both"
+    if live:
+        _, is_admin = await asyncio.to_thread(_get_user_info, request)
+        if not is_admin:
+            live = False
+    try:
+        return await asyncio.to_thread(get_sharing_overlay, catalog, schema, audience, live)
+    except Exception as e:
+        logger.error(f"Error getting sharing overlay: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/sharing/overview")
+async def api_sharing_overview(request: Request, live: bool = Query(False)):
+    """Metastore-wide Delta Sharing inventory for the landing 'Sharing overview' card."""
+    if live:
+        _, is_admin = await asyncio.to_thread(_get_user_info, request)
+        if not is_admin:
+            live = False
+    try:
+        return await asyncio.to_thread(get_sharing_overview, live)
+    except Exception as e:
+        logger.error(f"Error getting sharing overview: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
 @app.get("/api/entity-name")
 async def api_entity_name(entity_type: str = Query(...), entity_id: str = Query(...)):
     """Resolve an entity (job/pipeline/notebook) ID to a display name + metadata."""
@@ -701,12 +763,16 @@ async def api_entity_name(entity_type: str = Query(...), entity_id: str = Query(
 
 @app.post("/api/cache/invalidate")
 async def api_invalidate_cache(request: Request):
-    """Cache invalidation — protected: only callable from localhost or the app itself."""
-    client_ip = request.client.host if request.client else ""
-    if client_ip not in ("127.0.0.1", "::1", "localhost"):
-        logger.warning(f"Cache invalidation attempt from external IP: {client_ip}")
-        raise HTTPException(status_code=403, detail="Cache invalidation is restricted")
+    """Cache invalidation — ADMIN ONLY. (Was IP-gated to localhost, but behind the
+    Databricks Apps proxy request.client.host is the proxy — which can resolve to
+    localhost — so the IP check failed open and let any authenticated user flush
+    the cache. Gate by admin identity instead.)"""
+    email, is_admin = await asyncio.to_thread(_get_user_info, request)
+    if not is_admin:
+        logger.warning(f"Non-admin cache invalidation attempt by {email}")
+        raise HTTPException(status_code=403, detail="Admin access required")
     invalidate_cache()
+    logger.info(f"Admin {email} invalidated the full cache")
     return {"status": "ok", "message": "Cache cleared"}
 
 
