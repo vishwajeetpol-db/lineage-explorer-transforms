@@ -849,6 +849,11 @@ def _parse_lineage_ref(table_full_name: str | None, path: str | None, ref_type: 
         return table_full_name, type_map.get(ref_type, ref_type or "TABLE")
 
     if path:
+        # Write-side volume paths arrive dbfs-scheme-prefixed (dbfs:/Volumes/...) while
+        # read-side paths are bare (/Volumes/...). Normalize so both resolve to the same
+        # VOLUME node id instead of fragmenting into a VOLUME node + a PATH node.
+        if path.startswith("dbfs:/Volumes/"):
+            path = path[len("dbfs:"):]
         # Volume path: /Volumes/catalog/schema/volume_name/...
         if path.startswith("/Volumes/"):
             parts = path.split("/")
