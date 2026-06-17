@@ -38,6 +38,19 @@ class TestParseLineageRef:
         assert node_id == "mycatalog.myschema.myvol"
         assert node_type == "VOLUME"
 
+    def test_dbfs_prefixed_volume_matches_bare_volume(self):
+        # Write-side lineage records volumes as dbfs:/Volumes/...; read-side as
+        # bare /Volumes/.... Both must resolve to the SAME volume node id, or a
+        # table->volume->table chain fragments into two disconnected nodes.
+        bare_id, bare_type = _parse_lineage_ref(
+            None, "/Volumes/mycatalog/myschema/myvol/data.csv", None
+        )
+        dbfs_id, dbfs_type = _parse_lineage_ref(
+            None, "dbfs:/Volumes/mycatalog/myschema/myvol/_tmp_write", None
+        )
+        assert dbfs_id == bare_id == "mycatalog.myschema.myvol"
+        assert dbfs_type == bare_type == "VOLUME"
+
     def test_short_volume_path_fallback(self):
         node_id, node_type = _parse_lineage_ref(
             None, "/Volumes/onlyone", None
