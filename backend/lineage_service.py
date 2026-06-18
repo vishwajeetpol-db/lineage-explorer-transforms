@@ -1413,6 +1413,59 @@ def get_columns(catalog: str, schema: str, table: str, skip_cache: bool = False)
     return _cached_fetch(cache_key, _fetch, skip_cache=skip_cache)
 
 
+def run_diagnostics() -> dict:
+    """Probe the prerequisites a fresh deploy needs and report what's reachable.
+
+    The hot-path data functions all swallow missing-grant / disabled-system-table
+    errors and return empty results, so a misconfigured deploy looks like an empty
+    app with no explanation. This turns each silent failure into an actionable
+    status. Read-only — every probe is a `LIMIT 1` / `SELECT 1`, no row data.
+    """
+    client = _get_client()
+    warehouse_id = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
+    checks: list[dict] = []
+
+    def probe(name: str, sql: str, hint: str, required: bool) -> None:
+        try:
+            _execute_sql(client, sql)
+            checks.append({"check": name, "ok": True, "required": required, "detail": "reachable"})
+        except Exception as e:
+            checks.append({"check": name, "ok": False, "required": required,
+                           "detail": str(e)[:200], "hint": hint})
+
+    if not warehouse_id:
+        checks.append({"check": "warehouse", "ok": False, "required": True,
+                       "detail": "DATABRICKS_WAREHOUSE_ID is not set",
+                       "hint": "Bind a SQL warehouse to the app (databricks.yml resources) "
+                               "and pass --var warehouse_id=<id> at deploy."})
+    else:
+        probe("warehouse", "SELECT 1",
+              "Grant the app service principal CAN_USE on the SQL warehouse.", required=True)
+        probe("system.access (lineage)",
+              "SELECT 1 FROM system.access.table_lineage LIMIT 1",
+              "Enable system.access (Account console → Settings → System tables) AND grant the "
+              "app SPN SELECT (see setup.sql). Without this the lineage graph is empty.",
+              required=True)
+        probe("system.billing (cost)",
+              "SELECT 1 FROM system.billing.usage LIMIT 1",
+              "Enable system.billing and grant the SPN SELECT to show pipeline/job cost.",
+              required=False)
+        probe("system.information_schema (sharing)",
+              "SELECT 1 FROM system.information_schema.shares LIMIT 1",
+              "Grant the SPN SELECT on system.information_schema for Delta Sharing badges.",
+              required=False)
+        probe("catalogs browsable", "SHOW CATALOGS",
+              "Grant USE CATALOG + BROWSE on each explorable catalog (see setup.sql).",
+              required=True)
+
+    required_ok = all(c["ok"] for c in checks if c.get("required"))
+    return {
+        "ok": required_ok,
+        "warehouse_id_set": bool(warehouse_id),
+        "checks": checks,
+    }
+
+
 def get_schema_column_lineage(catalog: str, schema: str, skip_cache: bool = False) -> ColumnLineageResponse:
     """All column lineage for a schema from system.access.column_lineage.
 
