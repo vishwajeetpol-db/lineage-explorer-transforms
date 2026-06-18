@@ -25,6 +25,9 @@ variables:
   cost_cache_ttl_seconds:
     description: "TTL (seconds) for the per-entity serverless-cost cache; billing rolls up daily"
     default: "21600"
+  app_name:
+    description: "Databricks App name. Override to avoid collisions in a shared workspace or to run multiple instances."
+    default: "lineage-explorer"
 
 # Files excluded from `databricks bundle deploy` uploads.
 # `.databricksignore` is best-effort across CLI versions — `sync.exclude` is authoritative.
@@ -58,6 +61,9 @@ sync:
     - "create_stress_test.py"
     - "generate_stress_test.py"
     - "setup_demo_lineage.py"
+    - "setup_full_demo.py"
+    - "setup.sql"
+    - "grant_app_access.sh"
     - "*.png"
     - "ss_*"
     - "screenshot_*"
@@ -78,10 +84,11 @@ targets:
     #   databricks bundle deploy -t dev --profile <profile> --var warehouse_id=<id>
     variables:
       rate_limit_max_requests: "200"  # higher cap for dev (admin dashboard polls every 10s)
+      app_name: "lineage-explorer-direct"
     resources:
       apps:
         lineage-explorer:
-          name: lineage-explorer-direct
+          name: ${var.app_name}
           description: "Unity Catalog Lineage Explorer — Interactive DAG visualization"
           source_code_path: .
           resources:
@@ -122,7 +129,7 @@ targets:
     resources:
       apps:
         lineage-explorer:
-          name: lineage-explorer
+          name: ${var.app_name}
           description: "Unity Catalog Lineage Explorer — Interactive DAG visualization"
           source_code_path: .
           resources:

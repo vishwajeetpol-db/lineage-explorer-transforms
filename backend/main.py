@@ -371,6 +371,18 @@ async def health_check():
     return {"status": "ok", "version": APP_VERSION}
 
 
+@app.get("/api/diagnostics")
+async def api_diagnostics():
+    """Deploy self-check: reports which prerequisites (warehouse, system.access,
+    system.billing, information_schema, catalog BROWSE) are actually reachable by
+    the app's service principal. Intentionally unauthenticated — it's used to
+    troubleshoot a fresh deploy before admin OAuth scopes are wired up, and it
+    exposes only reachability status, never row data."""
+    from backend.lineage_service import run_diagnostics
+    result = await asyncio.to_thread(run_diagnostics)
+    return JSONResponse(result, status_code=200 if result["ok"] else 503)
+
+
 @app.get("/api/admin/status")
 async def api_admin_status(request: Request):
     """Admin-only utilization dashboard — returns system metrics and cache status."""

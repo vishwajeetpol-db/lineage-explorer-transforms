@@ -20,15 +20,30 @@ Unity Catalog captures lineage from every SQL operation — but reading it means
 
 ## Quick start
 
-**Prerequisites:** Databricks CLI v0.239+, a SQL warehouse, Unity Catalog, and **system tables enabled** — `system.access` (lineage) and `system.billing` (cost). *Without `system.access`, the app shows no lineage — the #1 "empty app" cause.*
+Deploying to your own workspace is a short ordered checklist — not every step is automated, so follow them in order. Run `/api/diagnostics` at the end to confirm.
 
+**0. Account-admin prerequisites** (do these once, before deploying):
+- **Enable system tables** (Account console → Settings → System tables): `system.access` (lineage — *required*, the #1 "empty app" cause if missing), `system.billing` (cost), `system.information_schema` (Delta Sharing).
+- A **SQL warehouse** (serverless or pro) and **Unity Catalog**. Databricks CLI **v0.239+**.
+
+**1. Deploy** (creates the app + its service principal):
 ```bash
 databricks auth login --profile <profile>
 databricks bundle deploy -t dev --profile <profile> --var warehouse_id=<warehouse-id>
 databricks bundle run lineage-explorer -t dev --profile <profile>
 ```
+> The app name defaults to `lineage-explorer-direct` (dev) / `lineage-explorer` (prod). In a shared workspace, override it to avoid collisions: `--var app_name=<your-name>`.
 
-Then, as a **metastore admin**, grant the app's service principal read on the system tables + `BROWSE` on the catalogs you want explorable — fill in the placeholders in **[`setup.sql`](setup.sql)** and run it. (End-to-end traces span catalogs, so grant on every catalog in the lineage you want visible.)
+**2. Grant the app's service principal** (as a **metastore admin**). The SP only exists after step 1. Easiest path — the helper resolves the SP and applies the grants:
+```bash
+./grant_app_access.sh --profile <profile> --warehouse <warehouse-id> \
+    --catalogs "catalog_a catalog_b"
+```
+Or do it by hand: fill the `:APP_SP` / `:CATALOG` placeholders in **[`setup.sql`](setup.sql)** and run it. End-to-end traces span catalogs, so grant `BROWSE` on **every** catalog you want visible.
+
+**3. (Optional) Live mode** — enable App on-behalf-of OAuth + scopes `iam.current-user:read`, `iam.access-control:read`, and set `--var admin_group_name=<your-admin-group>` if it isn't `admins`.
+
+**4. Verify** — open `https://<app-url>/api/diagnostics`. It reports exactly which prerequisites the SP can reach (warehouse, `system.access`, `system.billing`, `information_schema`, catalog BROWSE), so a misconfigured deploy surfaces a clear reason instead of an empty graph.
 
 ## Documentation
 
