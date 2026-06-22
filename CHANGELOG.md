@@ -6,6 +6,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [2.1.0] - 2026-06-22
+
+### Fixed
+
+- **CRITICAL: Orphaned polling race** — `closePanel()` could not cancel scheduled `setTimeout`, causing stale poll to re-open panel. Added triple guard in `transformStore.ts`.
+- **CRITICAL: Double-open race** — rapid column clicks caused parallel `openPanel` chains to overwrite each other. Added staleness guard after each await.
+- **BuildSubmitResponse type** — added `'fresh'` status and `message` field to match backend.
+- **F401 lint errors** (10+ files) — removed all unused imports across the codebase.
+
+### Changed
+
+- ARCHITECTURE.md updated to v2.1.0 with race condition documentation.
+
+---
+
 ## [2.0.0] - 2025-06-22
 
 ### Summary

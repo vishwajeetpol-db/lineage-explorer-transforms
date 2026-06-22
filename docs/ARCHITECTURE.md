@@ -1,7 +1,7 @@
 # NEXUS Lineage — Architecture & Functionality Reference
 
-> **Version**: 2.0.0  
-> **Last Updated**: 2025-06-22  
+> **Version**: 2.1.0  
+> **Last Updated**: 2026-06-22  
 > **Tech Stack**: FastAPI · React · TypeScript · ReactFlow · ELK.js · Databricks Apps · DABs
 
 ---
@@ -222,6 +222,8 @@ The 8-phase transformation lineage pipeline:
 | Max depth reached in BFS | Stops at configured limit, reports `max_depth_reached` |
 | Concurrent build requests | Freshness check prevents redundant jobs |
 | Build job failure | `BuildJobStatus.is_success=false` with state_message |
+| Orphaned polling (panel closed mid-build) | Triple guard: `buildPolling` + `panelState !== 'closed'` checked at poll entry, post-await, and pre-schedule |
+| Double-open race (rapid column clicks) | Staleness guard compares `selectedTable/Column` after each await; aborts if superseded |
 | Rate limit exceeded | 429 with clear message; per-user (not per-IP) |
 | Graph too large (catalog-wide) | 413 with actionable message |
 | Path traversal attacks | `os.path.realpath` + prefix validation on static files |
