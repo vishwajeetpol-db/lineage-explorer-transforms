@@ -108,12 +108,16 @@ export const useTransformStore = create<TransformState>((set, get) => ({
       return;
     }
 
+    // Stop any existing poll from a previous open before resetting state
     set({
       panelState: 'loading',
       panelError: null,
       selectedTable: tableFqn,
       selectedColumn: column,
       traceResult: null,
+      buildPolling: false,
+      buildRunId: null,
+      buildStatus: null,
       // Reset pruning on new column selection
       maxDepth: 8,
       hiddenCategories: new Set<string>(),
@@ -123,6 +127,12 @@ export const useTransformStore = create<TransformState>((set, get) => ({
     try {
       // 1. Check freshness
       const freshness = await getTransformFreshness(catalog, schema, table);
+
+      // Guard: if user clicked a different column while we were awaiting, abort
+      if (get().selectedTable !== tableFqn || get().selectedColumn !== column) {
+        return;
+      }
+
       set({ freshness });
 
       if (!freshness.exists || freshness.is_stale) {
@@ -135,7 +145,10 @@ export const useTransformStore = create<TransformState>((set, get) => ({
       // 2. Lineage exists and is fresh — load trace
       await get().loadTrace(catalog, schema, table, column);
     } catch (err: any) {
-      set({ panelState: 'error', panelError: err.message || 'Failed to load' });
+      // Only set error if this is still the active panel request
+      if (get().selectedTable === tableFqn && get().selectedColumn === column) {
+        set({ panelState: 'error', panelError: err.message || 'Failed to load' });
+      }
     }
   },
 
@@ -181,8 +194,21 @@ export const useTransformStore = create<TransformState>((set, get) => ({
     if (!buildRunId) return;
 
     const poll = async () => {
+      // Guard: if panel was closed or polling was stopped, abort immediately.
+      // This prevents the orphaned-timeout race condition where closePanel()
+      // resets state but a previously-scheduled setTimeout still fires.
+      if (!get().buildPolling || get().panelState === 'closed') {
+        return;
+      }
+
       try {
         const status = await getBuildStatus(buildRunId);
+
+        // Re-check after await — panel may have been closed during the fetch
+        if (!get().buildPolling || get().panelState === 'closed') {
+          return;
+        }
+
         set({ buildStatus: status });
 
         if (status.is_complete) {
@@ -204,16 +230,19 @@ export const useTransformStore = create<TransformState>((set, get) => ({
           return;
         }
 
-        // Continue polling
-        if (get().buildPolling) {
+        // Continue polling — re-check guard before scheduling next tick
+        if (get().buildPolling && get().panelState !== 'closed') {
           setTimeout(poll, 3000);
         }
       } catch (err: any) {
-        set({
-          panelState: 'error',
-          panelError: `Polling error: ${err.message}`,
-          buildPolling: false,
-        });
+        // Only set error if panel is still open
+        if (get().panelState !== 'closed') {
+          set({
+            panelState: 'error',
+            panelError: `Polling error: ${err.message}`,
+            buildPolling: false,
+          });
+        }
       }
     };
 
