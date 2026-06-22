@@ -115,7 +115,7 @@ print(f"{'='*60}")
 # DBTITLE 1,Sub-Lineage & Backtracking (skipped in BUILD_ONLY mode)
 if not BUILD_ONLY:
     from transformation_lineage.sublineage.api import (
-        find_shortest_path, backtrack_target, invalidate_graph_cache
+        backtrack_target, invalidate_graph_cache
     )
     invalidate_graph_cache()
 

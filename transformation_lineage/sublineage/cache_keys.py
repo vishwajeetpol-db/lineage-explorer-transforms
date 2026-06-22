@@ -15,7 +15,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
-from pyspark.sql import Row, SparkSession
+from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, StringType, StructField, StructType, TimestampType
 

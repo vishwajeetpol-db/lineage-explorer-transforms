@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timezone
-from typing import Sequence
 
 from pyspark.sql import Row, SparkSession
 from pyspark.sql import functions as F

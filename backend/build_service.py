@@ -15,7 +15,6 @@ Design:
 import os
 import logging
 from datetime import datetime
-from typing import Optional
 
 import requests as http_client
 from databricks.sdk.service.jobs import RunLifeCycleState, RunResultState

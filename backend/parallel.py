@@ -13,7 +13,7 @@ Key design:
 """
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Callable, TypeVar, Sequence
 
 logger = logging.getLogger(__name__)

@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Callable, Sequence
 
-from pyspark.sql import Row, SparkSession
+from pyspark.sql import SparkSession
 from pyspark.sql.types import (
     IntegerType,
     LongType,
