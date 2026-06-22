@@ -1,8 +1,9 @@
 import { memo, useCallback, useMemo, useRef } from "react";
 import { Handle, Position, type NodeProps } from "reactflow";
 import { motion, AnimatePresence } from "framer-motion";
-import { Database, Eye, Layers, ChevronDown, Key, ExternalLink, HardDrive, FolderOpen, Zap, Share2, Building2 } from "lucide-react";
+import { Database, Eye, Layers, ChevronDown, Key, ExternalLink, HardDrive, FolderOpen, Zap, Share2, Building2, Microscope } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
+import { useTransformStore } from "../../store/transformStore";
 import type { TableNode as TableNodeType } from "../../api/client";
 
 // Injected by the Delta Sharing overlay (see LineageCanvas). Optional — only
@@ -59,6 +60,16 @@ function TableNodeComponent({ data, id }: NodeProps<TableNodeType & { isExpanded
       }
     },
     [id, selectedColumn, setSelectedColumn]
+  );
+
+  // Transformation lineage drill-down: opens the TransformPanel for the selected column
+  const handleTransformDrillDown = useCallback(
+    (colName: string, e: React.MouseEvent) => {
+      e.stopPropagation();
+      // id is the full table name (catalog.schema.table)
+      useTransformStore.getState().openPanel(id, colName);
+    },
+    [id]
   );
 
   const columns: { name: string; type: string; nullable: boolean }[] = useMemo(() => data.columns || [], [data.columns]);
@@ -199,6 +210,19 @@ function TableNodeComponent({ data, id }: NodeProps<TableNodeType & { isExpanded
                     <span className={`text-[10px] font-mono tracking-wide ${isColSelected ? "text-purple-400/60" : "text-slate-600"}`}>
                       {col.type}
                     </span>
+
+                    {/* Transformation drill-down icon */}
+                    {isColSelected && (
+                      <motion.button
+                        initial={{ opacity: 0, scale: 0.8 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        onClick={(e) => handleTransformDrillDown(col.name, e)}
+                        className="p-0.5 rounded hover:bg-purple-500/20 text-purple-400 hover:text-purple-300 transition-colors"
+                        title="View transformation lineage"
+                      >
+                        <Microscope size={11} />
+                      </motion.button>
+                    )}
 
                     <Handle
                       type="source"

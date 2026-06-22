@@ -53,6 +53,20 @@ from backend.lineage_service import (
     get_cache_snapshot,
     _get_client,
 )
+from backend.transform_service import (
+    get_transform_freshness,
+    backtrack_transform_lineage,
+    get_transform_categories,
+    get_transform_cache_snapshot,
+    invalidate_transform_cache,
+)
+from backend.build_service import (
+    submit_build_job,
+    get_build_status,
+    is_build_configured,
+    BUILD_STEPS,
+)
+from backend.models import BuildJobRequest
 
 class _JsonLogFormatter(logging.Formatter):
     """Structured JSON logs — one line per record so downstream log queries
@@ -244,7 +258,7 @@ async def lifespan(app: FastAPI):
         invalidate_cache()
 
 
-app = FastAPI(title="Lineage Explorer", version=APP_VERSION, lifespan=lifespan)
+app = FastAPI(title="NEXUS Lineage", version=APP_VERSION, lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +812,127 @@ async def api_admin_evict_cache(request: Request, key: str = Query(...)):
         logger.info(f"Admin {email} evicted cache key: {key}")
         return {"status": "ok", "message": f"Evicted: {key}"}
     return {"status": "not_found", "message": f"Key not in cache: {key}"}
+
+
+# ---------------------------------------------------------------------------
+# Transformation Lineage endpoints — the "microscopic" drill-down
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/transform/freshness")
+async def api_transform_freshness(
+    catalog: str = Query(...),
+    schema: str = Query(...),
+    table: str = Query(...),
+):
+    """Check if transformation lineage exists for a table and whether it's stale."""
+    catalog = _validate_identifier(catalog, "catalog")
+    schema = _validate_identifier(schema, "schema")
+    table = _validate_identifier(table, "table")
+    try:
+        result = await asyncio.to_thread(get_transform_freshness, catalog, schema, table)
+        return result
+    except Exception as e:
+        logger.error(f"Error checking transform freshness: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.post("/api/transform/build")
+async def api_transform_build(request: Request, body: BuildJobRequest):
+    """Submit a serverless job to build transformation lineage for a table.
+    Requires the PIPELINE_NOTEBOOK_PATH to be configured."""
+    if not is_build_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Build pipeline not configured. Set PIPELINE_NOTEBOOK_PATH in databricks.yml.",
+        )
+
+    table_fqn = body.table_fqn.strip()
+    # Validate FQN format (catalog.schema.table)
+    if not _FULL_NAME_RE.match(table_fqn):
+        raise HTTPException(
+            status_code=400,
+            detail="table_fqn must be fully qualified: catalog.schema.table",
+        )
+    parts = table_fqn.split(".")
+    catalog, schema, table = parts[0], parts[1], parts[2]
+
+    # Check freshness first (unless force_rebuild)
+    if not body.force_rebuild:
+        freshness = await asyncio.to_thread(
+            get_transform_freshness, catalog, schema, table
+        )
+        if freshness.exists and not freshness.is_stale:
+            return {
+                "status": "fresh",
+                "message": f"Lineage is fresh ({freshness.age_str}). Use force_rebuild=true to rebuild.",
+                "freshness": freshness,
+            }
+
+    try:
+        run_id = await asyncio.to_thread(submit_build_job, table_fqn)
+        return {
+            "status": "submitted",
+            "run_id": run_id,
+            "table_fqn": table_fqn,
+            "steps": BUILD_STEPS,
+        }
+    except Exception as e:
+        logger.error(f"Error submitting build job for {table_fqn}: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/transform/status/{run_id}")
+async def api_transform_status(run_id: str):
+    """Poll the progress of a running transformation lineage build job."""
+    if not run_id.isdigit():
+        raise HTTPException(status_code=400, detail="run_id must be numeric")
+    try:
+        result = await asyncio.to_thread(get_build_status, run_id)
+        # On successful completion, invalidate transform cache so next
+        # trace query picks up the fresh edges.
+        if result.is_complete and result.is_success:
+            invalidate_transform_cache()
+        return result
+    except Exception as e:
+        logger.error(f"Error getting build status for run {run_id}: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/transform/trace")
+async def api_transform_trace(
+    catalog: str = Query(...),
+    schema: str = Query(...),
+    table: str = Query(...),
+    column: str = Query(...),
+    max_depth: int = Query(None),
+):
+    """Backtrack upstream transformation lineage for a specific column.
+    Returns a layered graph of columns, expressions, and categories."""
+    catalog = _validate_identifier(catalog, "catalog")
+    schema = _validate_identifier(schema, "schema")
+    table = _validate_identifier(table, "table")
+    column = _validate_identifier(column, "column")
+    try:
+        result = await asyncio.to_thread(
+            backtrack_transform_lineage, catalog, schema, table, column, max_depth
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Error tracing transform lineage for {catalog}.{schema}.{table}.{column}: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/transform/categories")
+async def api_transform_categories():
+    """Return transformation category → color mapping for the frontend legend."""
+    return {"categories": get_transform_categories()}
+
+
+@app.get("/api/transform/build-configured")
+async def api_transform_build_configured():
+    """Check if the build pipeline is configured (PIPELINE_NOTEBOOK_PATH set)."""
+    return {"configured": is_build_configured()}
 
 
 # ---------------------------------------------------------------------------

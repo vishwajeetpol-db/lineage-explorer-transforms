@@ -1,6 +1,6 @@
-# Lineage Explorer
+# NEXUS Lineage
 
-**Interactive DAG visualization for Unity Catalog lineage** — end-to-end table & column lineage, pipeline/job visibility, serverless cost, and Delta Sharing, across every catalog in your metastore. One command to deploy; zero access to your row data.
+**Unified lineage visualization with transformation drill-down** — end-to-end table & column lineage, expression-level transformation graphs, pipeline/job visibility, serverless cost, and Delta Sharing, across every catalog in your metastore. One command to deploy; zero access to your row data.
 
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat&logo=fastapi&logoColor=white) ![React](https://img.shields.io/badge/React-18-blue) ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=flat&logo=typescript&logoColor=white) ![Databricks](https://img.shields.io/badge/Databricks_Apps-FF3621?style=flat&logo=databricks&logoColor=white) ![ELK.js](https://img.shields.io/badge/ELK.js-layout-orange)
 

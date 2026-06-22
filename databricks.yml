@@ -1,5 +1,5 @@
 bundle:
-  name: lineage-explorer
+  name: nexus-lineage
 
 variables:
   warehouse_id:
@@ -25,6 +25,21 @@ variables:
   cost_cache_ttl_seconds:
     description: "TTL (seconds) for the per-entity serverless-cost cache; billing rolls up daily"
     default: "21600"
+  lineage_catalog:
+    description: "Catalog where transformation lineage Delta tables are stored"
+    default: "lattice_lineage"
+  lineage_schema:
+    description: "Schema within lineage_catalog for transformation lineage tables"
+    default: "lineage"
+  pipeline_notebook_path:
+    description: "Workspace path to the run_all notebook for building transformation lineage"
+    default: ""
+  transform_cache_ttl_seconds:
+    description: "TTL (seconds) for transformation lineage cache (shorter than table lineage)"
+    default: "3600"
+  build_cache_ttl_hours:
+    description: "Hours before transformation lineage is considered stale and needs rebuild"
+    default: "24"
   app_name:
     description: "Databricks App name. Override to avoid collisions in a shared workspace or to run multiple instances."
     default: "lineage-explorer"
@@ -121,6 +136,16 @@ targets:
                 value: ${var.lineage_window_days}
               - name: COST_CACHE_TTL_SECONDS
                 value: ${var.cost_cache_ttl_seconds}
+              - name: LINEAGE_CATALOG
+                value: ${var.lineage_catalog}
+              - name: LINEAGE_SCHEMA
+                value: ${var.lineage_schema}
+              - name: PIPELINE_NOTEBOOK_PATH
+                value: ${var.pipeline_notebook_path}
+              - name: TRANSFORM_CACHE_TTL_SECONDS
+                value: ${var.transform_cache_ttl_seconds}
+              - name: BUILD_CACHE_TTL_HOURS
+                value: ${var.build_cache_ttl_hours}
 
   prod:
     mode: production
@@ -162,3 +187,13 @@ targets:
                 value: ${var.lineage_window_days}
               - name: COST_CACHE_TTL_SECONDS
                 value: ${var.cost_cache_ttl_seconds}
+              - name: LINEAGE_CATALOG
+                value: ${var.lineage_catalog}
+              - name: LINEAGE_SCHEMA
+                value: ${var.lineage_schema}
+              - name: PIPELINE_NOTEBOOK_PATH
+                value: ${var.pipeline_notebook_path}
+              - name: TRANSFORM_CACHE_TTL_SECONDS
+                value: ${var.transform_cache_ttl_seconds}
+              - name: BUILD_CACHE_TTL_HOURS
+                value: ${var.build_cache_ttl_hours}

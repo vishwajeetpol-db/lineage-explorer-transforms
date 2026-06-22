@@ -119,7 +119,7 @@ function Landing({ onSelectTable }: Props) {
             <GitBranch size={22} className="text-white" />
           </div>
           <div>
-            <h1 className="text-[22px] font-semibold text-white tracking-tight">Lineage Explorer</h1>
+            <h1 className="text-[22px] font-semibold text-white tracking-tight">NEXUS Lineage</h1>
             <p className="text-[12px] text-slate-500">Click any table to explore its data lineage</p>
           </div>
         </motion.div>

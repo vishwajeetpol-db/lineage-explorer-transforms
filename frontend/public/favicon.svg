@@ -1,17 +1,25 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
   <defs>
-    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#6366F1"/>
-      <stop offset="100%" style="stop-color:#8B5CF6"/>
+    <linearGradient id="nexus-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FF3621"/>
+      <stop offset="50%" style="stop-color:#A855F7"/>
+      <stop offset="100%" style="stop-color:#3B82F6"/>
     </linearGradient>
   </defs>
   <rect width="32" height="32" rx="8" fill="#0A0A0F"/>
-  <circle cx="8" cy="16" r="3" fill="url(#g)"/>
-  <circle cx="16" cy="8" r="3" fill="url(#g)"/>
-  <circle cx="16" cy="24" r="3" fill="url(#g)"/>
-  <circle cx="24" cy="16" r="3" fill="url(#g)"/>
-  <line x1="10.5" y1="14.5" x2="13.5" y2="9.5" stroke="#6366F1" stroke-width="1.5" stroke-linecap="round"/>
-  <line x1="10.5" y1="17.5" x2="13.5" y2="22.5" stroke="#6366F1" stroke-width="1.5" stroke-linecap="round"/>
-  <line x1="18.5" y1="9.5" x2="21.5" y2="14.5" stroke="#8B5CF6" stroke-width="1.5" stroke-linecap="round"/>
-  <line x1="18.5" y1="22.5" x2="21.5" y2="17.5" stroke="#8B5CF6" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- Diamond lattice: 4 nodes forming an N-shaped connection pattern -->
+  <circle cx="9" cy="8" r="2.8" fill="url(#nexus-grad)"/>
+  <circle cx="9" cy="24" r="2.8" fill="url(#nexus-grad)"/>
+  <circle cx="23" cy="8" r="2.8" fill="url(#nexus-grad)"/>
+  <circle cx="23" cy="24" r="2.8" fill="url(#nexus-grad)"/>
+  <!-- Central nexus node -->
+  <circle cx="16" cy="16" r="3.2" fill="url(#nexus-grad)" opacity="0.9"/>
+  <!-- Connecting edges forming N shape -->
+  <line x1="9" y1="10.8" x2="9" y2="21.2" stroke="#FF3621" stroke-width="1.4" stroke-linecap="round" opacity="0.8"/>
+  <line x1="9" y1="8" x2="16" y2="16" stroke="#A855F7" stroke-width="1.4" stroke-linecap="round" opacity="0.7"/>
+  <line x1="16" y1="16" x2="23" y2="24" stroke="#A855F7" stroke-width="1.4" stroke-linecap="round" opacity="0.7"/>
+  <line x1="23" y1="10.8" x2="23" y2="21.2" stroke="#3B82F6" stroke-width="1.4" stroke-linecap="round" opacity="0.8"/>
+  <!-- Cross connections -->
+  <line x1="11.5" y1="9" x2="14" y2="14" stroke="#FF3621" stroke-width="1" stroke-linecap="round" opacity="0.4"/>
+  <line x1="18" y1="18" x2="20.5" y2="23" stroke="#3B82F6" stroke-width="1" stroke-linecap="round" opacity="0.4"/>
 </svg>

@@ -94,3 +94,83 @@ class SharingOverlay(BaseModel):
     shared_out: list[SharedOutEntry] = []
     foreign_catalogs: list[ForeignCatalogEntry] = []
     available: bool = True               # False when the sharing views aren't readable
+
+
+# ---------------------------------------------------------------------------
+# Transformation Lineage Models — column-level expression-aware lineage
+# from the LATTICE pipeline (transformation_lineage library).
+#
+# These power the "microscopic" drill-down: clicking a column on the table
+# lineage graph opens the transformation sub-graph showing exactly how
+# that column is derived (expressions, categories, source files).
+# ---------------------------------------------------------------------------
+
+
+class TransformNode(BaseModel):
+    """A column node in the transformation graph."""
+    node_id: str                          # e.g. "col:catalog.schema.table::column_name"
+    table_fqn: str                        # fully qualified table name
+    column: str                           # column name
+
+
+class TransformEdge(BaseModel):
+    """A transformation edge: source_column → target_column via an expression."""
+    source_node_id: str
+    target_node_id: str
+    expression: str                       # the SQL/PySpark expression (e.g. "COALESCE(a, b)")
+    category: str                         # ARITHMETIC, WINDOW, AGGREGATE, CAST, etc.
+    category_color: str                   # hex color for the category
+    source_file: str = ""                 # notebook/file where this transform is defined
+
+
+class TransformLevel(BaseModel):
+    """A depth layer in the backtracked transformation graph."""
+    depth: int                            # 0 = target column, 1+ = upstream layers
+    label: str                            # e.g. "Target Column", "Upstream Layer 1"
+    color: str                            # hex color for this depth level
+    nodes: list[TransformNode] = []       # columns discovered at this depth
+    transforms: list[TransformEdge] = []  # edges flowing INTO this depth
+
+
+class TransformResponse(BaseModel):
+    """Full response for a transformation lineage trace."""
+    levels: list[TransformLevel] = []
+    has_lineage: bool = False
+    is_source_column: bool = False        # True when the column has no upstream (it's a root)
+    cached: bool = False
+    cached_at: Optional[str] = None
+    fetch_duration_ms: Optional[int] = None
+    total_nodes: int = 0
+    total_edges: int = 0
+    max_depth_reached: int = 0
+
+
+class FreshnessInfo(BaseModel):
+    """Staleness status for a table's transformation lineage."""
+    exists: bool = False
+    edge_count: int = 0
+    last_built: Optional[str] = None      # ISO timestamp of last materialization
+    age_str: str = "Never built"          # human-readable age (e.g. "2h ago", "3d ago")
+    is_stale: bool = True
+
+
+class BuildJobRequest(BaseModel):
+    """Request to trigger a transformation lineage build."""
+    table_fqn: str                        # e.g. "catalog.schema.table"
+    force_rebuild: bool = False           # bypass freshness check
+
+
+class BuildJobStatus(BaseModel):
+    """Status of a running/completed lineage build job."""
+    run_id: str
+    state: str                            # PENDING, RUNNING, TERMINATED, ERROR, etc.
+    result_state: Optional[str] = None    # SUCCESS, FAILED, CANCELED
+    state_message: str = ""
+    progress_pct: int = 0                 # 0-100
+    is_complete: bool = False
+    is_success: bool = False
+    current_step: int = 0                 # index into steps[]
+    current_step_name: str = ""
+    total_steps: int = 8
+    steps: list[str] = []                 # ordered step names for progress bar
+    run_page_url: str = ""                # link to the job run in Databricks UI
