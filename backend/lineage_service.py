@@ -15,7 +15,6 @@ system.access.column_lineage — the source of truth captured by Unity Catalog
 from actual query execution. No inference, no heuristics, no regex parsing.
 """
 
-import json
 import os
 import re
 import sys

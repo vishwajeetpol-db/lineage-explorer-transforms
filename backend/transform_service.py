@@ -19,7 +19,6 @@ Performance optimizations (v3):
   - Single-flight coalescing with bounded per-key lock pool
 """
 
-import json
 import os
 import sys
 import time
