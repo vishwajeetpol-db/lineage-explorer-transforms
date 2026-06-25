@@ -6,6 +6,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **On-demand, opt-in transformation lineage** — clicking a column no longer auto-builds. UC column lineage is the free default; the transformation popup offers an explicit **Generate** action with a compute-cost warning. Adds `needs_build` + empty-state panel states.
+- **Multi-entity-type column transformation lineage** — beyond notebook/python-file jobs: **SQL-file tasks** (resolver `sql_task` branch); **materialized views, views, streaming tables, and SQL-defined DLT** via new **definition-based resolution** (parse the object's own `SHOW CREATE TABLE` — no discovery, no system-table lineage lag); **Lakeflow/DLT pipelines** via `PIPELINE` discovery + `pipelines.get` library resolver.
+- **Dedicated app-owned lineage store (Option A)** — all transformation edges materialize into one fixed `LINEAGE_CATALOG.LINEAGE_SCHEMA` store owned by the app service principal; node-ids carry the real data catalog, so the app SP needs **zero write** on any data catalog.
+- **Empty-state** for columns with no transformation lineage (external/shared source, unsupported producer, or not yet generated) — replaces the misleading blank-but-green popup.
+
+### Changed
+
+- **Transformation popup UX** — target column rendered on top with upstream cascading down; `fitView` zoom capped (small graphs no longer magnified ~3×); persistent zoom-stable edge labels (category + expression, no hover required); responsive canvas height. **Removed the depth slider** — the popup always shows the selected column's full end-to-end transformation lineage (depth is not a meaningful knob for a single column).
+- **`LINEAGE_WINDOW_DAYS` reconciled to 365** across code + docs, with the producer-staleness semantics documented (the window is max producer staleness before lineage drops off; pair with `event_date` partition pruning to keep a wide window cheap).
+
+### Fixed
+
+- **SQL parser** — detect `MATERIALIZED VIEW` / `STREAMING [LIVE] TABLE` / `LIVE TABLE` / `VIEW` / `OR REFRESH` output targets; unwrap `STREAM(...)` source reads; resolve unqualified columns against a single known source table.
+- **`run_pipeline`** — `sys.dont_write_bytecode = True` to avoid WSFS `__pycache__` `AsyncFlushFailedException` when importing the package from a Workspace path.
+- **Transform read/build paths** resolve the dedicated lineage store consistently (was deriving the store from the selected table's own schema).
+
+### Known limitations
+
+- **Python-defined DLT (`@dlt.table`)** — the pipeline is discovered and its notebook fetched, but the PySpark parser does not yet extract `.select()` / `.withColumn()` column logic (SQL-defined DLT works via the definition path).
+- **Streaming tables** — parse produces column nodes/edges, but the edge-endpoints serve-builder does not yet emit serve rows for the `STREAM(...)` / single-source shape (in progress).
+- **Delta Sharing / Lakehouse Federation tables** — transformation lineage is not derivable (the producing code runs in another account); detected and surfaced as an external source. A local notebook that **reads** a shared table into a local table **is** captured (the shared table appears as an upstream source).
+
+---
+
 ## [2.1.0] - 2026-06-22
 
 ### Fixed

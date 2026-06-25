@@ -77,6 +77,49 @@ def _qualify_fqn(
     return name
 
 
+# `STREAM(<table>)` / `STREAM (<table>)` — the streaming-read wrapper used by
+# streaming tables and DLT. Source-table extraction must see the inner table,
+# not the literal "STREAM"; this rewrites the wrapper away before FROM/JOIN
+# matching. (Subquery forms like STREAM(SELECT ...) don't match the simple
+# identifier group and are left for normal nested parsing.)
+_STREAM_WRAP_RE = re.compile(r"\bstream\s*\(\s*([`\"\w.]+)\s*\)", re.IGNORECASE)
+
+
+def _unwrap_streaming_sources(sql: str) -> str:
+    return _STREAM_WRAP_RE.sub(r"\1", sql)
+
+
+# SQL keywords / type names to exclude when guessing bare column identifiers
+# from an expression (used ONLY to resolve unqualified columns against a single
+# known source table, e.g. streaming tables / CTAS without table aliases).
+_SQL_NONCOLUMN = {
+    "as", "and", "or", "not", "is", "null", "case", "when", "then", "else", "end",
+    "distinct", "over", "partition", "by", "order", "asc", "desc", "interval", "cast",
+    "try_cast", "date", "timestamp", "int", "integer", "bigint", "smallint", "tinyint",
+    "string", "varchar", "char", "double", "float", "decimal", "numeric", "boolean",
+    "true", "false", "from", "where", "group", "having", "select", "on", "join", "using",
+    "in", "like", "between", "current_date", "current_timestamp", "stream", "div", "ilike",
+}
+
+
+def _unqualified_columns(expr: str) -> list[str]:
+    """Best-effort bare column identifiers in an expression: function names
+    (identifier immediately followed by ``(``), SQL keywords, type names, and
+    string literals are excluded. Used only to attribute unqualified columns to
+    a SINGLE known source table when no alias-qualified references are present.
+    """
+    e = re.sub(r"'[^']*'", " ", expr)
+    e = re.sub(r'"[^"]*"', " ", e)
+    out: list[str] = []
+    for m in re.finditer(r"\b([a-zA-Z_]\w*)\b(\s*\()?", e):
+        name, is_func = m.group(1), m.group(2)
+        if is_func or name.lower() in _SQL_NONCOLUMN:
+            continue
+        if name not in out:
+            out.append(name)
+    return out
+
+
 def extract_tables(
     sql: str,
     *,
@@ -87,6 +130,7 @@ def extract_tables(
     using `default_catalog` / `default_schema` when the source SQL only
     uses 2- or 1-part identifiers.
     """
+    sql = _unwrap_streaming_sources(sql)
     tables: list[str] = []
     for m in _TABLE_RE.finditer(sql):
         raw = _strip_quotes(m.group(1))
@@ -112,6 +156,7 @@ def extract_alias_map(
       FROM schema.table         (with `USE CATALOG c`) -> {"table": "c.schema.table"}
     """
     mapping: dict[str, str] = {}
+    sql = _unwrap_streaming_sources(sql)
     for match in _ALIAS_RE.finditer(sql):
         raw = _strip_quotes(match.group(1))
         fqn = _qualify_fqn(raw, default_catalog=default_catalog, default_schema=default_schema)
@@ -287,20 +332,40 @@ def parse_sql_text(
         for a in stmt_aliases:
             src_cols = re.findall(r"\b([\w]+)\.([\w]+)\b", a["expr"])
             if not src_cols:
-                # No qualified columns -- record the alias with an unresolved
-                # source so downstream tooling at least sees the output column.
-                all_mappings.append(
-                    {
-                        "artifact_id": artifact_id,
-                        "output_column": a["output_column"],
-                        "output_table_fqn": stmt_output,
-                        "source_ref": "",
-                        "source_fqn": None,
-                        "source_column": "",
-                        "expr": a["expr"][:2000],
-                        "expr_lang": "sql",
-                    }
-                )
+                # No alias-qualified columns. If there's exactly ONE source table
+                # (common for streaming tables / simple CTAS without aliases),
+                # attribute the expression's bare column identifiers to that
+                # single source so real edges form. Otherwise fall back to an
+                # unresolved mapping so the output column is at least visible.
+                single_src = stmt_tables[0] if len(stmt_tables) == 1 else None
+                ucols = _unqualified_columns(a["expr"]) if single_src else []
+                if single_src and ucols:
+                    for col in ucols:
+                        all_mappings.append(
+                            {
+                                "artifact_id": artifact_id,
+                                "output_column": a["output_column"],
+                                "output_table_fqn": stmt_output,
+                                "source_ref": col,
+                                "source_fqn": single_src,
+                                "source_column": col,
+                                "expr": a["expr"][:2000],
+                                "expr_lang": "sql",
+                            }
+                        )
+                else:
+                    all_mappings.append(
+                        {
+                            "artifact_id": artifact_id,
+                            "output_column": a["output_column"],
+                            "output_table_fqn": stmt_output,
+                            "source_ref": "",
+                            "source_fqn": None,
+                            "source_column": "",
+                            "expr": a["expr"][:2000],
+                            "expr_lang": "sql",
+                        }
+                    )
                 continue
             for tbl_alias, col in src_cols:
                 resolved_fqn = stmt_alias_map.get(tbl_alias.lower())

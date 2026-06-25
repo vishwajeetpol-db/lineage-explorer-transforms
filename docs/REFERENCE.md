@@ -373,6 +373,20 @@ The frontend uses [React Flow](https://reactflow.dev/) with [ELK.js](https://www
 | Billing data requires grants | `system.billing` needs `SELECT` access. If not granted, cost gracefully not shown |
 | Lineage propagation delay | UC system tables can take 5-30 minutes to reflect new lineage from recent queries |
 
+### Transformation Lineage Coverage
+
+Column-level *transformation* lineage (the SQL/PySpark expression behind each column) is **opt-in** — generate it per table from the column popup (runs a serverless build; compute cost applies; cached after). Coverage by producer type:
+
+| Producer | Supported |
+|---|---|
+| Notebook / Python-file jobs (SQL & PySpark) | ✅ |
+| SQL-file tasks | ✅ |
+| Views · materialized views · streaming tables · SQL-defined DLT | ✅ via definition-based resolution (`SHOW CREATE TABLE` — no discovery/lineage lag) |
+| Python-defined DLT (`@dlt.table`) | ⚠️ pipeline is discovered + notebook fetched, but PySpark `.select()`/`.withColumn()` extraction is not yet implemented |
+| Delta Sharing / Lakehouse Federation tables (as target) | ❌ not derivable — the producing code runs in another account; detected and surfaced as an external source |
+
+A local notebook/job that **reads** a shared or foreign table into a local table **is** captured — the shared table appears as an upstream source column (lineage stops at that boundary).
+
 ### Architecture Boundaries
 
 | Constraint | Reason |
