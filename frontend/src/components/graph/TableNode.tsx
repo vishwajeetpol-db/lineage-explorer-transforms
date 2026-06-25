@@ -55,8 +55,13 @@ function TableNodeComponent({ data, id }: NodeProps<TableNodeType & { isExpanded
       e.stopPropagation();
       if (selectedColumn?.table === id && selectedColumn?.column === colName) {
         setSelectedColumn(null);
+        // De-selecting the column also closes the transformation popup.
+        useTransformStore.getState().closePanel();
       } else {
         setSelectedColumn({ table: id, column: colName });
+        // Selecting a column also opens the transformation popup (id is the
+        // full table name catalog.schema.table).
+        useTransformStore.getState().openPanel(id, colName);
       }
     },
     [id, selectedColumn, setSelectedColumn]

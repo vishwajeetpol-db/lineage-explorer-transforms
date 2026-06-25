@@ -75,10 +75,16 @@ SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")  # max 50s per Data
 # When the in-scope table count exceeds this, we refuse rather than melt the
 # warehouse/browser. Schema-scoped requests are never capped.
 LINEAGE_MAX_NODES = int(os.environ.get("LINEAGE_MAX_NODES", "2500"))
-# Lookback window for system.access lineage queries. UC retains lineage events
-# but the app only surfaces those within this window; older-only tables show as
-# orphan. Configurable so aged demos/datasets can still be visualized.
-LINEAGE_WINDOW_DAYS = int(os.environ.get("LINEAGE_WINDOW_DAYS", "90"))
+# Lookback window for system.access lineage queries. This is effectively the max
+# staleness a producing pipeline can have before its lineage drops off the view:
+# a relationship is surfaced only if its producer emitted a lineage EVENT within
+# this window, so older-only tables (whose pipeline hasn't run in N days) appear
+# as orphans. Keep it WIDE (365d, matching databricks.yml) so infrequently-run
+# pipelines — monthly/quarterly/annual batches, one-time backfills, rarely-rebuilt
+# dimensions — still show lineage. Window size need not cost more: pair it with
+# event_date partition pruning so a wide window stays cheap. (UC system-table
+# retention is ~365d, which naturally caps this.)
+LINEAGE_WINDOW_DAYS = int(os.environ.get("LINEAGE_WINDOW_DAYS", "365"))
 
 # Lakeflow/DLT pipelines create internal backing tables alongside each
 # materialized view / streaming table (`__materialization_mat_*`, `event_log_*`,
@@ -640,7 +646,11 @@ def get_lineage_trace(seed_full_name: str, skip_cache: bool = False) -> LineageR
         fetch_start = time.time()
         result = _fetch_lineage_trace(seed_full_name)
         fetch_ms = int((time.time() - fetch_start) * 1000)
-        _cache_set(cache_key, result)
+        # Only cache complete traces. A truncated result is partial (deeper than
+        # MAX_ITERS, over the node cap, or an errored hop) — caching it would serve an
+        # incomplete graph for the full TTL instead of retrying on the next request.
+        if not result.truncated:
+            _cache_set(cache_key, result)
         return _wrap_with_cache_metadata(result, cache_key, from_cache=False, fetch_ms=fetch_ms)
 
 
@@ -694,7 +704,12 @@ def _fetch_lineage_trace(seed_full_name: str) -> LineageResponse:
                 rows = _execute_sql(client, sql)
             except Exception as e:
                 logger.warning(f"Trace query failed (need SELECT on system.access): {e}")
-                break
+                # Propagate instead of breaking: a failed hop would otherwise return a
+                # PARTIAL graph that get_lineage_trace caches for the full TTL, making the
+                # seed table look like it has almost no lineage. Raising lets the caller
+                # surface the error and the next request retry (e.g. once the warehouse
+                # is warm). See get_lineage_trace — it only caches non-truncated results.
+                raise
             _collect(rows)
             nxt: set[str] = set()
             for r in rows:
@@ -1585,7 +1600,12 @@ def get_schema_column_lineage(catalog: str, schema: str, skip_cache: bool = Fals
             """
             rows = _execute_sql(client, sql)
         except Exception as e:
+            # Don't swallow into an empty result: _cached_fetch caches unconditionally,
+            # so a transient query timeout (cold/slow warehouse) would poison this
+            # schema's column lineage for the full cache TTL. Propagate so it isn't
+            # cached and the next request retries.
             logger.warning(f"Schema column lineage query failed: {e}")
+            raise
 
         edges = [
             ColumnLineageEdge(
@@ -1652,7 +1672,8 @@ def get_table_edges(catalog: str, schema: str | None = None, skip_cache: bool = 
             rows = _execute_sql(client, sql)
         except Exception as e:
             logger.warning(f"table_edges query failed (need SELECT on system.access): {e}")
-            return []
+            # Propagate rather than caching an empty edge list for the full TTL.
+            raise
         return [
             {
                 "source": r["source"],

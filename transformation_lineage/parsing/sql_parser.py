@@ -34,6 +34,16 @@ _OUTPUT_TABLE_RES = [
         rf"\bcreate\s+(?:or\s+replace\s+)?table\s+(?:if\s+not\s+exists\s+)?({_FQN})",
         re.IGNORECASE,
     ),
+    # Declarative / Lakeflow targets: MATERIALIZED VIEW, (STREAMING) [LIVE] TABLE,
+    # and plain VIEW — supporting `OR REPLACE`/`OR REFRESH` and `TEMPORARY`.
+    # Without these, MV / streaming-table / DLT statements parse to no output
+    # target and yield zero transformation edges (silent empty popup).
+    re.compile(
+        rf"\bcreate\s+(?:or\s+(?:replace|refresh)\s+)?(?:temporary\s+)?"
+        rf"(?:materialized\s+view|streaming\s+(?:live\s+)?table|live\s+table|view)\s+"
+        rf"(?:if\s+not\s+exists\s+)?({_FQN})",
+        re.IGNORECASE,
+    ),
     re.compile(rf"\bmerge\s+into\s+({_FQN})", re.IGNORECASE),
 ]
 

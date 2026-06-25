@@ -18,6 +18,12 @@ import os
 import sys
 import time
 
+# The transformation_lineage package is imported from a Workspace (WSFS) path via
+# sys.path below. Writing __pycache__/*.pyc back into WSFS can race the async
+# flush and fail the run (AsyncFlushFailedException on __pycache__). Disable
+# bytecode writes so imports never touch the workspace package dir.
+sys.dont_write_bytecode = True
+
 # Derive current user dynamically
 USER_NAME = spark.sql("SELECT current_user()").collect()[0][0]
 
@@ -62,7 +68,7 @@ try:
     DISCOVERY_LOOKBACK_HOURS = int(dbutils.widgets.get("DISCOVERY_LOOKBACK_HOURS"))
 except Exception:
     DISCOVERY_LOOKBACK_HOURS = 1080
-LINEAGE_ENTITY_TYPES = ("JOB", "NOTEBOOK")
+LINEAGE_ENTITY_TYPES = ("JOB", "NOTEBOOK", "PIPELINE")
 
 # BUILD_ONLY mode: run pipeline only (skip interactive demo phases)
 try:

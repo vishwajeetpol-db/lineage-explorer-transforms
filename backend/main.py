@@ -869,7 +869,7 @@ async def api_transform_build(request: Request, body: BuildJobRequest):
             }
 
     try:
-        run_id = await asyncio.to_thread(submit_build_job, table_fqn)
+        run_id = await asyncio.to_thread(submit_build_job, table_fqn, catalog, schema)
         return {
             "status": "submitted",
             "run_id": run_id,

@@ -111,3 +111,20 @@ def distinct_notebook_entities(df: DataFrame) -> list[str]:
         .collect()
     )
     return sorted({str(r["entity_id"]) for r in ids})
+
+
+def distinct_pipeline_entities(df: DataFrame) -> list[str]:
+    """Unique pipeline_ids from PIPELINE rows in the discovery DataFrame.
+
+    Lakeflow Declarative (DLT) pipelines attribute lineage with
+    entity_type='PIPELINE' and entity_id=<pipeline_id>; these are resolved to
+    their source libraries (notebooks/files) by the resolver.
+    """
+    ids = (
+        df.where(F.col("entity_type") == "PIPELINE")
+        .select(F.col("entity_id"))
+        .where(F.col("entity_id").isNotNull())
+        .distinct()
+        .collect()
+    )
+    return sorted({str(r["entity_id"]) for r in ids})

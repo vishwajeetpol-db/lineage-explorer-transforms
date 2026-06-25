@@ -234,6 +234,24 @@ LEVEL_COLORS = [
 # ---------------------------------------------------------------------------
 # Core query functions
 # ---------------------------------------------------------------------------
+def _resolve_edge_table(
+    catalog: Optional[str] = None, schema: Optional[str] = None
+) -> str:
+    """Resolve the edge endpoints table from a caller-supplied catalog/schema.
+
+    Option A — single dedicated lineage store: ALL transformation edges live in
+    one app-SP-owned store (LINEAGE_CATALOG.LINEAGE_SCHEMA), regardless of which
+    data catalog the selected table belongs to. Node-ids are fully qualified
+    (col:<data_catalog>.<schema>.<table>::<col>), so one store serves every data
+    catalog and the app SP never needs write access on production data catalogs.
+
+    The catalog/schema args (the *selected table's* location) are intentionally
+    NOT used for the store path — they only matter for building the node-id that
+    the trace backtracks from. Retained for call-site compatibility.
+    """
+    return EDGE_TABLE
+
+
 def get_transform_freshness(catalog: str, schema: str, table: str) -> FreshnessInfo:
     """Check if transformation lineage exists for a table and whether it's stale.
 
@@ -242,15 +260,19 @@ def get_transform_freshness(catalog: str, schema: str, table: str) -> FreshnessI
     returns cnt=0 just as fast as the old EXISTS check because the query planner short-
     circuits on the WHERE filter. For tables WITH lineage, this is 2x faster (1 query
     vs 2 sequential queries).
+
+    The edge table is derived from the supplied catalog/schema so reads hit
+    <catalog>.<schema>.lineage_edge_endpoints (the same catalog as the selected table).
     """
     fqn = f"{catalog}.{schema}.{table}"
-    cache_key = f"transform_fresh:{fqn}"
+    edge_table = _resolve_edge_table(catalog, schema)
+    cache_key = f"transform_fresh:{edge_table}:{fqn}"
 
     def _fetch():
         try:
             _, rows = _sql(f"""
                 SELECT COUNT(*) AS cnt, MAX(materialized_at) AS last_built
-                FROM {EDGE_TABLE}
+                FROM {edge_table}
                 WHERE src_fqn = '{fqn}' OR dst_fqn = '{fqn}'
             """)
             if not rows or not rows[0]:
@@ -305,14 +327,15 @@ def get_transform_freshness(catalog: str, schema: str, table: str) -> FreshnessI
     return _transform_cached_fetch(cache_key, _fetch)
 
 
-def _get_latest_run_id() -> Optional[str]:
+def _get_latest_run_id(edge_table: Optional[str] = None) -> Optional[str]:
     """Get the latest pipeline_run_id from the edge table (cached separately)."""
-    cache_key = "transform_latest_run_id"
+    edge_table = edge_table or EDGE_TABLE
+    cache_key = f"transform_latest_run_id:{edge_table}"
 
     def _fetch():
         _, rows = _sql(f"""
             SELECT pipeline_run_id
-            FROM {EDGE_TABLE}
+            FROM {edge_table}
             ORDER BY materialized_at DESC
             LIMIT 1
         """)
@@ -323,17 +346,20 @@ def _get_latest_run_id() -> Optional[str]:
     return _transform_cached_fetch(cache_key, _fetch)
 
 
-def load_edges(table_fqn: Optional[str] = None) -> list[dict]:
+def load_edges(
+    table_fqn: Optional[str] = None, edge_table: Optional[str] = None
+) -> list[dict]:
     """Load transformation edges from the latest pipeline run.
     Optionally filtered to edges touching a specific table.
 
     Optimized: resolves latest run_id separately (cached), then uses direct
     equality predicate instead of correlated subquery / CTE.
     """
-    cache_key = f"transform_edges:{table_fqn or 'all'}"
+    edge_table = edge_table or EDGE_TABLE
+    cache_key = f"transform_edges:{edge_table}:{table_fqn or 'all'}"
 
     def _fetch():
-        run_id = _get_latest_run_id()
+        run_id = _get_latest_run_id(edge_table)
         if not run_id:
             return []
 
@@ -348,8 +374,8 @@ def load_edges(table_fqn: Optional[str] = None) -> list[dict]:
             SELECT
                 src_node_id, src_fqn, src_col,
                 dst_node_id, dst_fqn, dst_col,
-                edge_id, source_path, expr, transform_category
-            FROM {EDGE_TABLE}
+                edge_id, source_path, expr, expr_sql, transform_category
+            FROM {edge_table}
             WHERE {' AND '.join(where_parts)}
         """
         cols, rows = _sql(sql)
@@ -381,14 +407,15 @@ def backtrack_transform_lineage(
         max_depth = TRANSFORM_MAX_DEPTH
 
     fqn = f"{catalog}.{schema}.{table}"
+    edge_table = _resolve_edge_table(catalog, schema)
     target_node_id = f"col:{fqn}::{column}"
-    cache_key = f"transform_trace:{fqn}::{column}::{max_depth}"
+    cache_key = f"transform_trace:{edge_table}:{fqn}::{column}::{max_depth}"
 
     def _fetch():
         start_ts = time.time()
 
         # Load all edges for this table (cached after first call)
-        edges = load_edges(fqn)
+        edges = load_edges(fqn, edge_table)
         if not edges:
             return TransformResponse(
                 levels=[],
@@ -462,7 +489,7 @@ def backtrack_transform_lineage(
                     level_transforms.append(TransformEdge(
                         source_node_id=src_id,
                         target_node_id=node_id,
-                        expression=edge.get("expr") or "--",
+                        expression=edge.get("expr_sql") or edge.get("expr") or "--",
                         category=category,
                         category_color=TRANSFORM_CATEGORIES.get(category, "#6B7280"),
                         source_file=edge.get("source_path") or "",

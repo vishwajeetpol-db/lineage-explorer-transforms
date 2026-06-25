@@ -92,7 +92,11 @@ def _estimate_step_from_progress(pct: int) -> int:
 # ---------------------------------------------------------------------------
 # Job Submission
 # ---------------------------------------------------------------------------
-def submit_build_job(target_table_fqn: str) -> str:
+def submit_build_job(
+    target_table_fqn: str,
+    target_catalog: str | None = None,
+    target_schema: str | None = None,
+) -> str:
     """Submit a serverless one-time job to build transformation lineage.
 
     Returns the run_id as a string.
@@ -121,6 +125,11 @@ def submit_build_job(target_table_fqn: str) -> str:
                 "notebook_path": PIPELINE_NOTEBOOK_PATH,
                 "source": "WORKSPACE",
                 "base_parameters": {
+                    # Option A — single dedicated, app-SP-owned lineage store.
+                    # Edges are ALWAYS written to LINEAGE_CATALOG.LINEAGE_SCHEMA,
+                    # never to the selected table's data catalog (the app SP has
+                    # no write there). KPI_TABLES (what to analyze) stays dynamic,
+                    # driven by the table the user clicked Generate on.
                     "TARGET_CATALOG": LINEAGE_CATALOG,
                     "TARGET_SCHEMA": LINEAGE_SCHEMA,
                     "KPI_TABLES": target_table_fqn,

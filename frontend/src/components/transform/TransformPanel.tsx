@@ -6,7 +6,11 @@
  * 2. Panel slides in from the right with Framer Motion
  * 3. Store auto-flows: loading → (building if stale) → ready
  *
- * Store states: closed | loading | building | ready | error
+ * Store states: closed | loading | needs_build | building | ready | error
+ *
+ * Transformation lineage is OPT-IN: viewing UC column lineage on the graph is
+ * the default and free. Generating transformation logic runs a serverless job
+ * (compute cost) and only happens when the user explicitly clicks Generate.
  * Pruning: depth slider, category filter, path isolation (in ready state)
  */
 import React from 'react';
@@ -26,6 +30,7 @@ export default function TransformPanel() {
   const traceResult = useTransformStore((s) => s.traceResult);
   const panelError = useTransformStore((s) => s.panelError);
   const closePanel = useTransformStore((s) => s.closePanel);
+  const triggerBuild = useTransformStore((s) => s.triggerBuild);
 
   const isOpen = panelState !== 'closed';
 
@@ -82,6 +87,61 @@ export default function TransformPanel() {
               </div>
             )}
 
+            {panelState === 'needs_build' && (
+              <div className="flex flex-col items-center justify-center h-full gap-5 px-8 text-center">
+                <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-purple-600/30 to-indigo-600/30 border border-purple-700/40 flex items-center justify-center">
+                  <GitBranch size={24} className="text-purple-300" />
+                </div>
+                <div>
+                  <h4 className="text-sm font-semibold text-slate-200 mb-2">
+                    {freshness?.exists && freshness.is_stale
+                      ? 'Transformation lineage may be out of date'
+                      : 'Transformation lineage not generated yet'}
+                  </h4>
+                  <p className="text-xs text-slate-400 max-w-md leading-relaxed">
+                    The column lineage for{' '}
+                    <span className="text-purple-300 font-mono font-semibold">{selectedColumn}</span>{' '}
+                    is already shown on the graph. Generating <span className="text-slate-200">transformation lineage</span>{' '}
+                    parses the source pipeline to extract the exact SQL logic behind each
+                    column of <span className="font-mono text-slate-300">{selectedTable?.split('.').slice(-1)[0]}</span> — useful
+                    if you need to understand precisely how a column is derived.
+                  </p>
+                </div>
+
+                {/* Cost warning */}
+                <div className="flex items-start gap-2.5 px-4 py-3 rounded-xl bg-amber-950/40 border border-amber-700/40 max-w-md text-left">
+                  <AlertCircle size={16} className="text-amber-400 mt-0.5 shrink-0" />
+                  <p className="text-[11px] text-amber-200/90 leading-relaxed">
+                    <span className="font-semibold">Compute cost applies.</span> Generating runs a
+                    serverless job that parses the producing pipeline and may take a few minutes.
+                    It builds the logic for the whole table (all columns), then caches it — so this
+                    only needs to run once per table. Generate only if you need the transformation detail.
+                  </p>
+                </div>
+
+                {freshness?.exists && (
+                  <p className="text-[10px] text-slate-500">
+                    Existing version: {freshness.edge_count} edges &middot; {freshness.age_str}
+                  </p>
+                )}
+
+                <button
+                  onClick={() => selectedTable && triggerBuild(selectedTable, !!(freshness?.exists && freshness.is_stale))}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white text-xs font-semibold shadow-lg shadow-purple-900/40 transition-colors"
+                >
+                  <Zap size={14} />
+                  {freshness?.exists && freshness.is_stale ? 'Regenerate transformation lineage' : 'Generate transformation lineage'}
+                </button>
+
+                <button
+                  onClick={closePanel}
+                  className="text-[11px] text-slate-500 hover:text-slate-300 transition-colors"
+                >
+                  No thanks — just show column lineage
+                </button>
+              </div>
+            )}
+
             {panelState === 'building' && <BuildProgress status={buildStatus} />}
 
             {panelState === 'ready' && traceResult && (
@@ -96,7 +156,9 @@ export default function TransformPanel() {
                   {traceResult.cached && (<span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-500 text-[10px]">cached</span>)}
                 </div>
 
-                <p className="text-[10px] text-slate-600 italic">Click any upstream node to isolate its path to target. Use controls above to filter by depth or category.</p>
+                {!traceResult.is_source_column && traceResult.has_lineage && (
+                  <p className="text-[10px] text-slate-600 italic">Click any upstream node to isolate its path to target. Use controls above to filter by depth or category.</p>
+                )}
 
                 {traceResult.is_source_column && (
                   <div className="text-center py-12">
@@ -108,7 +170,13 @@ export default function TransformPanel() {
 
                 {!traceResult.is_source_column && traceResult.has_lineage && (
                   <>
-                    <TransformCanvas data={traceResult} height={450} />
+                    <TransformCanvas
+                      data={traceResult}
+                      height={Math.min(
+                        Math.max(340, traceResult.max_depth_reached * 130 + 160),
+                        Math.round(window.innerHeight * 0.7),
+                      )}
+                    />
                     <div className="flex flex-wrap gap-3 pt-3 border-t border-slate-800">
                       {traceResult.levels.slice(0, 6).map((level) => (
                         <div key={level.depth} className="flex items-center gap-1.5">
@@ -118,6 +186,20 @@ export default function TransformPanel() {
                       ))}
                     </div>
                   </>
+                )}
+
+                {!traceResult.is_source_column && !traceResult.has_lineage && (
+                  <div className="text-center py-12">
+                    <div className="w-12 h-12 rounded-full bg-amber-950/40 flex items-center justify-center mx-auto mb-4"><AlertCircle size={20} className="text-amber-400" /></div>
+                    <h4 className="text-sm font-semibold text-slate-300 mb-1">No transformation logic found</h4>
+                    <p className="text-xs text-slate-500 max-w-sm mx-auto leading-relaxed">
+                      No column-level transformation lineage was found for{' '}
+                      <span className="text-purple-400 font-mono font-bold">{selectedColumn}</span>. Its
+                      producer may be an <span className="text-slate-300">external or shared source</span>{' '}
+                      (Delta Sharing / Lakehouse Federation), an unsupported producer type, or the build
+                      genuinely found no transformation for this column.
+                    </p>
+                  </div>
                 )}
               </div>
             )}

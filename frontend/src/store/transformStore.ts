@@ -21,7 +21,13 @@ import {
   getTransformCategories,
 } from '../api/transform';
 
-export type TransformPanelState = 'closed' | 'loading' | 'building' | 'ready' | 'error';
+export type TransformPanelState =
+  | 'closed'
+  | 'loading'
+  | 'needs_build' // lineage missing/stale — await explicit, cost-incurring user trigger
+  | 'building'
+  | 'ready'
+  | 'error';
 
 interface TransformState {
   // Panel visibility
@@ -136,13 +142,15 @@ export const useTransformStore = create<TransformState>((set, get) => ({
       set({ freshness });
 
       if (!freshness.exists || freshness.is_stale) {
-        // Need to build first
-        set({ panelState: 'building' });
-        await get().triggerBuild(tableFqn);
+        // Do NOT auto-build. Transformation lineage is an explicit, opt-in,
+        // compute-cost action. The column (UC) lineage is already shown on the
+        // main graph; here we just surface a prompt + cost note and let the
+        // user decide to generate. The build only runs on an explicit click.
+        set({ panelState: 'needs_build' });
         return;
       }
 
-      // 2. Lineage exists and is fresh — load trace
+      // 2. Lineage exists and is fresh — load trace (read-only, no build)
       await get().loadTrace(catalog, schema, table, column);
     } catch (err: any) {
       // Only set error if this is still the active panel request

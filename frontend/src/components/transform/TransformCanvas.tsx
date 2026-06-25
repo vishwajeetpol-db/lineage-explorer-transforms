@@ -1,10 +1,11 @@
 /**
  * TransformCanvas — React Flow sub-graph for transformation lineage.
  *
- * Renders a vertical DAG (bottom-to-top) where:
- * - Level 0 (bottom) = target column
- * - Level N (top) = Nth upstream source columns
- * - Edges show transformation expressions on hover
+ * Renders a vertical DAG (top-to-bottom) where:
+ * - Level 0 (top) = target column (the one the user clicked)
+ * - Level N (below) = Nth upstream source columns, cascading downward
+ * - Edges show the transformation category + expression persistently,
+ *   with the full expression + source file on hover
  *
  * Supports pruning:
  * - Category filtering (hiddenCategories from store → edges hidden)
@@ -31,8 +32,14 @@ import { useTransformStore } from '../../store/transformStore';
 import TransformNodeComponent from './TransformNode';
 import TransformEdgeComponent from './TransformEdge';
 
-const NODE_WIDTH = 200;
-const NODE_HEIGHT = 60;
+// Layout cell footprint — kept close to the real rendered node box (CSS
+// minWidth 140 / maxWidth 200, auto height ~56) so fitView's bounding box
+// matches what's actually drawn. H_GAP/V_GAP are the clear channels between
+// siblings (horizontal) and levels (vertical).
+const NODE_WIDTH = 180;
+const NODE_HEIGHT = 56;
+const H_GAP = 80;
+const V_GAP = 64;
 
 const nodeTypes = {
   transformNode: TransformNodeComponent,
@@ -193,19 +200,22 @@ function applySimpleLayout(nodes: Node[], levels: TransformLevel[]): Node[] {
     depthGroups.get(depth)!.push(node);
   }
 
-  const maxDepth = Math.max(...Array.from(depthGroups.keys()), 0);
   const layoutNodes: Node[] = [];
 
   for (const [depth, group] of depthGroups) {
-    const rowWidth = group.length * (NODE_WIDTH + 40);
+    const rowWidth = group.length * (NODE_WIDTH + H_GAP);
     const startX = -rowWidth / 2;
-    const y = (maxDepth - depth) * (NODE_HEIGHT + 80);
+    // Target column (depth 0) sits at the TOP; upstream sources cascade
+    // downward as depth increases. This matches the node handles
+    // (source emits from Top, target receives at Bottom) so edges run as
+    // clean vertical connectors instead of curving back on themselves.
+    const y = depth * (NODE_HEIGHT + V_GAP);
 
     group.forEach((node, i) => {
       layoutNodes.push({
         ...node,
         position: {
-          x: startX + i * (NODE_WIDTH + 40),
+          x: startX + i * (NODE_WIDTH + H_GAP),
           y,
         },
       });
@@ -288,9 +298,12 @@ export default function TransformCanvas({ data, height = 500 }: TransformCanvasP
     setEdges(filteredEdges);
   }, [layoutNodes, filteredEdges, setNodes, setEdges]);
 
-  // Fit view on initial load
+  // Fit view on initial load. Cap the zoom-IN ceiling (maxZoom) so a small
+  // graph (2-5 nodes) can't be magnified to the giant 3x default — while still
+  // allowing zoom-OUT (minZoom 0.2) to fit a deep graph. This re-fit is also
+  // what re-frames the graph when the user switches columns.
   const onInit = useCallback((instance: any) => {
-    setTimeout(() => instance.fitView({ padding: 0.2 }), 100);
+    setTimeout(() => instance.fitView({ padding: 0.2, maxZoom: 1.2, minZoom: 0.2 }), 100);
   }, []);
 
   // Node click → path isolation (click target node to clear)
@@ -319,8 +332,9 @@ export default function TransformCanvas({ data, height = 500 }: TransformCanvasP
         edgeTypes={edgeTypes}
         onInit={onInit}
         fitView
+        fitViewOptions={{ padding: 0.2, minZoom: 0.2, maxZoom: 1.2 }}
         minZoom={0.2}
-        maxZoom={3}
+        maxZoom={1.5}
         defaultEdgeOptions={{ animated: true }}
         proOptions={{ hideAttribution: true }}
       >

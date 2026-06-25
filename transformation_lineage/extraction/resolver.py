@@ -121,9 +121,90 @@ def resolve_run_tasks(client: WorkspaceClient, run_id: int) -> list[ResolvedTask
                 )
             continue
 
-    if not resolved:
-        logger.info("No notebook/python tasks resolved for run_id=%s", run_id)
+        # SQL file task (Databricks `sql_task` with a workspace/git .sql file).
+        # Without this branch, SQL-file-task jobs are silently dropped and yield
+        # zero transformation edges. (sql_task.query — a saved-query id — is not
+        # handled here; it needs the Queries API and is left for a follow-up.)
+        sqt = getattr(task, "sql_task", None)
+        if sqt:
+            file_obj = getattr(sqt, "file", None)
+            path = getattr(file_obj, "path", None) if file_obj else None
+            if path:
+                source = str(getattr(file_obj, "source", None) or "WORKSPACE").upper()
+                if source == "GIT" or git_ctx.get("git_url"):
+                    resolved.append(
+                        ResolvedTaskSource(
+                            run_id=run_id,
+                            job_id=job_id,
+                            task_key=_task_key(task),
+                            source_kind="git_file",
+                            git_url=git_ctx.get("git_url"),
+                            git_provider=git_ctx.get("git_provider"),
+                            git_branch=git_ctx.get("git_branch"),
+                            git_commit=git_ctx.get("git_commit"),
+                            git_path=path,
+                            language="sql",
+                        )
+                    )
+                else:
+                    resolved.append(
+                        ResolvedTaskSource(
+                            run_id=run_id,
+                            job_id=job_id,
+                            task_key=_task_key(task),
+                            source_kind="workspace_notebook",
+                            workspace_path=path,
+                            language="sql",
+                        )
+                    )
+            continue
 
+    if not resolved:
+        logger.info("No notebook/python/sql tasks resolved for run_id=%s", run_id)
+
+    return resolved
+
+
+def resolve_pipeline_libraries(
+    client: WorkspaceClient, pipeline_id: str
+) -> list[ResolvedTaskSource]:
+    """Resolve a Lakeflow Declarative (DLT) pipeline to its source libraries.
+
+    Reads `pipelines.get(pipeline_id).spec.libraries` and returns each notebook /
+    workspace-file as a fetchable source. This is what enables transformation
+    lineage for Python-defined DLT (whose logic is NOT recoverable from
+    SHOW CREATE TABLE, unlike SQL-defined MV/streaming tables).
+    """
+    try:
+        pipe = client.pipelines.get(pipeline_id=pipeline_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("pipelines.get failed for pipeline_id=%s: %s", pipeline_id, e)
+        return []
+    spec = getattr(pipe, "spec", None)
+    libs = list(getattr(spec, "libraries", None) or []) if spec else []
+    resolved: list[ResolvedTaskSource] = []
+    for lib in libs:
+        nb = getattr(lib, "notebook", None)
+        fl = getattr(lib, "file", None)
+        path = None
+        if nb:
+            path = getattr(nb, "path", None)
+        elif fl:
+            path = getattr(fl, "path", None)
+        if not path:
+            continue
+        resolved.append(
+            ResolvedTaskSource(
+                run_id=0,
+                job_id=None,
+                task_key=f"pipeline:{pipeline_id}",
+                source_kind="workspace_notebook",
+                workspace_path=path,
+                language=_infer_language_from_path(path),
+            )
+        )
+    if not resolved:
+        logger.info("No libraries resolved for pipeline_id=%s", pipeline_id)
     return resolved
 
 

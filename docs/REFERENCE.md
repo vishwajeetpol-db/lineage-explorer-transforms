@@ -207,7 +207,7 @@ Switch to **Pipelines** view to see job-to-job dependencies derived from shared 
 - **User identity cache:** Token-hash keyed (SHA-256 first 16 chars), 5-minute TTL, LRU-bounded at 1,000 entries. Checked before any Databricks API call to the control plane
 - **Startup/shutdown cache management:** All stale caches cleared on startup via FastAPI lifespan handler. Caches also cleared on SIGTERM for graceful shutdown
 - **Metrics collection:** Middleware records latency for all `/api/` requests into a 1,000-entry rolling deque. Powers P50/P95/P99 in the admin dashboard
-- **90-day time window:** Lineage queries filter to `event_time > current_date() - INTERVAL 90 DAYS` to bound scan size
+- **365-day time window:** Lineage queries filter to `event_time > current_date() - INTERVAL 365 DAYS` (set via `LINEAGE_WINDOW_DAYS`). This is the max staleness a producing pipeline can have before its lineage drops off the view — kept wide so infrequently-run pipelines (monthly/quarterly/backfills) still show lineage; pair with `event_date` partition pruning to keep a wide window cheap
 - **50K row limit:** Column lineage queries capped at `LIMIT 50000` to prevent runaway scans
 - **Adjacency maps:** Frontend pre-computes upstream/downstream maps for O(1) traversal on hover/select (not O(n^2))
 - **Jittered backoff:** If the coalescing leader fails, waiting threads use random backoff (0-10s spread) to avoid stampeding the warehouse
@@ -365,7 +365,7 @@ The frontend uses [React Flow](https://reactflow.dev/) with [ELK.js](https://www
 | Limitation | Affected Features |
 |---|---|
 | UC captures SQL operations only | Path-based access, RDD operations, some DLT patterns have no lineage |
-| 90-day lineage window | Queries older than 90 days don't appear |
+| 365-day lineage window | Lineage whose producer last ran >365 days ago doesn't appear (configurable via `LINEAGE_WINDOW_DAYS`) |
 | Column lineage requires grants | `system.access.column_lineage` needs `SELECT` access |
 | Entity names from `system.lakeflow.jobs` | Only Lakeflow jobs have resolved names; notebooks/queries show raw IDs |
 | Ad-hoc SQL has no entity info | CTAS/INSERT run directly on warehouse have `entity_type=NULL` — no pipeline node shown (correct behavior, no job was involved) |
@@ -839,7 +839,7 @@ Single-process is the right default — it keeps the cache, coalescing, and rate
 | `SQL_WAIT_TIMEOUT` | `50s` | SQL execution timeout |
 | `RATE_LIMIT_MAX_REQUESTS` | `60` | Requests per user per window |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit window |
-| `LINEAGE_WINDOW_DAYS` | `90` | Lookback window for `system.access` lineage queries |
+| `LINEAGE_WINDOW_DAYS` | `365` | Lookback window for `system.access` lineage queries (max producer staleness before lineage drops off; UC retention ~365d caps it) |
 | `COST_CACHE_TTL_SECONDS` | `21600` (6h) | TTL for the serverless-cost cache (billing rolls up daily) |
 | `LINEAGE_MAX_NODES` | `2500` | Cap on nodes per graph/trace (UI flags partial results) |
 

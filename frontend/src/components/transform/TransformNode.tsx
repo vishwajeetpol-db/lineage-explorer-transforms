@@ -33,7 +33,7 @@ function TransformNodeComponent({ data }: NodeProps<TransformNodeData>) {
         transition={{ duration: 0.3, delay: depth * 0.05 }}
         className={`
           relative flex flex-col items-center justify-center
-          px-4 py-3 rounded-xl
+          px-3 py-2 rounded-xl
           border-2 backdrop-blur-sm
           cursor-pointer select-none
           transition-all duration-200
@@ -46,7 +46,8 @@ function TransformNodeComponent({ data }: NodeProps<TransformNodeData>) {
         style={{
           borderColor: isTarget ? undefined : color,
           boxShadow: `0 0 12px ${color}30, 0 0 4px ${color}20`,
-          minWidth: '160px',
+          minWidth: '140px',
+          maxWidth: '200px',
         }}
       >
         {/* Pulse ring for target node */}
@@ -60,7 +61,7 @@ function TransformNodeComponent({ data }: NodeProps<TransformNodeData>) {
 
         {/* Column name */}
         <span
-          className="text-sm font-bold truncate max-w-[150px]"
+          className="text-sm font-bold truncate max-w-[176px]"
           style={{ color: isTarget ? '#FF6B4A' : '#E2E8F0' }}
           title={column}
         >
@@ -69,7 +70,7 @@ function TransformNodeComponent({ data }: NodeProps<TransformNodeData>) {
 
         {/* Table name (subtle) */}
         <span
-          className="text-[10px] text-slate-400 truncate max-w-[150px] mt-0.5"
+          className="text-[10px] text-slate-400 truncate max-w-[176px] mt-0.5"
           title={data.tableFqn}
         >
           {shortTable}
