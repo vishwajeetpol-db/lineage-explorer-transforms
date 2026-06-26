@@ -275,6 +275,89 @@ def _split_select_list(select_list: str) -> list[str]:
     return parts
 
 
+def _extract_ctes(stmt_sql: str) -> tuple[list[tuple[str, str]], str]:
+    """Split a statement into its CTEs and main query.
+
+    For ``CREATE ... AS WITH a AS (q1), b AS (q2) <main>`` returns
+    ``([("a", q1), ("b", q2)], "<main>")``. Returns ``([], stmt_sql)`` when there
+    is no CTE block. Uses balanced-paren scanning so nested parens inside a CTE
+    body don't terminate it early.
+    """
+    m = re.search(r"\bwith\b", stmt_sql, re.IGNORECASE)
+    if not m:
+        return [], stmt_sql
+    rest = stmt_sql[m.end():]
+    ctes: list[tuple[str, str]] = []
+    while True:
+        nm = re.match(r"\s*([`\"]?[\w]+[`\"]?)\s+as\s*\(", rest, re.IGNORECASE)
+        if not nm:
+            break
+        name = _strip_quotes(nm.group(1))
+        open_idx = nm.end() - 1  # position of '('
+        depth = 0
+        close_idx = -1
+        for j in range(open_idx, len(rest)):
+            c = rest[j]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    close_idx = j
+                    break
+        if close_idx == -1:
+            break
+        ctes.append((name, rest[open_idx + 1:close_idx]))
+        rest = rest[close_idx + 1:]
+        cm = re.match(r"\s*,", rest)
+        if cm:
+            rest = rest[cm.end():]
+            continue
+        break
+    if not ctes:
+        return [], stmt_sql
+    return ctes, rest  # rest = the main query after the CTE block
+
+
+def _cte_column_map(
+    body: str,
+    *,
+    default_catalog: str | None,
+    default_schema: str | None,
+) -> dict[str, tuple[str | None, str, str]]:
+    """Map a CTE's output columns -> (source_fqn, source_column, expr).
+
+    Resolves each output the same way the main parser does, but SCOPED to the
+    CTE's own FROM/JOIN tables, so ``sum(lifetime_revenue) AS total_revenue``
+    inside ``FROM customer_lifetime_value`` attributes to that one table.
+    """
+    tables = extract_tables(body, default_catalog=default_catalog, default_schema=default_schema)
+    alias_map = extract_alias_map(body, default_catalog=default_catalog, default_schema=default_schema)
+    out: dict[str, tuple[str | None, str, str]] = {}
+    try:
+        stmts = sqlparse.parse(body)
+    except Exception:  # noqa: BLE001
+        stmts = []
+    aliases: list[dict[str, Any]] = []
+    for s in stmts:
+        aliases.extend(_aliases_from_one_stmt(s))
+    single_src = tables[0] if len(tables) == 1 else None
+    for a in aliases:
+        col = a["output_column"]
+        expr = a["expr"]
+        qual = re.findall(r"\b([\w]+)\.([\w]+)\b", expr)
+        if qual:
+            ta, sc = qual[0]
+            out[col] = (alias_map.get(ta.lower()), sc, expr)
+        else:
+            ucols = _unqualified_columns(expr) if single_src else []
+            if single_src and ucols:
+                out[col] = (single_src, ucols[0], expr)
+            else:
+                out[col] = (None, col, expr)
+    return out
+
+
 def parse_sql_text(
     sql: str,
     *,
@@ -328,6 +411,57 @@ def parse_sql_text(
         all_tables.extend(stmt_tables)
         if artifact_output_fqn is None and stmt_output:
             artifact_output_fqn = stmt_output
+
+        # ── CTE-aware path ──────────────────────────────────────────
+        # `WITH cte AS (...) SELECT cte.col ...` — the outer SELECT references CTE
+        # aliases, not base tables. Resolve each CTE's columns to their base source
+        # (scoped to the CTE's own FROM), then map the main query's `cte.col`
+        # references through that. Without this, CTE refs resolve to nothing
+        # (phantom unresolved-external edges) and bare CTE columns can't attribute
+        # because the statement pools every CTE's tables.
+        ctes, main_sql = _extract_ctes(stmt_sql)
+        if ctes:
+            cte_maps = {
+                name.lower(): _cte_column_map(
+                    body, default_catalog=default_catalog, default_schema=default_schema
+                )
+                for name, body in ctes
+            }
+            main_alias_map = extract_alias_map(
+                main_sql, default_catalog=default_catalog, default_schema=default_schema
+            )
+            main_aliases: list[dict[str, Any]] = []
+            try:
+                for s in sqlparse.parse(main_sql):
+                    main_aliases.extend(_aliases_from_one_stmt(s))
+            except Exception:  # noqa: BLE001
+                main_aliases = []
+            for a in main_aliases:
+                out_col = a["output_column"]
+                expr = a["expr"]
+                for ta, col in re.findall(r"\b([\w]+)\.([\w]+)\b", expr):
+                    cte = cte_maps.get(ta.lower())
+                    if cte is not None:
+                        src_fqn, src_col, inner_expr = cte.get(col, (None, col, expr))
+                        all_mappings.append({
+                            "artifact_id": artifact_id, "output_column": out_col,
+                            "output_table_fqn": stmt_output,
+                            "source_ref": src_col, "source_fqn": src_fqn,
+                            "source_column": src_col,
+                            "expr": (inner_expr or expr)[:2000], "expr_lang": "sql",
+                        })
+                    else:
+                        all_mappings.append({
+                            "artifact_id": artifact_id, "output_column": out_col,
+                            "output_table_fqn": stmt_output,
+                            "source_ref": f"{ta}.{col}",
+                            "source_fqn": main_alias_map.get(ta.lower()),
+                            "source_column": col,
+                            "expr": expr[:2000], "expr_lang": "sql",
+                        })
+            if main_aliases or stmt_tables or stmt_output:
+                statements_parsed += 1
+            continue
 
         for a in stmt_aliases:
             src_cols = re.findall(r"\b([\w]+)\.([\w]+)\b", a["expr"])

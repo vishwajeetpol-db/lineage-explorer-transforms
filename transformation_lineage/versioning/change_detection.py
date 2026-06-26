@@ -28,7 +28,8 @@ from pyspark.errors import AnalysisException
 #   2  STREAM(...) unwrap + unqualified-column attribution; @dlt.table extraction
 #   3  self-loop guard; sqlparse pinned to 0.4.4
 #   4  edge-endpoints join pins source by node id (kills same-column cross-joins)
-PARSER_VERSION = "4"
+#   5  CTE resolution (WITH ... AS) — resolve cte.col through the CTE to its base source
+PARSER_VERSION = "5"
 
 
 def content_sha256(text: str) -> str:
