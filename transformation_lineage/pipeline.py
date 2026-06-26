@@ -106,6 +106,11 @@ def run_daily_pipeline(spark: SparkSession, cfg: LineageJobConfig) -> str:
             new_version_ids=new_version_ids,
         )
 
+    # Force re-parse bypasses the content-version gate (used by clear/regenerate).
+    if getattr(cfg, "force_reparse", False):
+        new_version_ids = {a.extraction_id for a in artifacts}
+        logger.info("force_reparse=True — re-parsing all %d artifacts", len(artifacts))
+
     # Early termination: no new content means no parsing needed
     new_artifacts = [a for a in artifacts if a.extraction_id in new_version_ids]
     if not new_artifacts:

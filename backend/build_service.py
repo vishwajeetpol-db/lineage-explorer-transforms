@@ -96,6 +96,7 @@ def submit_build_job(
     target_table_fqn: str,
     target_catalog: str | None = None,
     target_schema: str | None = None,
+    force_reparse: bool = False,
 ) -> str:
     """Submit a serverless one-time job to build transformation lineage.
 
@@ -134,6 +135,9 @@ def submit_build_job(
                     "TARGET_SCHEMA": LINEAGE_SCHEMA,
                     "KPI_TABLES": target_table_fqn,
                     "BUILD_ONLY": "true",
+                    # A forced/regenerate build must re-parse even if the source
+                    # content is byte-identical (else change-detection skips it).
+                    "FORCE_REPARSE": "true" if force_reparse else "false",
                 },
             },
             "environment_key": "Default",

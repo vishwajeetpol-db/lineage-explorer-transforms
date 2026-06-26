@@ -190,4 +190,13 @@ export const api = {
     ),
 
   getAdminStatus: () => fetchJson<AdminStatus>(`${BASE}/admin/status`),
+
+  /** Invalidate transformation lineage. scope: cache (flush in-memory) | all (wipe stored) | table. */
+  invalidateTransform: async (scope: "cache" | "all" | "table", tableFqn?: string) => {
+    const q = new URLSearchParams({ scope });
+    if (tableFqn) q.set("table_fqn", tableFqn);
+    const res = await fetch(`${BASE}/transform/invalidate?${q.toString()}`, { method: "POST" });
+    if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+    return res.json() as Promise<{ status: string; scope: string; cleared?: string[] }>;
+  },
 };

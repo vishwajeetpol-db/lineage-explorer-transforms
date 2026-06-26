@@ -22,6 +22,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Admin "Invalidate transformation lineage" controls** — the admin dashboard now has *Flush cache* (clear in-memory freshness/edges/trace caches, no data loss) and *Wipe lineage* (delete all stored transformation-lineage tables so everything shows "not built" and rebuilds fully re-parse; the expensive audit-path and LLM-expression caches are retained). New admin-gated `POST /api/transform/invalidate?scope=cache|table|all` endpoint + `clear_transform_lineage()`.
+- **`FORCE_REPARSE` build flag** — a forced "Regenerate" / clear-and-rebuild now bypasses the content-version early-termination so the parser actually re-runs on byte-identical sources (previously a regenerate of unchanged content silently no-op'd). Threaded config → run_pipeline → build_service (`force_rebuild ⇒ force_reparse`).
+- **Query-history fallback resolver** — tables with no tracked producing entity (`entity_type = NULL`: ad-hoc SQL, SQL editor, scripts) are now recovered from `system.query.history` by matching the most recent FINISHED write statement whose parsed output is the target table. Degrades gracefully (`no_producing_query` skip) when the service principal can't see the producing query (query history is identity-scoped — needs broad query-history visibility to cover other users' ad-hoc tables).
 - **Persistent build control in the transformation panel header** — the "Generate / Regenerate" button is now always visible: enabled when lineage is missing or stale, and **grayed when already built** (so it's clear it exists) while still allowing a force-rebuild. Previously the button only appeared in the not-built state, so an already-built table showed no build affordance at all.
 
 ### Fixed

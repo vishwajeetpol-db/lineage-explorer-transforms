@@ -294,6 +294,96 @@ def _extract_object_definitions(
     return artifacts
 
 
+def _extract_from_query_history(
+    spark: SparkSession,
+    cfg: LineageJobConfig,
+    report: DailyExtractionReport,
+    skip_fqns: set[str],
+) -> list[ExtractedArtifact]:
+    """Fallback extraction from `system.query.history` for KPI tables with no
+    discoverable producing entity.
+
+    Many tables are produced by ad-hoc SQL (SQL editor, notebooks not captured as
+    a tracked entity, scripts). Their `system.access.column_lineage` rows have
+    ``entity_type = NULL``, so discovery (which filters to JOB/NOTEBOOK/PIPELINE)
+    never finds them and no transformation lineage is built. The defining SQL,
+    however, is recorded verbatim in query history — we recover the most recent
+    FINISHED write statement (CTAS / INSERT / MERGE / CREATE-OR-REPLACE) whose
+    parsed output target equals the KPI table, and parse that.
+
+    `skip_fqns` are tables already covered by the definition or entity paths.
+    """
+    from transformation_lineage.parsing.sql_parser import extract_output_table
+
+    targets = [t for t in cfg.kpi_tables if t not in skip_fqns and len(t.split(".")) == 3]
+    if not targets:
+        return []
+
+    artifacts: list[ExtractedArtifact] = []
+    lookback_hours = max(int(cfg.discovery_lookback_hours), 24)
+    # Non-write statement types we never want to treat as a producer.
+    _NON_WRITE = (
+        "SELECT", "USE", "SET", "SHOW", "DESCRIBE", "DROP", "ALTER", "GRANT",
+        "REVOKE", "OPTIMIZE", "VACUUM", "ANALYZE", "EXPLAIN", "REFRESH", "COMMENT",
+        "TRUNCATE", "DELETE", "UPDATE",
+    )
+    for fqn in targets:
+        cat, sch, name = (p.replace("`", "") for p in fqn.split("."))
+        safe_name = name.replace("'", "''")
+        try:
+            rows = spark.sql(
+                f"""
+                SELECT statement_text
+                FROM system.query.history
+                WHERE execution_status = 'FINISHED'
+                  AND start_time >= current_timestamp() - INTERVAL {lookback_hours} HOURS
+                  AND statement_text ILIKE '%{safe_name}%'
+                  AND statement_type NOT IN ({', '.join(f"'{t}'" for t in _NON_WRITE)})
+                ORDER BY start_time DESC
+                LIMIT 40
+                """
+            ).collect()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("query.history lookup failed for %s: %s", fqn, e)
+            merge_skip_reason(report, "query_history_unavailable")
+            continue
+
+        chosen: str | None = None
+        for r in rows:
+            stmt = r["statement_text"] or ""
+            out = extract_output_table(stmt, default_catalog=cat, default_schema=sch)
+            if out and out.replace("`", "") == fqn:
+                chosen = stmt
+                break
+        if not chosen:
+            merge_skip_reason(report, "no_producing_query")
+            continue
+
+        cells = normalize_to_cells(chosen, "sql")
+        eid = _stable_extraction_id(0, None, f"query_history:{fqn}")
+        artifacts.append(
+            ExtractedArtifact(
+                extraction_id=eid,
+                run_id=0,
+                job_id=None,
+                task_key=None,
+                source_kind="query_history",
+                source_path=fqn,
+                git_commit=None,
+                raw_source=chosen,
+                normalized_cells_json=cells_to_json(cells),
+                language="sql",
+                extracted_at=datetime.now(timezone.utc),
+            )
+        )
+        report.artifacts_extracted += 1
+        report.by_source_kind["query_history"] = report.by_source_kind.get("query_history", 0) + 1
+
+    if artifacts:
+        logger.info("Query-history extraction produced %d artifact(s)", len(artifacts))
+    return artifacts
+
+
 def run_extraction_phase(
     spark: SparkSession,
     cfg: LineageJobConfig,
@@ -336,7 +426,18 @@ def run_extraction_phase(
     # ── Definition-based extraction (views / MV / streaming tables) ──
     # Runs first and independently of discovery — covers declarative objects and
     # flags external (federated/shared) sources. No lineage lag.
-    artifacts.extend(_extract_object_definitions(spark, cfg, report))
+    defn_artifacts = _extract_object_definitions(spark, cfg, report)
+    artifacts.extend(defn_artifacts)
+    defn_covered = {a.source_path for a in defn_artifacts if a.source_path}
+    # Targets that DID resolve to a tracked producing entity (JOB/NOTEBOOK/PIPELINE).
+    try:
+        entity_covered = {
+            r["target_table_full_name"]
+            for r in disc.select("target_table_full_name").distinct().collect()
+            if r["target_table_full_name"]
+        }
+    except Exception:  # noqa: BLE001
+        entity_covered = set()
 
     # ── JOB entity extraction (CONCURRENT) ─────────────────────────
     logger.info("Processing %d job runs with concurrency=%d", len(run_ids), max_concurrency)
@@ -498,6 +599,14 @@ def run_extraction_phase(
                     report.errors.append(f"pipeline_fetch:{pid}:{e}")
                     merge_skip_reason(report, "pipeline_fetch_error")
         report.timings["pipeline_fetch"] = round(time.time() - _t, 1)
+
+    # ── Query-history fallback (entity-less producers) ─────────────
+    # KPI tables with no tracked producing entity and no embedded definition are
+    # recovered from system.query.history (ad-hoc SQL / SQL editor / scripts).
+    qh_artifacts = _extract_from_query_history(
+        spark, cfg, report, skip_fqns=defn_covered | entity_covered
+    )
+    artifacts.extend(qh_artifacts)
 
     # Dedupe by extraction_id
     seen: set[str] = set()

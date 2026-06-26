@@ -186,6 +186,62 @@ def invalidate_transform_cache():
     logger.info("Transform cache invalidated")
 
 
+# Stored transformation-lineage tables wiped by a global "clear". The audit-scan
+# (notebook_path) and LLM (pyspark_to_sql) caches are deliberately retained — they
+# are expensive to rebuild and aren't lineage; clearing code_versions forces the
+# next build to fully re-parse.
+_CLEARABLE_STORE_TABLES = (
+    "lineage_edge_endpoints", "lineage_nodes", "lineage_edges",
+    "lineage_code_versions", "lineage_raw_code", "lineage_parse_metrics",
+    "lineage_graph_cache", "lineage_reconciliation", "lineage_extraction_reports",
+    "lineage_sublineage_cache",
+)
+
+
+def clear_transform_lineage(scope: str = "cache", table_fqn: Optional[str] = None) -> dict:
+    """Invalidate the in-memory transform caches and (optionally) the stored edges.
+
+    scope:
+      - "cache": flush in-memory caches only (no data loss).
+      - "table": also delete the given table's stored edges/nodes (then it shows
+        as "not built" until rebuilt). Requires a validated `table_fqn`.
+      - "all":   wipe every stored transformation-lineage table (start fresh).
+    Always flushes the in-memory cache so the next read re-queries.
+    """
+    invalidate_transform_cache()
+    schema_prefix = EDGE_TABLE.rsplit(".", 1)[0]  # catalog.schema
+    cleared: list[str] = []
+
+    if scope == "table":
+        if not table_fqn:
+            return {"scope": scope, "error": "table_fqn required"}
+        _sql(f"DELETE FROM {EDGE_TABLE} WHERE src_fqn = '{table_fqn}' OR dst_fqn = '{table_fqn}'")
+        cleared.append("lineage_edge_endpoints")
+        try:
+            _sql(f"DELETE FROM {schema_prefix}.lineage_nodes WHERE table_fqn = '{table_fqn}'")
+            _sql(
+                f"DELETE FROM {schema_prefix}.lineage_edges "
+                f"WHERE src_id LIKE 'col:{table_fqn}::%' OR dst_id LIKE 'col:{table_fqn}::%'"
+            )
+            cleared += ["lineage_nodes", "lineage_edges"]
+        except Exception as e:  # noqa: BLE001
+            logger.warning("per-table clear (nodes/edges) failed for %s: %s", table_fqn, e)
+        logger.info("Cleared transformation lineage for table %s", table_fqn)
+        return {"scope": scope, "table_fqn": table_fqn, "cleared": cleared}
+
+    if scope == "all":
+        for t in _CLEARABLE_STORE_TABLES:
+            try:
+                _sql(f"DELETE FROM {schema_prefix}.{t}")
+                cleared.append(t)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("clear store table %s failed: %s", t, e)
+        logger.info("Wiped all stored transformation lineage (%d tables)", len(cleared))
+        return {"scope": scope, "cleared": cleared}
+
+    return {"scope": "cache", "cleared": cleared}
+
+
 # ---------------------------------------------------------------------------
 # SQL execution helper (reuses the shared WorkspaceClient)
 # ---------------------------------------------------------------------------

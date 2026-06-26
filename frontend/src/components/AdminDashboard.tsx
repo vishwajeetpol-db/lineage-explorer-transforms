@@ -1,6 +1,6 @@
 import { memo, useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { X, Activity, Database, Clock, Cpu, HardDrive, Zap, Users, Layers, AlertTriangle } from "lucide-react";
+import { X, Activity, Database, Clock, Cpu, HardDrive, Zap, Users, Layers, AlertTriangle, RefreshCw, Trash2 } from "lucide-react";
 import { api } from "../api/client";
 import type { AdminStatus } from "../api/client";
 
@@ -26,6 +26,23 @@ function AdminDashboard({ open, onClose }: Props) {
   const [status, setStatus] = useState<AdminStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [txBusy, setTxBusy] = useState(false);
+  const [txMsg, setTxMsg] = useState<string | null>(null);
+
+  const invalidateTx = async (scope: "cache" | "all") => {
+    if (scope === "all" && !window.confirm(
+      "Wipe ALL stored transformation lineage?\n\nEvery table will show 'not built' until regenerated. The audit-path and LLM-expression caches are kept."
+    )) return;
+    setTxBusy(true); setTxMsg(null);
+    try {
+      const r = await api.invalidateTransform(scope);
+      setTxMsg(scope === "all" ? `Wiped ${r.cleared?.length ?? 0} stored tables + flushed cache` : "In-memory caches flushed");
+    } catch (e: any) {
+      setTxMsg(`Error: ${e.message}`);
+    } finally {
+      setTxBusy(false);
+    }
+  };
 
   const fetchStatus = () => {
     setLoading(true);
@@ -69,6 +86,23 @@ function AdminDashboard({ open, onClose }: Props) {
                   <span className="font-mono text-[10px] text-emerald-500/40">ADMIN ONLY</span>
                 </div>
                 <div className="flex items-center gap-3">
+                  {txMsg && <span className="text-[10px] font-mono text-emerald-500/60 max-w-[260px] truncate">{txMsg}</span>}
+                  <button
+                    onClick={() => invalidateTx("cache")}
+                    disabled={txBusy}
+                    title="Flush in-memory transform caches (freshness/edges/trace). No data loss."
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded border border-emerald-500/20 text-[10px] font-mono text-emerald-400/80 hover:bg-emerald-500/10 disabled:opacity-40 transition-colors"
+                  >
+                    <RefreshCw size={11} className={txBusy ? "animate-spin" : ""} /> Flush cache
+                  </button>
+                  <button
+                    onClick={() => invalidateTx("all")}
+                    disabled={txBusy}
+                    title="Wipe ALL stored transformation lineage (start fresh). Tables show 'not built' until regenerated."
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded border border-red-500/30 text-[10px] font-mono text-red-400/90 hover:bg-red-500/10 disabled:opacity-40 transition-colors"
+                  >
+                    <Trash2 size={11} /> Wipe lineage
+                  </button>
                   {loading && <div className="w-3 h-3 border border-emerald-500/40 border-t-emerald-400 rounded-full animate-spin" />}
                   <button onClick={onClose} className="text-emerald-500/40 hover:text-emerald-400 transition-colors">
                     <X size={18} />

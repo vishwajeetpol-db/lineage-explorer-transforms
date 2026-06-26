@@ -76,6 +76,12 @@ try:
 except Exception:
     BUILD_ONLY = False
 
+# FORCE_REPARSE: bypass content-version early-termination (re-parse even unchanged source).
+try:
+    FORCE_REPARSE = dbutils.widgets.get("FORCE_REPARSE").strip().lower() in ("true", "1", "yes")
+except Exception:
+    FORCE_REPARSE = False
+
 # Provide token for SDK calls
 os.environ["DATABRICKS_TOKEN"] = (
     dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
@@ -103,6 +109,7 @@ cfg = LineageJobConfig.from_dbutils(
     max_runs_per_execution=MAX_RUNS_PER_EXECUTION,
     discovery_lookback_hours=DISCOVERY_LOOKBACK_HOURS,
     lineage_entity_types=LINEAGE_ENTITY_TYPES,
+    force_reparse=FORCE_REPARSE,
 )
 
 t0 = time.time()

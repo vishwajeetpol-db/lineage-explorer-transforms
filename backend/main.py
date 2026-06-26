@@ -58,6 +58,7 @@ from backend.transform_service import (
     backtrack_transform_lineage,
     get_transform_categories,
     invalidate_transform_cache,
+    clear_transform_lineage,
 )
 from backend.build_service import (
     submit_build_job,
@@ -836,6 +837,36 @@ async def api_transform_freshness(
         raise HTTPException(status_code=500, detail=_safe_error(e))
 
 
+@app.post("/api/transform/invalidate")
+async def api_transform_invalidate(
+    request: Request,
+    scope: str = Query("cache"),
+    table_fqn: str = Query(None),
+):
+    """Invalidate transformation lineage. ADMIN ONLY.
+
+    scope=cache  → flush in-memory transform caches (no data loss).
+    scope=table  → also delete one table's stored edges (needs table_fqn).
+    scope=all    → wipe ALL stored transformation lineage (start fresh).
+    """
+    email, is_admin = await asyncio.to_thread(_get_user_info, request)
+    if not is_admin:
+        logger.warning(f"Non-admin transform invalidate attempt by {email}")
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if scope not in ("cache", "table", "all"):
+        raise HTTPException(status_code=400, detail="scope must be cache|table|all")
+    if scope == "table":
+        if not table_fqn or not _FULL_NAME_RE.match(table_fqn):
+            raise HTTPException(status_code=400, detail="table_fqn (catalog.schema.table) required for scope=table")
+    try:
+        result = await asyncio.to_thread(clear_transform_lineage, scope, table_fqn)
+        logger.info(f"Admin {email} invalidated transform lineage scope={scope} table={table_fqn}")
+        return {"status": "ok", **result}
+    except Exception as e:
+        logger.error(f"Transform invalidate failed: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
 @app.post("/api/transform/build")
 async def api_transform_build(request: Request, body: BuildJobRequest):
     """Submit a serverless job to build transformation lineage for a table.
@@ -869,7 +900,11 @@ async def api_transform_build(request: Request, body: BuildJobRequest):
             }
 
     try:
-        run_id = await asyncio.to_thread(submit_build_job, table_fqn, catalog, schema)
+        # A force_rebuild also forces a full re-parse (bypass change detection),
+        # so "Regenerate" / clear-and-rebuild actually re-runs the parser.
+        run_id = await asyncio.to_thread(
+            submit_build_job, table_fqn, catalog, schema, bool(body.force_rebuild)
+        )
         return {
             "status": "submitted",
             "run_id": run_id,

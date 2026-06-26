@@ -42,6 +42,12 @@ class LineageJobConfig:
     # Entity types for system.access.column_lineage. `NOTEBOOK` rows may not map to `jobs.get_run`.
     lineage_entity_types: tuple[str, ...] = ("JOB",)
 
+    # Force a full re-parse: bypass content-version early-termination so even
+    # byte-identical artifacts are re-parsed. Set by the app's force/clear flows
+    # (a "Regenerate"/"clear & rebuild" must actually re-run the parser, not skip
+    # it because the source content is unchanged).
+    force_reparse: bool = False
+
     @classmethod
     def from_environment(
         cls,
