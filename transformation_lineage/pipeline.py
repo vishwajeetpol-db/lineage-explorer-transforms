@@ -40,6 +40,7 @@ from transformation_lineage.versioning.change_detection import (
     batch_check_versions,
     batch_record_versions,
     content_sha256,
+    version_token,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,7 +91,10 @@ def run_daily_pipeline(spark: SparkSession, cfg: LineageJobConfig) -> str:
         )
 
         # ── Phase 2: Batch version check (single query instead of N queries) ──
-        sha_map = {a.extraction_id: content_sha256(a.raw_source) for a in artifacts}
+        # Key on (parser version + content), not content alone, so a deployed
+        # parser fix re-parses unchanged objects instead of being skipped by the
+        # early-termination below.
+        sha_map = {a.extraction_id: version_token(a.raw_source) for a in artifacts}
         new_version_ids = batch_check_versions(spark, tables["code_versions"], sha_map)
 
         # Record all version rows in one batch write

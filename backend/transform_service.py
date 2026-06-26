@@ -327,18 +327,47 @@ def get_transform_freshness(catalog: str, schema: str, table: str) -> FreshnessI
     return _transform_cached_fetch(cache_key, _fetch)
 
 
-def _get_latest_run_id(edge_table: Optional[str] = None) -> Optional[str]:
-    """Get the latest pipeline_run_id from the edge table (cached separately)."""
+def _get_latest_run_id(
+    edge_table: Optional[str] = None, table_fqn: Optional[str] = None
+) -> Optional[str]:
+    """Resolve the pipeline_run_id whose edges should serve `table_fqn`.
+
+    Builds are scoped to a single table (KPI_TABLES = the clicked table), so each
+    run materializes edges for ONLY that table. A naive global "latest run by
+    materialized_at" therefore serves whichever table was built most recently and
+    hides every other table — e.g. building the MV made dim_customers.full_name
+    return nothing, even though its edges were never deleted.
+
+    The fix: pick the latest run where THIS table is a build target (`dst_fqn`),
+    so each table is served from the run that actually produced its columns. If
+    the table is never a destination (a pure upstream source), fall back to the
+    latest run where it appears as a source so source-column detection still
+    works. With no `table_fqn`, retain the global-latest behavior.
+    """
     edge_table = edge_table or EDGE_TABLE
-    cache_key = f"transform_latest_run_id:{edge_table}"
+    cache_key = f"transform_latest_run_id:{edge_table}:{table_fqn or '__global__'}"
 
     def _fetch():
-        _, rows = _sql(f"""
-            SELECT pipeline_run_id
-            FROM {edge_table}
-            ORDER BY materialized_at DESC
-            LIMIT 1
-        """)
+        if table_fqn:
+            # Prefer the latest run where the table is a destination; among runs
+            # that only reference it as a source, pick the latest of those.
+            _, rows = _sql(f"""
+                SELECT pipeline_run_id
+                FROM {edge_table}
+                WHERE src_fqn = '{table_fqn}' OR dst_fqn = '{table_fqn}'
+                GROUP BY pipeline_run_id
+                ORDER BY
+                    MAX(CASE WHEN dst_fqn = '{table_fqn}' THEN 1 ELSE 0 END) DESC,
+                    MAX(materialized_at) DESC
+                LIMIT 1
+            """)
+        else:
+            _, rows = _sql(f"""
+                SELECT pipeline_run_id
+                FROM {edge_table}
+                ORDER BY materialized_at DESC
+                LIMIT 1
+            """)
         if rows and rows[0][0]:
             return str(rows[0][0])
         return None
@@ -359,7 +388,9 @@ def load_edges(
     cache_key = f"transform_edges:{edge_table}:{table_fqn or 'all'}"
 
     def _fetch():
-        run_id = _get_latest_run_id(edge_table)
+        # Resolve the run that actually built THIS table (not the global-latest
+        # run, which would be whichever table was generated most recently).
+        run_id = _get_latest_run_id(edge_table, table_fqn)
         if not run_id:
             return []
 

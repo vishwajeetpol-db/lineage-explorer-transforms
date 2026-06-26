@@ -382,8 +382,10 @@ Column-level *transformation* lineage (the SQL/PySpark expression behind each co
 | Notebook / Python-file jobs (SQL & PySpark) | ✅ |
 | SQL-file tasks | ✅ |
 | Views · materialized views · streaming tables · SQL-defined DLT | ✅ via definition-based resolution (`SHOW CREATE TABLE` — no discovery/lineage lag) |
-| Python-defined DLT (`@dlt.table`) | ⚠️ pipeline is discovered + notebook fetched, but PySpark `.select()`/`.withColumn()` extraction is not yet implemented |
+| Python-defined DLT (`@dlt.table` / `@dlt.view`) | ✅ pipeline discovered → notebook fetched → AST parser walks the decorated function's return chain (`.select()`/`.withColumn()`); resolves `spark.readStream.table` / `dlt.read` / `dlt.readStream` sources |
 | Delta Sharing / Lakehouse Federation tables (as target) | ❌ not derivable — the producing code runs in another account; detected and surfaced as an external source |
+
+> Each build is scoped to one table, and reads resolve the latest run that built **that** table (`dst_fqn`), so generating lineage for one table never hides another's. Deployed parser improvements automatically re-parse already-built objects on the next build (the change-detection key folds in `PARSER_VERSION`).
 
 A local notebook/job that **reads** a shared or foreign table into a local table **is** captured — the shared table appears as an upstream source column (lineage stops at that boundary).
 

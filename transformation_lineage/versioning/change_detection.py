@@ -16,8 +16,32 @@ from pyspark.sql.types import BooleanType, StringType, StructField, StructType, 
 from pyspark.errors import AnalysisException
 
 
+# Bump whenever the parser / graph-builder changes how it extracts column
+# lineage from UNCHANGED source. The version-check key folds this in, so a
+# deployed parser fix forces a one-time re-parse of every artifact even when its
+# source content is byte-for-byte identical. Without this, early-termination
+# (pipeline.py) skips re-parsing unchanged content and the fix silently no-ops —
+# this is exactly why the streaming-table parser fixes never took effect.
+#
+# History:
+#   1  implicit baseline (content-only key)
+#   2  STREAM(...) unwrap + unqualified-column attribution; @dlt.table extraction
+PARSER_VERSION = "2"
+
+
 def content_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def version_token(raw_source: str) -> str:
+    """Change-detection key = hash of (parser version + source content).
+
+    Distinct from ``content_sha256`` (the pure content hash stored as code
+    provenance): this token gates whether an artifact is re-parsed. Bumping
+    ``PARSER_VERSION`` invalidates every token, triggering a full re-parse on the
+    next run so engine improvements reach already-seen objects.
+    """
+    return content_sha256(f"parser_v{PARSER_VERSION}\x00{raw_source}")
 
 
 def is_new_content_version(spark: SparkSession, versions_table_fqn: str, extraction_id: str, sha256: str) -> bool:

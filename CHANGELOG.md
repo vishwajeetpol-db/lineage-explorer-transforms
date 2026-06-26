@@ -22,14 +22,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Per-table read scoping (regression)** — transformation reads served edges from the single global-latest `pipeline_run_id`. Because each build is scoped to one table, building table B made table A's column lineage vanish (e.g. building the MV blanked `dim_customers.full_name`). Reads now resolve the latest run that actually built the requested table (`dst_fqn`), so every built table stays viewable simultaneously.
+- **Change detection ignored the parser version** — early termination keyed only on source-content SHA, so a deployed parser fix silently no-op'd on byte-identical objects (the streaming-table fixes never re-ran). Added `PARSER_VERSION` folded into the version-check token; bumping it forces a one-time re-parse of all artifacts.
+- **Streaming tables now emit transformation edges** — with the change-detection fix above re-parsing the definition, `STREAM(...)` / single-source streaming tables produce correct column edges (`cast`, `upper`, `concat`, …). Verified end-to-end on `st_orders_norm`.
+- **Python-defined DLT (`@dlt.table` / `@dlt.view`)** — the AST parser now walks decorated dataset functions' return chains and emits column mappings (previously only `saveAsTable` sinks were handled). Also resolves `spark.readStream.table` / `dlt.read` / `dlt.readStream` sources. Verified end-to-end on `dlt_order_enriched`.
 - **SQL parser** — detect `MATERIALIZED VIEW` / `STREAMING [LIVE] TABLE` / `LIVE TABLE` / `VIEW` / `OR REFRESH` output targets; unwrap `STREAM(...)` source reads; resolve unqualified columns against a single known source table.
 - **`run_pipeline`** — `sys.dont_write_bytecode = True` to avoid WSFS `__pycache__` `AsyncFlushFailedException` when importing the package from a Workspace path.
 - **Transform read/build paths** resolve the dedicated lineage store consistently (was deriving the store from the selected table's own schema).
 
 ### Known limitations
 
-- **Python-defined DLT (`@dlt.table`)** — the pipeline is discovered and its notebook fetched, but the PySpark parser does not yet extract `.select()` / `.withColumn()` column logic (SQL-defined DLT works via the definition path).
-- **Streaming tables** — parse produces column nodes/edges, but the edge-endpoints serve-builder does not yet emit serve rows for the `STREAM(...)` / single-source shape (in progress).
 - **Delta Sharing / Lakehouse Federation tables** — transformation lineage is not derivable (the producing code runs in another account); detected and surfaced as an external source. A local notebook that **reads** a shared table into a local table **is** captured (the shared table appears as an upstream source).
 
 ---

@@ -94,17 +94,31 @@ def _is_attr_call(node: ast.AST, attr: str) -> bool:
 
 
 def _is_spark_table(node: ast.AST) -> bool:
-    """True iff node is `spark.table(...)` or `spark.read.table(...)`."""
+    """True iff node is a table-read whose first string arg is the source table.
+
+    Covers the batch and streaming spark readers plus the DLT readers:
+      spark.table(...) / spark.read.table(...) / spark.readStream.table(...)
+      dlt.read("...") / dlt.readStream("...")
+    All take the table name as the first positional argument, so the existing
+    `cur.args[0]` extraction in `_trace_root_fqns` / `_collect_symbols` works
+    uniformly.
+    """
     if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
         return False
-    if node.func.attr != "table":
-        return False
+    attr = node.func.attr
     inner = node.func.value
+    # dlt.read("x") / dlt.readStream("x") — DLT cross-dataset reads.
+    if attr in ("read", "readStream") and isinstance(inner, ast.Name) and inner.id == "dlt":
+        return True
+    if attr != "table":
+        return False
+    # spark.table(...)
     if isinstance(inner, ast.Name) and inner.id == "spark":
         return True
+    # spark.read.table(...) / spark.readStream.table(...)
     if (
         isinstance(inner, ast.Attribute)
-        and inner.attr == "read"
+        and inner.attr in ("read", "readStream")
         and isinstance(inner.value, ast.Name)
         and inner.value.id == "spark"
     ):
@@ -649,6 +663,81 @@ def _find_save_targets(tree: ast.AST, st: _SymbolTable) -> list[tuple[ast.AST, s
     return out
 
 
+# DLT / Lakeflow decorators that declare a dataset. The decorated function's
+# return value is the dataset's defining DataFrame chain.
+_DLT_DECORATORS = {"table", "view", "create_table", "create_streaming_table", "create_view"}
+
+
+def _is_dlt_decorator(dec: ast.AST) -> bool:
+    """True iff `dec` is `@dlt.table(...)` / `@table` / `@dlt.view` etc."""
+    target = dec.func if isinstance(dec, ast.Call) else dec
+    if isinstance(target, ast.Attribute):
+        return target.attr in _DLT_DECORATORS
+    if isinstance(target, ast.Name):
+        return target.id in _DLT_DECORATORS
+    return False
+
+
+def _dlt_target_name(func: ast.FunctionDef, st: _SymbolTable) -> str | None:
+    """Resolve a DLT dataset's output name: the decorator `name=`/positional arg
+    if present, else the function name."""
+    for dec in func.decorator_list:
+        if not _is_dlt_decorator(dec):
+            continue
+        if isinstance(dec, ast.Call):
+            for kw in dec.keywords or []:
+                if kw.arg == "name":
+                    n = _resolve_string(kw.value, st)
+                    if n:
+                        return n
+            if dec.args:
+                n = _resolve_string(dec.args[0], st)
+                if n:
+                    return n
+        return func.name
+    return None
+
+
+def _last_return_value(func: ast.FunctionDef) -> ast.AST | None:
+    """Return the value node of the function's last top-level `return` (DLT
+    dataset functions end in `return <dataframe chain>`)."""
+    ret: ast.AST | None = None
+    for stmt in func.body:
+        if isinstance(stmt, ast.Return) and stmt.value is not None:
+            ret = stmt.value
+    return ret
+
+
+def _find_dlt_targets(
+    tree: ast.AST, st: _SymbolTable
+) -> list[tuple[ast.AST, str, _SymbolTable]]:
+    """Find `@dlt.table`/`@dlt.view` dataset functions.
+
+    Returns (return_df_node, target_name, function_scoped_symbol_table). Each
+    function gets its own symbol table (seeded with module-level string vars) so
+    a local DataFrame name reused across datasets doesn't bleed between them.
+    """
+    out: list[tuple[ast.AST, str, _SymbolTable]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if not any(_is_dlt_decorator(d) for d in node.decorator_list):
+            continue
+        target = _dlt_target_name(node, st)
+        if not target:
+            continue
+        ret = _last_return_value(node)
+        if ret is None:
+            continue
+        # Function-scoped symbols: seed with module strings, then collect the
+        # function body's own assignments (e.g. `o = spark.read.table(...)`).
+        fn_st = _SymbolTable(string_vars=dict(st.string_vars))
+        _collect_symbols(node, fn_st)
+        _collect_df_aliases(node, fn_st)
+        out.append((ret, target, fn_st))
+    return out
+
+
 def parse_pyspark_ast(
     text: str,
     *,
@@ -691,6 +780,23 @@ def parse_pyspark_ast(
             m["output_table_fqn"] = target_fqn
         mappings.extend(chain_mappings)
         table_refs.extend(chain_sources)
+
+    # DLT / Lakeflow datasets: `@dlt.table def f(): return df.select(...)`. There
+    # is no saveAsTable sink — the decorated function's return chain IS the
+    # definition. The decorator only gives a bare dataset name (not a 3-part
+    # FQN), so mappings are left unstamped: graph_builder attributes them to the
+    # build's `default_table_fqn` (the single KPI table being built).
+    for ret_node, _target_name, fn_st in _find_dlt_targets(tree, st):
+        chain_expr = ret_node
+        if isinstance(ret_node, ast.Name) and ret_node.id in fn_st.df_chains:
+            chain_expr = fn_st.df_chains[ret_node.id]
+        alias_map, col_first_seen = _build_resolution_state(chain_expr, fn_st)
+        dlt_mappings, dlt_sources = _walk_chain_for_outputs(
+            chain_expr, fn_st, artifact_id, None,
+            alias_map=alias_map, col_first_seen=col_first_seen,
+        )
+        mappings.extend(dlt_mappings)
+        table_refs.extend(dlt_sources)
 
     statements_parsed = 1 if (mappings or table_refs) else 0
     return {
