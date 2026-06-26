@@ -20,8 +20,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Transformation popup UX** — target column rendered on top with upstream cascading down; `fitView` zoom capped (small graphs no longer magnified ~3×); persistent zoom-stable edge labels (category + expression, no hover required); responsive canvas height. **Removed the depth slider** — the popup always shows the selected column's full end-to-end transformation lineage (depth is not a meaningful knob for a single column).
 - **`LINEAGE_WINDOW_DAYS` reconciled to 365** across code + docs, with the producer-staleness semantics documented (the window is max producer staleness before lineage drops off; pair with `event_date` partition pruning to keep a wide window cheap).
 
+### Added
+
+- **Persistent build control in the transformation panel header** — the "Generate / Regenerate" button is now always visible: enabled when lineage is missing or stale, and **grayed when already built** (so it's clear it exists) while still allowing a force-rebuild. Previously the button only appeared in the not-built state, so an already-built table showed no build affordance at all.
+
 ### Fixed
 
+- **Cross-column-name edge contamination (edge-endpoints join)** — the serve-table builder matched a derived column's source by **column name** against the artifact's read set. Since a whole notebook shares one transformation node, an output column cross-joined to *every* source table exposing a same-named column (e.g. `gold.customer_orders.customer_id` gained spurious edges from `raw_customers`, `raw_orders`, `fct_orders`). Each derive edge now records its exact resolved source node id and the join pins the source by id — eliminating the cross-join. `order_count` went 7→1 edges, `customer_id` 6→1, etc.
+- **Self-loop edges** — a mis-resolved alias could attribute a column to its own output table (`x.col ← x.col`), rendering as a target with no upstream. Guarded at parse time (graph builder) and filtered at read time.
+- **Duplicate parallel edges** — the BFS now dedups by (source, target) column pair, so a column referenced both bare and alias-qualified renders as one edge, not two.
+- **`sqlparse` pinned to `0.4.4`** in the build job (newer 0.5.x tokenizes multi-statement SQL differently).
 - **Per-table read scoping (regression)** — transformation reads served edges from the single global-latest `pipeline_run_id`. Because each build is scoped to one table, building table B made table A's column lineage vanish (e.g. building the MV blanked `dim_customers.full_name`). Reads now resolve the latest run that actually built the requested table (`dst_fqn`), so every built table stays viewable simultaneously.
 - **Change detection ignored the parser version** — early termination keyed only on source-content SHA, so a deployed parser fix silently no-op'd on byte-identical objects (the streaming-table fixes never re-ran). Added `PARSER_VERSION` folded into the version-check token; bumping it forces a one-time re-parse of all artifacts.
 - **Streaming tables now emit transformation edges** — with the change-detection fix above re-parsing the definition, `STREAM(...)` / single-source streaming tables produce correct column edges (`cast`, `upper`, `concat`, …). Verified end-to-end on `st_orders_norm`.

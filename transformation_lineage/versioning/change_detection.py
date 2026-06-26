@@ -26,7 +26,9 @@ from pyspark.errors import AnalysisException
 # History:
 #   1  implicit baseline (content-only key)
 #   2  STREAM(...) unwrap + unqualified-column attribution; @dlt.table extraction
-PARSER_VERSION = "2"
+#   3  self-loop guard; sqlparse pinned to 0.4.4
+#   4  edge-endpoints join pins source by node id (kills same-column cross-joins)
+PARSER_VERSION = "4"
 
 
 def content_sha256(text: str) -> str:

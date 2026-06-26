@@ -9,12 +9,17 @@ joins across three tables per query.
 
 Correctness notes
 -----------------
-Each derive edge is 1:1 with a parser column_mapping — its `meta_json.source_ref`
-names the one source column it was derived from. We match that text against
-the source-column node's `column_name` to avoid false cross-joins when an
-artifact has multiple inputs and multiple outputs. `source_ref` can be either
-qualified (`alias.col`) or bare (`col`), so we extract the last dotted segment
-before comparing.
+Each derive edge is 1:1 with a parser column_mapping. The edge's
+`meta_json.src_node_id` is the EXACT resolved source-column node it was derived
+from, so we join the source node directly by id. This is essential because the
+whole artifact shares a single `xfm` node: matching the source by column name
+(the previous approach) cross-joins an output column to every source table that
+happens to expose a column of the same name — e.g. `customer_orders.customer_id`
+picking up spurious edges from `raw_customers`, `raw_orders`, and `fct_orders`
+just because they all have a `customer_id`.
+
+Older runs whose derive edges predate `src_node_id` produce no rows here; they
+are re-materialized on the next build (the parser version key forces a re-parse).
 """
 
 from __future__ import annotations
@@ -70,7 +75,7 @@ def build_edge_endpoints(
     )
     SELECT
       derive.pipeline_run_id                                    AS pipeline_run_id,
-      col_read.src_id                                           AS src_node_id,
+      src_node.node_id                                          AS src_node_id,
       src_node.table_fqn                                        AS src_fqn,
       src_node.column_name                                      AS src_col,
       derive.dst_id                                             AS dst_node_id,
@@ -89,22 +94,11 @@ def build_edge_endpoints(
       get_json_object(derive.meta_json, '$.transform_category') AS transform_category,
       current_timestamp()                                       AS materialized_at
     FROM {edges_table} AS derive
-    JOIN {edges_table} AS col_read
-      ON derive.pipeline_run_id = col_read.pipeline_run_id
-     AND derive.src_id          = col_read.dst_id
-     AND derive.edge_type       = 'derive'
-     AND col_read.edge_type     = 'read'
-     AND col_read.src_id LIKE 'col:%'
-     AND derive.src_id   LIKE 'xfm:%'
-     AND derive.dst_id   LIKE 'col:%'
+    -- Pin the source to the EXACT node the parser resolved (no column-name match,
+    -- which would cross-join across same-named columns of different source tables).
     JOIN {nodes_table} AS src_node
-      ON src_node.pipeline_run_id = col_read.pipeline_run_id
-     AND src_node.node_id         = col_read.src_id
-     AND src_node.column_name     = regexp_extract(
-           get_json_object(derive.meta_json, '$.source_ref'),
-           '([^.]+)$',
-           1
-         )
+      ON src_node.pipeline_run_id = derive.pipeline_run_id
+     AND src_node.node_id         = get_json_object(derive.meta_json, '$.src_node_id')
     JOIN {nodes_table} AS dst_node
       ON dst_node.pipeline_run_id = derive.pipeline_run_id
      AND dst_node.node_id         = derive.dst_id
@@ -112,6 +106,10 @@ def build_edge_endpoints(
       ON raw.pipeline_run_id = derive.pipeline_run_id
      AND raw.extraction_id   = derive.artifact_id
     WHERE derive.pipeline_run_id = '{safe_run_id}'
+      AND derive.edge_type = 'derive'
+      AND derive.src_id LIKE 'xfm:%'
+      AND derive.dst_id LIKE 'col:%'
+      AND get_json_object(derive.meta_json, '$.src_node_id') IS NOT NULL
     """
     spark.sql(insert_sql)
 

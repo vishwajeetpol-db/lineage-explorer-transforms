@@ -142,7 +142,12 @@ def submit_build_job(
             "environment_key": "Default",
             "spec": {
                 "client": "2",
-                "dependencies": ["sqlparse", "requests", "databricks-sdk"],
+                # Pin sqlparse: newer releases (0.5.x) tokenize/group multi-statement
+                # SQL differently, which leaks alias resolution ACROSS statements in a
+                # multi-CREATE notebook (e.g. gold.customer_orders.customer_id getting
+                # spurious edges from raw_customers/raw_orders). 0.4.4 parses each
+                # statement in isolation as the engine expects. See PARSER_VERSION.
+                "dependencies": ["sqlparse==0.4.4", "requests", "databricks-sdk"],
             },
         }],
     }

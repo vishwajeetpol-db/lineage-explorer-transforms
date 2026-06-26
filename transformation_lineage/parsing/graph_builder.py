@@ -167,6 +167,14 @@ def build_graph_from_parse_results(
         src_nid: str | None = None
         if src_col:
             src_nid = _col_node_id(src_fqn, src_col, artifact_id=artifact_id, fallback_tag="unresolved")
+            # Self-loop guard: a column can't be derived from itself. This happens
+            # when an alias mis-resolves to the output table (e.g. a stale parse
+            # attributing `oe.col` to the target instead of the FROM source).
+            # Such an edge renders as a target node with no upstream and, sharing
+            # the same edge_id as the real edge, shadows it in the BFS dedup. Skip
+            # the mapping entirely so the genuine source edge survives.
+            if src_nid == out_nid:
+                continue
             if src_nid not in nodes:
                 nodes[src_nid] = LineageNodeRecord(
                     node_id=src_nid,
@@ -189,7 +197,10 @@ def build_graph_from_parse_results(
                 )
             )
 
-        eid_d = _eid("derive", artifact_id, out, src_ref)
+        # Include src_node_id (and the resolved source col) in the edge_id so two
+        # outputs deriving from the same-named column of DIFFERENT source tables
+        # don't collapse to one edge.
+        eid_d = _eid("derive", artifact_id, out, src_ref, src_nid or "")
         edges.append(
             LineageEdgeRecord(
                 edge_id=f"e_{eid_d}",
@@ -200,6 +211,12 @@ def build_graph_from_parse_results(
                 meta_json=json.dumps(
                     {
                         "source_ref": src_ref,
+                        # The EXACT resolved source column node. The whole artifact
+                        # shares one xfm node, so the endpoints builder must pin the
+                        # source by node id — matching on column name alone cross-
+                        # joins an output to every source table that happens to have
+                        # a column of the same name.
+                        "src_node_id": src_nid,
                         "transform_category": category,
                         "expr": expr,
                         "expr_lang": expr_lang,

@@ -15,7 +15,7 @@
  */
 import React from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, Zap, RefreshCw, GitBranch, AlertCircle, Layers } from 'lucide-react';
+import { X, Zap, RefreshCw, GitBranch, AlertCircle, Layers, Check } from 'lucide-react';
 import { useTransformStore } from '../../store/transformStore';
 import TransformCanvas from './TransformCanvas';
 import BuildProgress from './BuildProgress';
@@ -33,6 +33,31 @@ export default function TransformPanel() {
   const triggerBuild = useTransformStore((s) => s.triggerBuild);
 
   const isOpen = panelState !== 'closed';
+
+  // Persistent build control (shown in the header). The button is ALWAYS visible
+  // once a column is selected so the user can see the build state at a glance:
+  //  - not built      → enabled "Generate"
+  //  - built but stale → enabled "Regenerate"
+  //  - built & fresh   → grayed "Lineage built" (so it's clear it's already built),
+  //                      still clickable to force a rebuild
+  //  - building/loading → disabled, transient label
+  const isBuilt = !!(freshness?.exists && !freshness.is_stale);
+  const isStale = !!(freshness?.exists && freshness.is_stale);
+  const isBusy = panelState === 'building' || panelState === 'loading';
+  const buildLabel = panelState === 'building'
+    ? 'Building…'
+    : panelState === 'loading'
+      ? 'Checking…'
+      : isBuilt
+        ? 'Lineage built'
+        : isStale
+          ? 'Regenerate'
+          : 'Generate';
+  const onBuildClick = () => {
+    if (!selectedTable || isBusy) return;
+    // force a rebuild when something already exists (stale or fresh)
+    triggerBuild(selectedTable, isStale || isBuilt);
+  };
 
   return (
     <AnimatePresence>
@@ -57,9 +82,43 @@ export default function TransformPanel() {
                 </p>
               </div>
             </div>
-            <button onClick={closePanel} className="p-2 rounded-lg hover:bg-slate-800 transition-colors">
-              <X size={18} className="text-slate-400" />
-            </button>
+            <div className="flex items-center gap-2">
+              {selectedTable && panelState !== 'error' && (
+                <button
+                  onClick={onBuildClick}
+                  disabled={isBusy}
+                  title={
+                    isBuilt
+                      ? `Transformation lineage is built (${freshness?.age_str ?? 'cached'}) — click to rebuild`
+                      : isStale
+                        ? `Transformation lineage may be out of date (${freshness?.age_str ?? ''}) — click to regenerate`
+                        : 'Build transformation lineage for this table'
+                  }
+                  className={
+                    `inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ` +
+                    (isBusy
+                      ? 'bg-slate-800 text-slate-500 border border-slate-700 cursor-wait'
+                      : isBuilt
+                        ? 'bg-slate-800/80 text-slate-400 border border-slate-700 hover:bg-slate-700 hover:text-slate-200'
+                        : isStale
+                          ? 'bg-amber-600/90 hover:bg-amber-500 text-white border border-amber-500/50'
+                          : 'bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white shadow-lg shadow-purple-900/40')
+                  }
+                >
+                  {panelState === 'building' || panelState === 'loading' ? (
+                    <RefreshCw size={13} className="animate-spin" />
+                  ) : isBuilt ? (
+                    <Check size={13} />
+                  ) : (
+                    <Zap size={13} />
+                  )}
+                  {buildLabel}
+                </button>
+              )}
+              <button onClick={closePanel} className="p-2 rounded-lg hover:bg-slate-800 transition-colors">
+                <X size={18} className="text-slate-400" />
+              </button>
+            </div>
           </div>
 
           {/* Pruning controls — only when graph is ready with lineage */}

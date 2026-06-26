@@ -397,6 +397,12 @@ def load_edges(
         where_parts = [f"pipeline_run_id = '{run_id}'"]
         where_parts.append("src_fqn IS NOT NULL AND dst_fqn IS NOT NULL")
         where_parts.append("src_col IS NOT NULL AND dst_col IS NOT NULL")
+        # Drop self-loops (src column node == dst column node). These come from
+        # stale/mis-resolved parses attributing a source ref to the output table
+        # itself; they render as a target with no upstream and, sharing an edge_id
+        # with the real edge, can shadow it. Filtering here fixes already-stored
+        # data without a rebuild.
+        where_parts.append("src_node_id != dst_node_id")
 
         if table_fqn:
             where_parts.append(f"(src_fqn = '{table_fqn}' OR dst_fqn = '{table_fqn}')")
@@ -509,7 +515,11 @@ def backtrack_transform_lineage(
 
                 for edge in node_edges:
                     src_id = edge["src_node_id"]
-                    edge_key = edge.get("edge_id") or f"{src_id}|{node_id}"
+                    # Dedup by the (source, target) column pair, not edge_id: the
+                    # parser can emit several rows for the same hop (e.g. a bare
+                    # `col` and an alias-qualified `t.col` reference), which would
+                    # otherwise render as duplicate parallel edges in the popup.
+                    edge_key = f"{src_id}|{node_id}"
 
                     if edge_key in seen_edges:
                         continue
