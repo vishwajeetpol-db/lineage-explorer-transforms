@@ -131,12 +131,12 @@ function Toolbar({ onGenerate }: Props) {
         title="Back to home"
         aria-label="Back to home"
       >
-        <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-accent to-purple-500 flex items-center justify-center shadow-[0_0_12px_rgba(99,102,241,0.3)]">
+        <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-red-500 via-purple-500 to-blue-500 flex items-center justify-center shadow-[0_0_12px_rgba(255,54,33,0.3)]">
           <GitBranch size={16} className="text-white" />
         </div>
         <div className="text-left">
           <div className="font-semibold text-[14px] text-white tracking-tight leading-none">
-            Lineage Explorer
+            NEXUS Lineage
           </div>
           <div className="text-[9px] text-slate-600 tracking-wider uppercase mt-0.5">
             Unity Catalog

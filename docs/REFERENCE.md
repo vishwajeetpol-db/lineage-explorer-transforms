@@ -90,12 +90,13 @@
 
 ## Why This Exists
 
-Unity Catalog captures lineage from every SQL operation. But exploring that lineage means writing SQL against system tables. Lineage Explorer turns those system tables into an interactive, visual DAG — deployed in one command, shared across your entire workspace.
+Unity Catalog captures lineage from every SQL operation. But exploring that lineage means writing SQL against system tables. Lineage Explorer turns those system tables into an interactive, visual DAG — deployed in one command, shared across your entire workspace. **And it goes one layer deeper than UC itself:** it reconstructs the *actual transformation expression* behind every column — not just the dependency edges UC records.
 
 ### Key Highlights
 
 | What | Why It Matters |
 |---|---|
+| **Expression-level transformation lineage** (the unique part) | UC records that "column A depends on column B." This app reconstructs the **actual SQL/PySpark expression** that produced each column (`cast`, `sum`, `concat`, `CASE`, window, CTE chains), tagged with a transform category, by genuinely **parsing the producing code** — across notebook/Python/SQL-file jobs, Python- & SQL-defined DLT pipelines, view/MV/streaming-table definitions, and ad-hoc query history. Served as a per-column upstream drill-down. *No other lineage view shows you the "how," only the "what."* |
 | **4,000 users, 1 query** | Request coalescing means thousands of simultaneous users generate a single DBSQL query. Everyone else gets the cached result instantly. |
 | **Zero-code deploy** | `databricks bundle deploy` + `--var warehouse_id=<id>`. No files to edit, no config to write. One command, any workspace. |
 | **Deep link integration** | Add `?table=catalog.schema.table` to the URL. Embed lineage links in any existing dashboard (Azure App Service, internal tools) with a single `<a href>` tag. |
@@ -207,7 +208,7 @@ Switch to **Pipelines** view to see job-to-job dependencies derived from shared 
 - **User identity cache:** Token-hash keyed (SHA-256 first 16 chars), 5-minute TTL, LRU-bounded at 1,000 entries. Checked before any Databricks API call to the control plane
 - **Startup/shutdown cache management:** All stale caches cleared on startup via FastAPI lifespan handler. Caches also cleared on SIGTERM for graceful shutdown
 - **Metrics collection:** Middleware records latency for all `/api/` requests into a 1,000-entry rolling deque. Powers P50/P95/P99 in the admin dashboard
-- **90-day time window:** Lineage queries filter to `event_time > current_date() - INTERVAL 90 DAYS` to bound scan size
+- **365-day time window:** Lineage queries filter to `event_time > current_date() - INTERVAL 365 DAYS` (set via `LINEAGE_WINDOW_DAYS`). This is the max staleness a producing pipeline can have before its lineage drops off the view — kept wide so infrequently-run pipelines (monthly/quarterly/backfills) still show lineage; pair with `event_date` partition pruning to keep a wide window cheap
 - **50K row limit:** Column lineage queries capped at `LIMIT 50000` to prevent runaway scans
 - **Adjacency maps:** Frontend pre-computes upstream/downstream maps for O(1) traversal on hover/select (not O(n^2))
 - **Jittered backoff:** If the coalescing leader fails, waiting threads use random backoff (0-10s spread) to avoid stampeding the warehouse
@@ -318,6 +319,15 @@ Moving it to a separate tab eliminates all three issues.
 | Request rate | Total requests and requests per minute |
 | Uptime | Process uptime, PID, and Python version |
 
+**Transformation-lineage controls (admin):**
+
+| Control | Effect |
+|---|---|
+| **Flush cache** | Clears the in-memory transformation caches (freshness/edges/trace) so the next read re-queries. No data loss. (`POST /api/transform/invalidate?scope=cache`) |
+| **Wipe lineage** | Deletes all stored transformation-lineage tables — every table shows "not built" until regenerated, and rebuilds fully re-parse. The expensive audit-path and LLM-expression caches are retained. (`POST /api/transform/invalidate?scope=all`) |
+
+Per-table rebuild is available from the column popup's header button (Generate / Regenerate). A forced rebuild re-parses even byte-identical source.
+
 ---
 
 ## Lineage Data Source
@@ -365,13 +375,55 @@ The frontend uses [React Flow](https://reactflow.dev/) with [ELK.js](https://www
 | Limitation | Affected Features |
 |---|---|
 | UC captures SQL operations only | Path-based access, RDD operations, some DLT patterns have no lineage |
-| 90-day lineage window | Queries older than 90 days don't appear |
+| 365-day lineage window | Lineage whose producer last ran >365 days ago doesn't appear (configurable via `LINEAGE_WINDOW_DAYS`) |
 | Column lineage requires grants | `system.access.column_lineage` needs `SELECT` access |
 | Entity names from `system.lakeflow.jobs` | Only Lakeflow jobs have resolved names; notebooks/queries show raw IDs |
-| Ad-hoc SQL has no entity info | CTAS/INSERT run directly on warehouse have `entity_type=NULL` — no pipeline node shown (correct behavior, no job was involved) |
+| Ad-hoc SQL has no entity info | CTAS/INSERT run directly on warehouse have `entity_type=NULL` — no pipeline node shown on the table graph (no job was involved). *Transformation* lineage for these **is** recovered via the `system.query.history` fallback (identity-scoped — see Transformation Lineage Coverage). |
 | Serverless cost only | Classic compute (interactive/job clusters) cost not shown — only `%SERVERLESS%` SKU from `system.billing.usage` |
 | Billing data requires grants | `system.billing` needs `SELECT` access. If not granted, cost gracefully not shown |
 | Lineage propagation delay | UC system tables can take 5-30 minutes to reflect new lineage from recent queries |
+
+### Transformation Lineage Coverage
+
+Column-level *transformation* lineage (the SQL/PySpark expression behind each column) is **opt-in** — generate it per table from the column popup (runs a serverless build; compute cost applies; cached after). Coverage by producer type:
+
+| Producer | Supported |
+|---|---|
+| Notebook / Python-file jobs (SQL & PySpark) | ✅ |
+| SQL-file tasks (`sql_task`) | ✅ |
+| Views · materialized views · streaming tables · SQL-defined DLT | ✅ via definition-based resolution (`SHOW CREATE TABLE` — no discovery/lineage lag; per-catalog `information_schema` reads `table_type`) |
+| Python-defined DLT (`@dlt.table` / `@dlt.view`) | ✅ pipeline discovered → notebook fetched → AST parser walks the decorated function's return chain (`.select()`/`.withColumn()`); resolves `spark.readStream.table` / `dlt.read` / `dlt.readStream` sources |
+| Ad-hoc SQL / SQL editor / scripts (`entity_type=NULL`) | ✅ via `system.query.history` fallback — the latest FINISHED write whose parsed output is the target is parsed. *Identity-scoped:* needs query-history visibility for the producing user; otherwise degrades to a `no_producing_query` skip |
+| Delta Sharing / Lakehouse Federation tables (as target) | ⛔ not derivable — the producing code runs in another account; detected (`table_type` FOREIGN) and surfaced as an `external_source` skip, not a misleading empty graph |
+
+**SQL parsing handles:** CTE chains (`WITH cte AS (...)` — resolved through to base columns), `STREAM(...)` reads (unwrapped to the inner table), `USE CATALOG/SCHEMA` qualification of 1-/2-part names, single-source attribution of unqualified columns (multi-source leaves `source_fqn` NULL but still creates the derive edge), and output-target detection for `CREATE [OR REPLACE/REFRESH] [TEMPORARY] MATERIALIZED VIEW / STREAMING [LIVE] TABLE / LIVE TABLE / VIEW`, `INSERT`, `MERGE`, CTAS.
+
+> Each build is scoped to one table, and reads resolve the latest run that built **that** table (`dst_fqn`), so generating lineage for one table never hides another's. Deployed parser improvements automatically re-parse already-built objects on the next build (the change-detection key folds in `PARSER_VERSION`; a `force_rebuild`/Regenerate forces it immediately). Each derive edge pins its exact source node (`src_node_id`), so the serve table never cross-joins same-named columns across different source tables.
+
+A local notebook/job that **reads** a shared or foreign table into a local table **is** captured — the shared table appears as an upstream source column (lineage stops at that boundary).
+
+#### Change detection & re-parsing
+
+Builds skip work when nothing changed, but "changed" includes the parser itself. Each artifact's change-detection key is a **`version_token`** = `sha256("parser_v" + PARSER_VERSION + NUL + raw_source)`, distinct from the `content_sha256` stored as code provenance. So shipping a parser improvement (bumping `PARSER_VERSION` in `versioning/change_detection.py`, currently `5`) forces a one-time re-parse of every already-built object on its next build — without it, early-termination would skip unchanged source and the fix would silently no-op. A `force_rebuild` request (the **Regenerate** button) sets `FORCE_REPARSE=true`, bypassing the check immediately.
+
+#### Build-job parameters
+
+The build job (`notebooks/run_pipeline.py`) reads these widgets, set by `build_service.py`:
+
+| Parameter | Purpose |
+|---|---|
+| `KPI_TABLES` | The table(s) to build lineage for (the clicked table) |
+| `TARGET_CATALOG` / `TARGET_SCHEMA` | The dedicated store location (`LINEAGE_CATALOG.LINEAGE_SCHEMA`) |
+| `BUILD_ONLY` | Skip interactive demo phases |
+| `FORCE_REPARSE` | Re-parse even unchanged source (set when `force_rebuild`) |
+| `DISCOVERY_LOOKBACK_HOURS` | System-lineage discovery window (default 1080 = 45 days) |
+| `SRC_PATH` | Override for the engine package path |
+
+Entity types discovered: `JOB, NOTEBOOK, PIPELINE`.
+
+#### Transformation-lineage store tables (Option A)
+
+All transformation-lineage data lives in one app-SP-owned schema (`LINEAGE_CATALOG.LINEAGE_SCHEMA`) — node ids embed the real data catalog, so the build SP needs **zero write** on any data catalog. The 12 Delta tables: `lineage_nodes`, `lineage_edges`, **`lineage_edge_endpoints`** (the serve table — one row per column→column hop, columns `src_fqn/src_col/dst_fqn/dst_col/expr/expr_lang/expr_sql/transform_category/source_path`), `lineage_raw_code`, `lineage_code_versions`, `lineage_parse_metrics`, `lineage_graph_cache`, `lineage_reconciliation`, `lineage_extraction_reports`, `lineage_sublineage_cache`, `lineage_notebook_path_cache`, `lineage_pyspark_to_sql_cache`. A global **Wipe lineage** clears the lineage tables (including `code_versions`, so rebuilds fully re-parse) but keeps the two expensive caches.
 
 ### Architecture Boundaries
 
@@ -420,6 +472,9 @@ Before deploying, review the permissions the app needs. The app uses a **bare mi
 | `USE SCHEMA` + `SELECT` on `system.lakeflow` | For entity names | No | Usually pre-granted via `account users` |
 | `USE SCHEMA` + `SELECT` on `system.billing` | For serverless job costs | No | Account admin. If not granted, cost simply won't show (graceful fallback) |
 | `USE SCHEMA` + `SELECT` on `system.information_schema` | For Delta Sharing overlay (shares/recipients/providers) | No | Account admin. Sharing views only expose objects the SP is privileged on — a full sharing inventory needs metastore-admin or explicit share grants |
+| `SELECT` on `system.access.audit` | For transformation-lineage notebook-path resolution | No | Account admin |
+| `SELECT` on `system.query.history` | For the transformation-lineage query-history fallback (entity-less producers). Identity-scoped — needs broad query-history visibility to resolve other users' ad-hoc tables | No | Account admin |
+| `ALL PRIVILEGES` on `LINEAGE_CATALOG.LINEAGE_SCHEMA` (dedicated store) | For writing transformation-lineage tables. **Option A:** this one schema is the *only* place the app writes — **no write on any data catalog** (node ids embed the real catalog) | No | Owner of the dedicated catalog/schema |
 | `CAN_USE` on SQL Warehouse | Yes | No | Warehouse owner / admin |
 | `CAN_MANAGE` on SQL Warehouse | No | Yes (if SPN) | Warehouse owner / admin |
 | Workspace membership | Auto (app SPN added) | Must exist in workspace | Workspace admin |
@@ -839,9 +894,15 @@ Single-process is the right default — it keeps the cache, coalescing, and rate
 | `SQL_WAIT_TIMEOUT` | `50s` | SQL execution timeout |
 | `RATE_LIMIT_MAX_REQUESTS` | `60` | Requests per user per window |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit window |
-| `LINEAGE_WINDOW_DAYS` | `90` | Lookback window for `system.access` lineage queries |
+| `LINEAGE_WINDOW_DAYS` | `365` | Lookback window for `system.access` lineage queries (max producer staleness before lineage drops off; UC retention ~365d caps it) |
 | `COST_CACHE_TTL_SECONDS` | `21600` (6h) | TTL for the serverless-cost cache (billing rolls up daily) |
 | `LINEAGE_MAX_NODES` | `2500` | Cap on nodes per graph/trace (UI flags partial results) |
+| `LINEAGE_CATALOG` | `lattice_lineage` | Catalog for the dedicated transformation-lineage store (Option A). **Override per deployment** — if it doesn't exist, every transform read fails. |
+| `LINEAGE_SCHEMA` | `lineage` | Schema within `LINEAGE_CATALOG` for the store (12 Delta tables) |
+| `PIPELINE_NOTEBOOK_PATH` | (auto-derived) | Workspace path to `run_pipeline` the build job runs — must be readable by the app SP |
+| `TRANSFORM_CACHE_TTL_SECONDS` | `3600` (1h) | Transformation-lineage cache TTL |
+| `TRANSFORM_MAX_DEPTH` | `8` | Max BFS depth for the transformation backtrack |
+| `BUILD_CACHE_TTL_HOURS` | `24` | Hours before a built table's transformation lineage is considered stale |
 
 Override via DABs:
 
@@ -873,8 +934,17 @@ env:
 | `GET` | `/api/schema-column-lineage?catalog=X&schema=Y` | Column lineage edges (fetched per-schema; the client merges all schemas in a trace) |
 | `GET` | `/api/column-lineage?catalog=X&schema=Y&table=Z&column=W` | Column-level lineage for a single column |
 | `GET` | `/api/entity-name?entity_type=X&entity_id=Y` | Entity display name |
-| `POST` | `/api/cache/invalidate` | Clear the full cache (**admin-only**) |
-| `POST` | `/api/admin/evict-cache` | Evict a specific cache key (admin-only) |
+| `GET` | `/api/lineage/export?...` | Styled multi-sheet Excel (`.xlsx`) export of the lineage data |
+| `POST` | `/api/cache/invalidate` | Clear the full (table/column) cache (**admin-only**) |
+| `POST` | `/api/admin/evict-cache?key=` | Evict a specific cache key (admin-only) |
+| **Transformation lineage** | | |
+| `GET` | `/api/transform/freshness?catalog=&schema=&table=` | Whether transformation lineage exists for a table + staleness |
+| `GET` | `/api/transform/trace?catalog=&schema=&table=&column=` | Per-column upstream transformation DAG (BFS backtrack) |
+| `POST` | `/api/transform/build` | Submit a build job (`{table_fqn, force_rebuild}`; `force_rebuild` ⇒ full re-parse) |
+| `GET` | `/api/transform/status/{run_id}` | Poll build progress (invalidates transform cache on success) |
+| `GET` | `/api/transform/categories` | Transform category → color map |
+| `GET` | `/api/transform/build-configured` | Whether the build pipeline path is configured |
+| `POST` | `/api/transform/invalidate?scope=cache\|table\|all[&table_fqn=]` | Flush transform cache / wipe stored lineage (**admin-only**) |
 
 All identifier parameters are validated: alphanumeric + underscores, max 255 chars.
 

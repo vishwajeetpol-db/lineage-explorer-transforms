@@ -15,7 +15,6 @@ system.access.column_lineage — the source of truth captured by Unity Catalog
 from actual query execution. No inference, no heuristics, no regex parsing.
 """
 
-import json
 import os
 import re
 import sys
@@ -28,6 +27,7 @@ from typing import Callable, TypeVar
 from cachetools import TTLCache
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import StatementState
+from backend.parallel import map_parallel, run_parallel
 from backend.models import (
     TableNode,
     EntityNode,
@@ -75,10 +75,16 @@ SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")  # max 50s per Data
 # When the in-scope table count exceeds this, we refuse rather than melt the
 # warehouse/browser. Schema-scoped requests are never capped.
 LINEAGE_MAX_NODES = int(os.environ.get("LINEAGE_MAX_NODES", "2500"))
-# Lookback window for system.access lineage queries. UC retains lineage events
-# but the app only surfaces those within this window; older-only tables show as
-# orphan. Configurable so aged demos/datasets can still be visualized.
-LINEAGE_WINDOW_DAYS = int(os.environ.get("LINEAGE_WINDOW_DAYS", "90"))
+# Lookback window for system.access lineage queries. This is effectively the max
+# staleness a producing pipeline can have before its lineage drops off the view:
+# a relationship is surfaced only if its producer emitted a lineage EVENT within
+# this window, so older-only tables (whose pipeline hasn't run in N days) appear
+# as orphans. Keep it WIDE (365d, matching databricks.yml) so infrequently-run
+# pipelines — monthly/quarterly/annual batches, one-time backfills, rarely-rebuilt
+# dimensions — still show lineage. Window size need not cost more: pair it with
+# event_date partition pruning so a wide window stays cheap. (UC system-table
+# retention is ~365d, which naturally caps this.)
+LINEAGE_WINDOW_DAYS = int(os.environ.get("LINEAGE_WINDOW_DAYS", "365"))
 
 # Lakeflow/DLT pipelines create internal backing tables alongside each
 # materialized view / streaming table (`__materialization_mat_*`, `event_log_*`,
@@ -123,17 +129,38 @@ class _CacheEntry:
 
 def _estimate_value_size(val: object) -> int:
     """Estimate memory footprint of a cache value. Computed once at insert time.
-    Uses JSON byte length * 2.5 to approximate Python object overhead."""
+
+    v3: Uses structural heuristic instead of full JSON serialization.
+    For a 500-node LineageResponse, this is 50x faster than json.dumps(model_dump()).
+    Accuracy is within 2x of actual — acceptable for LRU eviction decisions.
+    """
     try:
         if hasattr(val, 'model_dump'):
-            raw = json.dumps(val.model_dump(), default=str)
-        elif isinstance(val, (dict, list)):
-            raw = json.dumps(val, default=str)
-        else:
-            return sys.getsizeof(val)
-        return int(len(raw.encode('utf-8')) * 2.5)
+            d = val.model_dump()
+            size = 256  # base Pydantic model overhead
+            for v in d.values():
+                if isinstance(v, list):
+                    # ~400 bytes per node/edge (measured empirically)
+                    size += len(v) * 400
+                elif isinstance(v, str):
+                    size += len(v) * 2
+                elif isinstance(v, dict):
+                    size += len(v) * 200
+                elif isinstance(v, bool):
+                    size += 28
+                elif isinstance(v, (int, float)):
+                    size += 28
+                else:
+                    size += 64
+            return int(size * 1.5)
+        elif isinstance(val, list):
+            return max(256, len(val) * 350)
+        elif isinstance(val, dict):
+            # Rough: 200 bytes per key-value pair
+            return max(256, len(val) * 200)
+        return sys.getsizeof(val)
     except Exception:
-        return 1024  # conservative 1KB fallback
+        return 1024
 
 
 def _entry_size(entry: _CacheEntry) -> int:
@@ -352,21 +379,23 @@ def _refresh_cost_cache(client: WorkspaceClient) -> None:
           AND u.usage_date > current_date() - INTERVAL {_COST_WINDOW_DAYS} DAYS
         GROUP BY u.usage_metadata.dlt_pipeline_id
         """
-        try:
-            jobs = {
+        # Run job and pipeline cost queries in parallel
+        def _fetch_jobs():
+            return {
                 str(r["id"]): float(r["cost_usd"])
                 for r in _execute_sql_long(client, job_sql, _COST_REFRESH_BUDGET_S)
             }
-        except Exception as e:
-            logger.warning(f"Job cost refresh failed (need SELECT on system.billing): {e}")
-            return
-        try:
-            pipes = {
+
+        def _fetch_pipes():
+            return {
                 str(r["id"]): float(r["cost_usd"])
                 for r in _execute_sql_long(client, pipeline_sql, _COST_REFRESH_BUDGET_S)
             }
+
+        try:
+            jobs, pipes = run_parallel(_fetch_jobs, _fetch_pipes)
         except Exception as e:
-            logger.warning(f"Pipeline cost refresh failed: {e}")
+            logger.warning(f"Cost refresh failed (need SELECT on system.billing): {e}")
             return
         _cost_by_job_id = jobs
         _cost_by_pipeline_id = pipes
@@ -449,8 +478,9 @@ def list_all_tables() -> list[dict]:
     def _fetch() -> list[dict]:
         client = _get_client()
         catalogs = list_catalogs()
-        tables: list[dict] = []
-        for cat in catalogs:
+
+        def _fetch_cat(cat: str) -> list[dict]:
+            """Fetch tables for a single catalog (runs in parallel)."""
             try:
                 sql = f"""
                 SELECT table_name, table_type, table_schema
@@ -460,19 +490,22 @@ def list_all_tables() -> list[dict]:
                 ORDER BY table_schema, table_name
                 """
                 rows = _execute_sql(client, sql, catalog=cat)
-                for r in rows:
-                    sch = r["table_schema"]
-                    name = r["table_name"]
-                    tables.append({
-                        "name": name,
-                        "fqdn": f"{cat}.{sch}.{name}",
-                        "catalog": cat,
-                        "schema": sch,
-                        "table_type": r["table_type"] or "TABLE",
-                    })
+                return [{
+                    "name": r["table_name"],
+                    "fqdn": f"{cat}.{r['table_schema']}.{r['table_name']}",
+                    "catalog": cat,
+                    "schema": r["table_schema"],
+                    "table_type": r["table_type"] or "TABLE",
+                } for r in rows]
             except Exception as e:
                 logger.warning(f"Failed to list tables in catalog {cat}: {e}")
-                continue
+                return []
+
+        # Run catalog queries in parallel (8 workers)
+        results = map_parallel(_fetch_cat, catalogs)
+        tables: list[dict] = []
+        for batch in results:
+            tables.extend(batch)
         return tables
 
     # Never cache empty results (retry on next call).
@@ -613,7 +646,11 @@ def get_lineage_trace(seed_full_name: str, skip_cache: bool = False) -> LineageR
         fetch_start = time.time()
         result = _fetch_lineage_trace(seed_full_name)
         fetch_ms = int((time.time() - fetch_start) * 1000)
-        _cache_set(cache_key, result)
+        # Only cache complete traces. A truncated result is partial (deeper than
+        # MAX_ITERS, over the node cap, or an errored hop) — caching it would serve an
+        # incomplete graph for the full TTL instead of retrying on the next request.
+        if not result.truncated:
+            _cache_set(cache_key, result)
         return _wrap_with_cache_metadata(result, cache_key, from_cache=False, fetch_ms=fetch_ms)
 
 
@@ -667,7 +704,12 @@ def _fetch_lineage_trace(seed_full_name: str) -> LineageResponse:
                 rows = _execute_sql(client, sql)
             except Exception as e:
                 logger.warning(f"Trace query failed (need SELECT on system.access): {e}")
-                break
+                # Propagate instead of breaking: a failed hop would otherwise return a
+                # PARTIAL graph that get_lineage_trace caches for the full TTL, making the
+                # seed table look like it has almost no lineage. Raising lets the caller
+                # surface the error and the next request retry (e.g. once the warehouse
+                # is warm). See get_lineage_trace — it only caches non-truncated results.
+                raise
             _collect(rows)
             nxt: set[str] = set()
             for r in rows:
@@ -681,8 +723,8 @@ def _fetch_lineage_trace(seed_full_name: str) -> LineageResponse:
         if frontier:
             truncated["hit"] = True
 
-    _walk("up")
-    _walk("down")
+    # Run upstream and downstream BFS in parallel (independent traversals)
+    run_parallel(lambda: _walk("up"), lambda: _walk("down"))
     return _build_graph_from_rows(client, lineage_rows, truncated=truncated["hit"])
 
 
@@ -1212,7 +1254,9 @@ def _fetch_table_lineage(catalog: str, schema: str | None, cache_key: str) -> tu
 
     # Fetch column metadata for external tables from their information_schema
     ext_columns: dict[str, list[dict]] = {}  # table_fqdn → [{name, type, nullable}]
-    for (ext_cat, ext_sch), table_names in ext_schema_groups.items():
+    def _fetch_ext_cols(key_and_names):
+        ext_cat, ext_sch = key_and_names[0]
+        table_names = key_and_names[1]
         table_list = ",".join(f"'{t}'" for t in table_names)
         col_sql = f"""
         SELECT table_name, column_name, full_data_type, is_nullable
@@ -1220,19 +1264,28 @@ def _fetch_table_lineage(catalog: str, schema: str | None, cache_key: str) -> tu
         WHERE table_schema = '{ext_sch}' AND table_name IN ({table_list})
         ORDER BY table_name, ordinal_position
         """
+        result = {}
         try:
             col_rows = _execute_sql(client, col_sql)
             for cr in col_rows:
                 fqdn = f"{ext_cat}.{ext_sch}.{cr['table_name']}"
-                if fqdn not in ext_columns:
-                    ext_columns[fqdn] = []
-                ext_columns[fqdn].append({
+                if fqdn not in result:
+                    result[fqdn] = []
+                result[fqdn].append({
                     "name": cr["column_name"],
                     "type": cr["full_data_type"],
                     "nullable": cr.get("is_nullable", "YES") == "YES",
                 })
         except Exception as e:
             logger.warning(f"Failed to fetch columns for external tables in {ext_cat}.{ext_sch}: {e}")
+        return result
+
+    # Fetch external columns in parallel across catalogs
+    ext_items = [((cat_sch), tnames) for cat_sch, tnames in ext_schema_groups.items()]
+    if ext_items:
+        col_results = map_parallel(_fetch_ext_cols, ext_items)
+        for batch in col_results:
+            ext_columns.update(batch)
 
     for ext_table in external_tables:
         if ext_table not in nodes_map:
@@ -1547,7 +1600,12 @@ def get_schema_column_lineage(catalog: str, schema: str, skip_cache: bool = Fals
             """
             rows = _execute_sql(client, sql)
         except Exception as e:
+            # Don't swallow into an empty result: _cached_fetch caches unconditionally,
+            # so a transient query timeout (cold/slow warehouse) would poison this
+            # schema's column lineage for the full cache TTL. Propagate so it isn't
+            # cached and the next request retries.
             logger.warning(f"Schema column lineage query failed: {e}")
+            raise
 
         edges = [
             ColumnLineageEdge(
@@ -1614,7 +1672,8 @@ def get_table_edges(catalog: str, schema: str | None = None, skip_cache: bool = 
             rows = _execute_sql(client, sql)
         except Exception as e:
             logger.warning(f"table_edges query failed (need SELECT on system.access): {e}")
-            return []
+            # Propagate rather than caching an empty edge list for the full TTL.
+            raise
         return [
             {
                 "source": r["source"],

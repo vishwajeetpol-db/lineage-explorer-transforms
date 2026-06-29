@@ -10,7 +10,7 @@ import resource
 import threading
 from collections import deque, OrderedDict
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "2.2.0"
 
 RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "60"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
@@ -53,6 +53,20 @@ from backend.lineage_service import (
     get_cache_snapshot,
     _get_client,
 )
+from backend.transform_service import (
+    get_transform_freshness,
+    backtrack_transform_lineage,
+    get_transform_categories,
+    invalidate_transform_cache,
+    clear_transform_lineage,
+)
+from backend.build_service import (
+    submit_build_job,
+    get_build_status,
+    is_build_configured,
+    BUILD_STEPS,
+)
+from backend.models import BuildJobRequest
 
 class _JsonLogFormatter(logging.Formatter):
     """Structured JSON logs — one line per record so downstream log queries
@@ -244,7 +258,7 @@ async def lifespan(app: FastAPI):
         invalidate_cache()
 
 
-app = FastAPI(title="Lineage Explorer", version=APP_VERSION, lifespan=lifespan)
+app = FastAPI(title="NEXUS Lineage", version=APP_VERSION, lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +812,161 @@ async def api_admin_evict_cache(request: Request, key: str = Query(...)):
         logger.info(f"Admin {email} evicted cache key: {key}")
         return {"status": "ok", "message": f"Evicted: {key}"}
     return {"status": "not_found", "message": f"Key not in cache: {key}"}
+
+
+# ---------------------------------------------------------------------------
+# Transformation Lineage endpoints — the "microscopic" drill-down
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/transform/freshness")
+async def api_transform_freshness(
+    catalog: str = Query(...),
+    schema: str = Query(...),
+    table: str = Query(...),
+):
+    """Check if transformation lineage exists for a table and whether it's stale."""
+    catalog = _validate_identifier(catalog, "catalog")
+    schema = _validate_identifier(schema, "schema")
+    table = _validate_identifier(table, "table")
+    try:
+        result = await asyncio.to_thread(get_transform_freshness, catalog, schema, table)
+        return result
+    except Exception as e:
+        logger.error(f"Error checking transform freshness: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.post("/api/transform/invalidate")
+async def api_transform_invalidate(
+    request: Request,
+    scope: str = Query("cache"),
+    table_fqn: str = Query(None),
+):
+    """Invalidate transformation lineage. ADMIN ONLY.
+
+    scope=cache  → flush in-memory transform caches (no data loss).
+    scope=table  → also delete one table's stored edges (needs table_fqn).
+    scope=all    → wipe ALL stored transformation lineage (start fresh).
+    """
+    email, is_admin = await asyncio.to_thread(_get_user_info, request)
+    if not is_admin:
+        logger.warning(f"Non-admin transform invalidate attempt by {email}")
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if scope not in ("cache", "table", "all"):
+        raise HTTPException(status_code=400, detail="scope must be cache|table|all")
+    if scope == "table":
+        if not table_fqn or not _FULL_NAME_RE.match(table_fqn):
+            raise HTTPException(status_code=400, detail="table_fqn (catalog.schema.table) required for scope=table")
+    try:
+        result = await asyncio.to_thread(clear_transform_lineage, scope, table_fqn)
+        logger.info(f"Admin {email} invalidated transform lineage scope={scope} table={table_fqn}")
+        return {"status": "ok", **result}
+    except Exception as e:
+        logger.error(f"Transform invalidate failed: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.post("/api/transform/build")
+async def api_transform_build(request: Request, body: BuildJobRequest):
+    """Submit a serverless job to build transformation lineage for a table.
+    Requires the PIPELINE_NOTEBOOK_PATH to be configured."""
+    if not is_build_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Build pipeline not configured. Set PIPELINE_NOTEBOOK_PATH in databricks.yml.",
+        )
+
+    table_fqn = body.table_fqn.strip()
+    # Validate FQN format (catalog.schema.table)
+    if not _FULL_NAME_RE.match(table_fqn):
+        raise HTTPException(
+            status_code=400,
+            detail="table_fqn must be fully qualified: catalog.schema.table",
+        )
+    parts = table_fqn.split(".")
+    catalog, schema, table = parts[0], parts[1], parts[2]
+
+    # Check freshness first (unless force_rebuild)
+    if not body.force_rebuild:
+        freshness = await asyncio.to_thread(
+            get_transform_freshness, catalog, schema, table
+        )
+        if freshness.exists and not freshness.is_stale:
+            return {
+                "status": "fresh",
+                "message": f"Lineage is fresh ({freshness.age_str}). Use force_rebuild=true to rebuild.",
+                "freshness": freshness,
+            }
+
+    try:
+        # A force_rebuild also forces a full re-parse (bypass change detection),
+        # so "Regenerate" / clear-and-rebuild actually re-runs the parser.
+        run_id = await asyncio.to_thread(
+            submit_build_job, table_fqn, catalog, schema, bool(body.force_rebuild)
+        )
+        return {
+            "status": "submitted",
+            "run_id": run_id,
+            "table_fqn": table_fqn,
+            "steps": BUILD_STEPS,
+        }
+    except Exception as e:
+        logger.error(f"Error submitting build job for {table_fqn}: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/transform/status/{run_id}")
+async def api_transform_status(run_id: str):
+    """Poll the progress of a running transformation lineage build job."""
+    if not run_id.isdigit():
+        raise HTTPException(status_code=400, detail="run_id must be numeric")
+    try:
+        result = await asyncio.to_thread(get_build_status, run_id)
+        # On successful completion, invalidate transform cache so next
+        # trace query picks up the fresh edges.
+        if result.is_complete and result.is_success:
+            invalidate_transform_cache()
+        return result
+    except Exception as e:
+        logger.error(f"Error getting build status for run {run_id}: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/transform/trace")
+async def api_transform_trace(
+    catalog: str = Query(...),
+    schema: str = Query(...),
+    table: str = Query(...),
+    column: str = Query(...),
+    max_depth: int = Query(None),
+):
+    """Backtrack upstream transformation lineage for a specific column.
+    Returns a layered graph of columns, expressions, and categories."""
+    catalog = _validate_identifier(catalog, "catalog")
+    schema = _validate_identifier(schema, "schema")
+    table = _validate_identifier(table, "table")
+    column = _validate_identifier(column, "column")
+    try:
+        result = await asyncio.to_thread(
+            backtrack_transform_lineage, catalog, schema, table, column, max_depth
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Error tracing transform lineage for {catalog}.{schema}.{table}.{column}: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/transform/categories")
+async def api_transform_categories():
+    """Return transformation category → color mapping for the frontend legend."""
+    return {"categories": get_transform_categories()}
+
+
+@app.get("/api/transform/build-configured")
+async def api_transform_build_configured():
+    """Check if the build pipeline is configured (PIPELINE_NOTEBOOK_PATH set)."""
+    return {"configured": is_build_configured()}
 
 
 # ---------------------------------------------------------------------------
