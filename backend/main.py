@@ -10,7 +10,7 @@ import resource
 import threading
 from collections import deque, OrderedDict
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "2.2.0"
 
 RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "60"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))

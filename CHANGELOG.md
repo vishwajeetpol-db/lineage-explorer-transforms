@@ -6,7 +6,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [2.2.0] - 2026-06-29
+
+> Matures the **expression-level transformation lineage** engine — the app's defining capability: reconstruct the actual SQL/PySpark expression behind every column (not just UC's dependency edges), across every producer type. Adds multi-entity-type coverage, the dedicated app-owned store, opt-in builds, admin invalidate controls, and a battery of correctness fixes verified against UC `column_lineage`. Docs (README, ARCHITECTURE, DESIGN, REFERENCE) brought current with the code.
 
 ### Added
 
@@ -14,18 +16,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Multi-entity-type column transformation lineage** — beyond notebook/python-file jobs: **SQL-file tasks** (resolver `sql_task` branch); **materialized views, views, streaming tables, and SQL-defined DLT** via new **definition-based resolution** (parse the object's own `SHOW CREATE TABLE` — no discovery, no system-table lineage lag); **Lakeflow/DLT pipelines** via `PIPELINE` discovery + `pipelines.get` library resolver.
 - **Dedicated app-owned lineage store (Option A)** — all transformation edges materialize into one fixed `LINEAGE_CATALOG.LINEAGE_SCHEMA` store owned by the app service principal; node-ids carry the real data catalog, so the app SP needs **zero write** on any data catalog.
 - **Empty-state** for columns with no transformation lineage (external/shared source, unsupported producer, or not yet generated) — replaces the misleading blank-but-green popup.
+- **Admin "Invalidate transformation lineage" controls** — the admin dashboard now has *Flush cache* (clear in-memory freshness/edges/trace caches, no data loss) and *Wipe lineage* (delete all stored transformation-lineage tables so everything shows "not built" and rebuilds fully re-parse; the expensive audit-path and LLM-expression caches are retained). New admin-gated `POST /api/transform/invalidate?scope=cache|table|all` endpoint + `clear_transform_lineage()`.
+- **`FORCE_REPARSE` build flag** — a forced "Regenerate" / clear-and-rebuild now bypasses the content-version early-termination so the parser actually re-runs on byte-identical sources (previously a regenerate of unchanged content silently no-op'd). Threaded config → run_pipeline → build_service (`force_rebuild ⇒ force_reparse`).
+- **Query-history fallback resolver** — tables with no tracked producing entity (`entity_type = NULL`: ad-hoc SQL, SQL editor, scripts) are now recovered from `system.query.history` by matching the most recent FINISHED write statement whose parsed output is the target table. Degrades gracefully (`no_producing_query` skip) when the service principal can't see the producing query (query history is identity-scoped — needs broad query-history visibility to cover other users' ad-hoc tables).
+- **Persistent build control in the transformation panel header** — the "Generate / Regenerate" button is now always visible: enabled when lineage is missing or stale, and **grayed when already built** (so it's clear it exists) while still allowing a force-rebuild. Previously the button only appeared in the not-built state, so an already-built table showed no build affordance at all.
 
 ### Changed
 
 - **Transformation popup UX** — target column rendered on top with upstream cascading down; `fitView` zoom capped (small graphs no longer magnified ~3×); persistent zoom-stable edge labels (category + expression, no hover required); responsive canvas height. **Removed the depth slider** — the popup always shows the selected column's full end-to-end transformation lineage (depth is not a meaningful knob for a single column).
 - **`LINEAGE_WINDOW_DAYS` reconciled to 365** across code + docs, with the producer-staleness semantics documented (the window is max producer staleness before lineage drops off; pair with `event_date` partition pruning to keep a wide window cheap).
-
-### Added
-
-- **Admin "Invalidate transformation lineage" controls** — the admin dashboard now has *Flush cache* (clear in-memory freshness/edges/trace caches, no data loss) and *Wipe lineage* (delete all stored transformation-lineage tables so everything shows "not built" and rebuilds fully re-parse; the expensive audit-path and LLM-expression caches are retained). New admin-gated `POST /api/transform/invalidate?scope=cache|table|all` endpoint + `clear_transform_lineage()`.
-- **`FORCE_REPARSE` build flag** — a forced "Regenerate" / clear-and-rebuild now bypasses the content-version early-termination so the parser actually re-runs on byte-identical sources (previously a regenerate of unchanged content silently no-op'd). Threaded config → run_pipeline → build_service (`force_rebuild ⇒ force_reparse`).
-- **Query-history fallback resolver** — tables with no tracked producing entity (`entity_type = NULL`: ad-hoc SQL, SQL editor, scripts) are now recovered from `system.query.history` by matching the most recent FINISHED write statement whose parsed output is the target table. Degrades gracefully (`no_producing_query` skip) when the service principal can't see the producing query (query history is identity-scoped — needs broad query-history visibility to cover other users' ad-hoc tables).
-- **Persistent build control in the transformation panel header** — the "Generate / Regenerate" button is now always visible: enabled when lineage is missing or stale, and **grayed when already built** (so it's clear it exists) while still allowing a force-rebuild. Previously the button only appeared in the not-built state, so an already-built table showed no build affordance at all.
+- **Versions reconciled to 2.2.0** — `APP_VERSION`, `frontend/package.json`, and the docs were drifting (1.3.0 / 1.0.0 / 2.1.0); now aligned.
 
 ### Fixed
 

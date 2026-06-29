@@ -1,8 +1,8 @@
-# LATTICE Explorer — Unified Design Document
+# NEXUS Lineage — Unified Design Document
 
 ## Overview
 
-LATTICE Explorer combines two lineage capabilities into a single app with a **macro → micro** interaction model:
+NEXUS Lineage combines two lineage capabilities into a single app with a **macro → micro** interaction model:
 
 | Zoom Level | Source | What You See |
 | --- | --- | --- |
@@ -44,78 +44,64 @@ This answers: *"Which source columns feed into my target column?"* — but NOT h
 
 On the selected (purple-highlighted) column, a **🔬 Microscope icon** appears. Clicking it opens the **Transformation Panel** — a slide-out canvas from the right edge.
 
-The panel follows this state machine:
+The panel follows this state machine (`transformStore.ts`):
 
 ```
-closed → loading-freshness → freshness-loaded → [building] → loading-trace → trace-loaded
-                                                                               └→ no-lineage
+closed → loading → needs_build → building → ready
+                      │                       └→ (source column / no transformation logic)
+                      └→ (fresh) ──────────────→ ready
+   any → error
 ```
+
+`needs_build` is the **opt-in gate**: when lineage is missing or stale the panel shows a compute-cost warning and an explicit **Generate** button — it **never auto-builds**. A persistent header button reflects state at a glance (Generate / amber Regenerate / grayed "Lineage built", still force-rebuildable).
 
 #### What happens under the hood:
 
-1. **Freshness Check** (`GET /api/transform/freshness`)
-   - Queries the `lineage_edge_endpoints` Delta table
-   - Returns: exists? edge_count? last_built? is_stale?
+1. **Freshness Check** (`GET /api/transform/freshness`) — queries the serve table; returns exists / edge_count / last_built / is_stale.
 
-2. **If fresh** → jumps directly to step 4
+2. **If fresh** → jumps directly to step 4.
 
-3. **If stale or missing** → shows "Build Lineage" button (or auto-builds)
-   - `POST /api/transform/build` submits a **serverless one-time job** that runs the `run_all` notebook
-   - The notebook executes the full LATTICE pipeline:
-     1. Discovery — find runs touching the KPI table in `system.access.column_lineage`
-     2. Resolution — expand to task-level sources via Jobs API
-     3. Extraction — fetch notebook source code (Workspace Export + GitHub)
-     4. Parsing — `sqlparse` for SQL, regex for PySpark (`.withColumn`, `.select`, `spark.table`)
-     5. Graph Construction — build nodes + edges
-     6. Storage — append to 8 Delta tables
-     7. Materialization — BFS subgraph expansion, write to `lineage_edge_endpoints`
-     8. Cache Update
-   - The panel shows an **8-step DAG progress bar** polling `GET /api/transform/status/{run_id}` every 3s
+3. **If stale or missing** → enters `needs_build`; on explicit **Generate**, `POST /api/transform/build` submits a **serverless one-time job** running the `run_pipeline` notebook (`force_rebuild` ⇒ `FORCE_REPARSE`, re-parsing even unchanged source). The pipeline:
+   1. **Extraction** — resolve the producing code across four paths — declarative **definitions** (`SHOW CREATE TABLE` for view/MV/streaming table), **JOB** task runs (notebook / `spark_python_task` / `sql_task`), **NOTEBOOK** entities (audit-log path lookup), **PIPELINE/DLT** libraries — plus a **query-history fallback** for entity-less producers (`entity_type=NULL`).
+   2. **Version check** — skip artifacts whose `version_token` (folds in `PARSER_VERSION`) is unchanged, unless `FORCE_REPARSE`.
+   3. **Parse + Graph** — SQL via `sqlparse` (CTE resolution, `STREAM()` unwrap, alias/qualification); PySpark **AST-first** (regex only as fallback). Each derive edge is classified into a transform category and pins its exact `src_node_id`.
+   4. **Storage** — write nodes/edges to the dedicated 12-table store.
+   5. **Materialization + Edge Endpoints** — build the serve table (`lineage_edge_endpoints`); source joined by `src_node_id` (no column-name cross-join).
+   6. **Expression enrichment** — best-effort LLM PySpark→SQL, cached per unique snippet.
+   - The panel shows an **8-step DAG progress bar** polling `GET /api/transform/status/{run_id}` every 3s.
 
-4. **Trace Fetch** (`GET /api/transform/trace?catalog=...&schema=...&table=...&column=...&max_depth=N`)
-   - Backend performs **BFS backtracking** from the target column through the edge table
-   - Returns layered levels (depth 0 = target, depth N = Nth upstream source)
-   - Each edge carries: `expression`, `category`, `source_file`
-   - `max_depth` parameter controls how many levels to traverse (default 8)
+4. **Trace Fetch** (`GET /api/transform/trace?catalog=...&schema=...&table=...&column=...`)
+   - Backend performs **BFS backtracking** from the target column through the serve table, scoped to the latest run that built **that** table (`dst_fqn`), self-loops filtered, hops deduped by `(src,dst)` pair.
+   - Returns layered levels (depth 0 = target, depth N = Nth upstream source); each edge carries `expression`, `category`, `source_file`.
 
 5. **Render** — The TransformCanvas (React Flow sub-graph) shows:
-   - Column nodes colored by depth level (red target → blue → purple → green upstream)
-   - Animated edges colored by **transformation category** (ARITHMETIC, WINDOW, AGGREGATE, TYPE CAST, FILTER, JOIN, etc.)
-   - **Hover on any edge** → tooltip shows the actual expression (`COALESCE(a, b)`, `SUM(amount) OVER (...)`) and the source notebook path
-   - Depth badge on each node showing how many hops from target
+   - Column nodes colored by depth level (red target on top → upstream cascading down)
+   - Edges colored by **transformation category** (the parser emits: `window, aggregation, case, null_handling, cast, string_fn, date_fn, arithmetic, projection, other`)
+   - **Persistent edge labels** show the actual expression (`concat('CH-', channel)`, `sum(quantity*unit_price)`) + category, zoom-stable (no hover needed)
 
 ---
 
 ## Pruning & Filtering
 
-The transformation graph can be complex (dozens of columns, many categories). Three interactive controls allow users to focus on what matters:
+The popup always shows the selected column's **full end-to-end** transformation lineage (there is no depth knob — depth isn't a meaningful choice when inspecting one column's derivation; the earlier depth slider was removed). Two context-relevant controls (`PruningControls.tsx`) let users focus:
 
-### 1. Depth Slider
+### 1. Category Filter
 
-A range input (1–8) in the panel toolbar. Dragging it **re-fetches from the backend** with a smaller `max_depth`, reducing the BFS traversal. This is a true data prune — fewer levels mean fewer nodes and edges returned.
+Color-coded chips for each transform category present in the current graph (cast, aggregation, string_fn, window, …). Clicking a chip **hides/shows** all edges of that category **client-side** — no re-fetch. Hidden edges fade out; orphaned nodes dim.
 
-**Use case:** "I only care about the immediate upstream transform, not the full 6-level chain."
+**Use case:** "Hide the projection passthroughs to see only the aggregation and window logic."
 
-### 2. Category Filter
+### 2. Path Isolation (Click-to-Focus)
 
-Color-coded chips for each transform category present in the current graph (ARITHMETIC, WINDOW, AGGREGATE, JOIN, etc.). Clicking a chip **hides/shows** all edges of that category **client-side** — no re-fetch needed. Hidden edges become nearly invisible (opacity 0.08). Nodes orphaned by hidden edges remain visible but dimmed.
+Clicking any **upstream node** highlights only the edges and nodes on the path(s) between that node and the target. Everything else dims. Click the target node (or the ✕ badge) to clear.
 
-**Use case:** "There are 20 PASSTHROUGH edges cluttering the graph. Hide them to see only the WINDOW and AGGREGATE logic."
-
-### 3. Path Isolation (Click-to-Focus)
-
-Clicking any **upstream node** highlights only the edges and nodes on the path(s) between that node and the target (depth 0). Everything else dims to 15% opacity. Click the **target node** (or the ✕ badge in the toolbar) to clear isolation.
-
-**Algorithm:** Bidirectional BFS — find intersection of (ancestors of target) ∩ (descendants of clicked node). Only nodes in both sets remain bright.
+**Algorithm:** Bidirectional BFS — intersection of (ancestors of target) ∩ (descendants of clicked node).
 
 **Use case:** "I see 4 branches feeding into my KPI column. I only want to trace how `exchange_rate` contributes."
 
 ### Combining Controls
 
-All three controls compose naturally:
-- Set depth=3 → only 3 levels shown
-- Hide PASSTHROUGH → clears noise edges
-- Click a node → isolates one specific flow within those 3 levels
+The two controls compose: hide a category to clear noise, then click a node to isolate one specific flow. Opening a new column resets all pruning state; the category filter has All/None bulk toggles.
 
 Resetting: opening a new column resets all pruning state. The "All/None" buttons on the category filter provide bulk toggle.
 
@@ -154,30 +140,27 @@ Resetting: opening a new column resets all pruning state. The "All/None" buttons
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  TRANSFORMATION PANEL (slide-in from right)                             │
 │                                                                         │
-│  [Freshness: 2h ago ●]  [Rebuild 🔄]  [Close ✕]                       │
+│  TRANSFORMATION LINEAGE   [⚡ Generate / ✓ Lineage built]   [Close ✕]  │
 │                                                                         │
-│  ┌──────── PRUNING TOOLBAR ─────────────────────────────────────────┐  │
-│  │  Depth: ──●──────── [3]       [Path isolated ✕]                   │  │
-│  │  [ARITHMETIC] [WINDOW] [̶P̶A̶S̶S̶T̶H̶R̶O̶U̶G̶H̶] [JOIN]  [All][None]       │  │
+│  ┌──────── CONTROLS ────────────────────────────────────────────────┐  │
+│  │  ⧉ filter:  [cast] [aggregation] [string_fn] [window]  [All][None]│  │
+│  │             [Path isolated ✕]                                      │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  TRANSFORMATION DAG (vertical, bottom-to-top)                    │   │
+│  │  TRANSFORMATION DAG (vertical, target on top)                    │   │
 │  │                                                                   │   │
-│  │  Depth 3:  [raw_amount]   [exchange_rate] ← click to isolate    │   │
-│  │                │ ARITHMETIC    │ JOIN                             │   │
-│  │                ▼               ▼                                  │   │
-│  │  Depth 2:     [converted_amount]                                 │   │
-│  │                │ WINDOW: SUM(...) OVER (PARTITION BY region)      │   │
-│  │                ▼                                                  │   │
-│  │  Depth 1:  [regional_total]                                      │   │
-│  │                │ TYPE CAST: CAST(... AS DECIMAL(18,2))            │   │
-│  │                ▼                                                  │   │
-│  │  Depth 0:  ◉ col_b  (TARGET) ← click to clear isolation         │   │
+│  │  ◉ col_b  (TARGET) ← click to clear isolation                    │   │
+│  │                ▲                                                  │   │
+│  │                │ cast: cast(order_ts AS date)                     │   │
+│  │  [order_date]                                                     │   │
+│  │                ▲                                                  │   │
+│  │                │ aggregation: sum(quantity*unit_price)            │   │
+│  │  [net_revenue]   [exchange_rate] ← click to isolate              │   │
 │  │                                                                   │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
 │                                                                         │
-│  [12 columns • 9 transforms • 3 levels deep • 45ms]                   │
+│  [12 columns • 9 transforms • full lineage • 45ms]                    │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -208,9 +191,11 @@ UC column lineage (step 2) is instant — it reads from system tables. Transform
 
 ### Why client-side category filtering (not re-fetch)?
 
-Category filtering hides edges that are already loaded — it's a visual prune, not a data prune. Re-fetching would be wasteful since the backend BFS doesn't support category exclusion (all edges at depth ≤ N are returned regardless of category). Client-side toggle provides instant feedback (<16ms frame).
+Category filtering hides edges that are already loaded — it's a visual prune, not a data prune. The full per-column lineage is fetched once; toggling categories or isolating a path is instant (<16ms frame) with no extra query. (There is no depth control — the popup always loads the column's complete end-to-end lineage.)
 
-Depth changes DO re-fetch because they reduce the BFS traversal scope — genuinely fewer rows returned.
+### Why pin the source by node id (not column name)?
+
+A whole notebook is parsed as one artifact sharing a single transformation node. If the serve table matched a derive edge's source by *column name*, an output column would cross-join to **every** source table that happens to expose a same-named column (e.g. `customer_id` in several tables). Each derive edge therefore records its exact resolved `src_node_id`, and the endpoints builder joins on that — so the popup shows only the real source.
 
 ---
 
@@ -222,29 +207,33 @@ Frontend (React 18 + TypeScript)
 ├── Table Lineage Canvas (React Flow + ELK.js)
 │   └── TableNode → column list → 🔬 icon
 ├── Transform Panel (slide-out, Framer Motion)
-│   ├── PruningControls (depth slider, category chips, isolation badge)
-│   ├── FreshnessBadge
+│   ├── header build button (Generate / Regenerate / grayed "Lineage built")
+│   ├── PruningControls (category chips + path-isolation badge — no depth slider)
 │   ├── BuildProgress (8-step DAG)
 │   └── TransformCanvas (React Flow sub-graph, filtering + path isolation)
-└── Zustand stores: lineageStore + transformStore (pruning state)
+├── AdminDashboard (ops metrics + Flush cache / Wipe lineage)
+└── Zustand stores: lineageStore + transformStore
 
 Backend (FastAPI + Uvicorn, 64 threads)
 ├── /api/lineage/*       → lineage_service.py (UC system tables)
-├── /api/transform/*     → transform_service.py (Delta tables + BFS)
-├── /api/transform/build → build_service.py (Jobs API)
+├── /api/transform/*     → transform_service.py (per-fqn read, BFS, invalidate)
+├── /api/transform/build → build_service.py (Jobs API, force_reparse)
 ├── /api/sharing/*       → sharing overlay
 ├── /api/admin/*         → ops dashboard
-└── Shared infra: cache.py, auth.py, rate_limit.py, security.py
+└── Cross-cutting (auth, cache, rate-limiting, security) lives in main.py + lineage_service.py
 
 Data Layer
 ├── UC System Tables (read-only, no writes)
-│   ├── system.access.table_lineage
-│   ├── system.access.column_lineage
+│   ├── system.access.table_lineage / column_lineage / audit
+│   ├── system.query.history          (transformation query-history fallback)
 │   └── system.billing.usage
-├── Transform Delta Tables (written by build job)
-│   └── lattice_lineage.lineage.lineage_edge_endpoints
+├── Dedicated transformation-lineage store — Option A (written by build job)
+│   └── LINEAGE_CATALOG.LINEAGE_SCHEMA — 12 Delta tables
+│       (serve: lineage_edge_endpoints; + nodes/edges/raw_code/code_versions/
+│        parse_metrics/graph_cache/reconciliation/extraction_reports/
+│        sublineage_cache/notebook_path_cache/pyspark_to_sql_cache)
 └── Serverless Jobs (build pipeline, on-demand)
-    └── run_all notebook (unchanged from LATTICE)
+    └── run_pipeline notebook
 ```
 
 ---
@@ -261,6 +250,6 @@ Deployed via **Declarative Automation Bundles** (`databricks.yml`) with two targ
 Key environment variables for the transformation feature:
 - `LINEAGE_CATALOG` — catalog holding transform Delta tables (default: `lattice_lineage`)
 - `LINEAGE_SCHEMA` — schema within that catalog (default: `lineage`)
-- `PIPELINE_NOTEBOOK_PATH` — workspace path to `run_all` notebook (must be set per workspace)
+- `PIPELINE_NOTEBOOK_PATH` — workspace path to `run_pipeline` notebook (must be set per workspace)
 - `TRANSFORM_CACHE_TTL_SECONDS` — transform cache TTL (default: 3600)
 - `BUILD_CACHE_TTL_HOURS` — hours before lineage is considered stale (default: 24)
