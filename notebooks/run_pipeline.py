@@ -67,7 +67,7 @@ MAX_RUNS_PER_EXECUTION = 100
 try:
     DISCOVERY_LOOKBACK_HOURS = int(dbutils.widgets.get("DISCOVERY_LOOKBACK_HOURS"))
 except Exception:
-    DISCOVERY_LOOKBACK_HOURS = 1080
+    DISCOVERY_LOOKBACK_HOURS = 8760  # 365d — discover producers that last ran a while ago
 LINEAGE_ENTITY_TYPES = ("JOB", "NOTEBOOK", "PIPELINE")
 
 # BUILD_ONLY mode: run pipeline only (skip interactive demo phases)

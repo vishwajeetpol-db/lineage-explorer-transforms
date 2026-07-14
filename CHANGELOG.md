@@ -6,6 +6,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [2.3.0] - 2026-07-14
+
+> Adds **transformation lineage diagnostics** — when a build materialises nothing the app now explains *why* (no producer found, producer outside the discovery window, producer source unreadable) instead of a generic "not generated yet". Also aligns the producer-discovery window to 1 year across all entry points and adds TTL caching to the new diagnostic path.
+
+### Added
+
+- **`GET /api/transform/diagnose`** — new endpoint that explains why a table has no transformation lineage after a build. Inspects `system.access.column_lineage` for the table's producer history relative to the discovery window, plus the most recent extraction report, and returns one of four actionable reason codes: `no_producer` (source/base table with no tracked writer), `producer_outside_window` (writer existed but last ran before the lookback cutoff), `producer_unresolved` (recent writer found but parsing failed), `unknown` (system.access unreadable).
+- **`TransformDiagnosis` Pydantic model** (`backend/models.py`) — structured response carrying `reason_code`, `title`, `detail`, `last_produced_at`, `days_ago`, `in_window`, and `skip_reasons`; consumed by the diagnose endpoint and the frontend empty-state panel.
+- **`diagnose_missing_lineage()`** (`backend/transform_service.py`) — service function backing the endpoint. Results are cached via the shared `_transform_cached_fetch` TTL cache so repeated UI polls don't re-hit `system.access.column_lineage`.
+- **`_latest_extraction_skip_reasons()`** (`backend/transform_service.py`) — best-effort helper that reads the most recent `lineage_extraction_reports` row and surfaces skip-reason keys (e.g. `no_resolvable_tasks`) to refine the diagnostic message.
+- **`DISCOVERY_LOOKBACK_HOURS` module constant** (`backend/transform_service.py`, `backend/build_service.py`) — mirrors the build's discovery window (default `8760` h = 1 year, overridable via env var) so the diagnose endpoint and build always share the same window definition.
+
+### Changed
+
+- **Discovery lookback window aligned to 1 year across all entry points** — `notebooks/run_pipeline` notebook default raised from `1080` h (45 d) to `8760` h; `transformation_lineage/config.py` `discovery_lookback_hours` raised from `24` h to `8760` h. Previously a direct/manual pipeline run without a widget override would silently find no producers for tables written on a quarterly or monthly schedule.
+- **`DISCOVERY_LOOKBACK_HOURS` forwarded to the build job** — `build_service.py` now passes the env-var value as a `base_parameters` entry so app-triggered builds respect the same window as the diagnose endpoint.
+
+### Fixed
+
+- **Tautological diagnostic title when date parsing fails** — if `system.access.column_lineage` returns a `last_produced` timestamp that `fromisoformat` cannot parse, `days_ago` stays `None` and the previous title read "Producer last ran outside the window — outside the X-day window". Title is now built conditionally: known age → "Producer last ran N days ago — outside the X-day window"; unknown age → "Producer last ran outside the X-day discovery window".
+
+---
+
 ## [2.2.0] - 2026-06-29
 
 > Matures the **expression-level transformation lineage** engine — the app's defining capability: reconstruct the actual SQL/PySpark expression behind every column (not just UC's dependency edges), across every producer type. Adds multi-entity-type coverage, the dedicated app-owned store, opt-in builds, admin invalidate controls, and a battery of correctness fixes verified against UC `column_lineage`. Docs (README, ARCHITECTURE, DESIGN, REFERENCE) brought current with the code.

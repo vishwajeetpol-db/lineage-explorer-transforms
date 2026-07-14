@@ -23,8 +23,11 @@ class LineageJobConfig:
     # Fully-qualified table names (catalog.schema.table) that define KPI / critical scope
     kpi_tables: Sequence[str] = field(default_factory=tuple)
 
-    # Look back window for system lineage discovery (hours)
-    discovery_lookback_hours: int = 24
+    # Look back window for system lineage discovery (hours).
+    # 8760 = 1 year — aligns with the app's DISCOVERY_LOOKBACK_HOURS env var default
+    # (transform_service.py / run_pipeline.py). Direct pipeline runs without the widget
+    # now pick up the same generous window instead of the misleading 24-hour dead-default.
+    discovery_lookback_hours: int = 8760
 
     # Version retention (days) — aligns with PRD default; pruning is optional follow-up
     history_retention_days: int = 90
