@@ -22,6 +22,7 @@ Performance optimizations (v3):
 import os
 import sys
 import time
+import json
 import logging
 import threading
 from collections import OrderedDict
@@ -39,6 +40,7 @@ from backend.models import (
     TransformLevel,
     TransformResponse,
     FreshnessInfo,
+    TransformDiagnosis,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,10 @@ BUILD_CACHE_TTL_HOURS = int(os.environ.get("BUILD_CACHE_TTL_HOURS", "24"))
 TRANSFORM_MAX_DEPTH = int(os.environ.get("TRANSFORM_MAX_DEPTH", "8"))
 SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")
 WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
+# Producer-discovery lookback used by the build (run_pipeline.py
+# DISCOVERY_LOOKBACK_HOURS). Mirrored here so a no-op build can be explained:
+# a table whose producer last ran outside this window yields no lineage.
+DISCOVERY_LOOKBACK_HOURS = int(os.environ.get("DISCOVERY_LOOKBACK_HOURS", "8760"))
 
 EDGE_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.lineage_edge_endpoints"
 
@@ -379,6 +385,121 @@ def get_transform_freshness(catalog: str, schema: str, table: str) -> FreshnessI
                 exists=False, edge_count=0, last_built=None,
                 age_str="Unknown", is_stale=True
             )
+
+    return _transform_cached_fetch(cache_key, _fetch)
+
+
+def _latest_extraction_skip_reasons() -> list[str]:
+    """Skip-reason keys from the most recent extraction report (best-effort hint
+    for why a recent build produced nothing)."""
+    schema_prefix = EDGE_TABLE.rsplit(".", 1)[0]  # catalog.schema
+    try:
+        _, rows = _sql(
+            f"SELECT report_json FROM {schema_prefix}.lineage_extraction_reports "
+            f"ORDER BY recorded_at DESC LIMIT 1"
+        )
+        if rows and rows[0] and rows[0][0]:
+            rep = json.loads(rows[0][0])
+            return list((rep.get("skip_reasons") or {}).keys())
+    except Exception as e:
+        logger.debug("extraction-report lookup failed: %s", e)
+    return []
+
+
+def diagnose_missing_lineage(catalog: str, schema: str, table: str) -> TransformDiagnosis:
+    """Explain why a table has no transformation lineage after a build.
+
+    Inspects `system.access.column_lineage` for the table's producer history and
+    the discovery window, plus the latest extraction report, to turn a generic
+    "not generated yet" into an actionable reason.
+
+    Results are cached via the shared transform TTL cache so repeated calls
+    (e.g. polling from the UI) don't hammer system.access.column_lineage.
+    """
+    fqn = f"{catalog}.{schema}.{table}"
+    cache_key = f"transform_diagnose:{fqn}"
+
+    def _fetch() -> TransformDiagnosis:
+        lookback_days = max(1, DISCOVERY_LOOKBACK_HOURS // 24)
+        try:
+            _, rows = _sql(f"""
+                SELECT
+                  MAX(event_time) AS last_produced,
+                  COUNT_IF(event_time >= current_timestamp() - INTERVAL {DISCOVERY_LOOKBACK_HOURS} HOURS) AS in_window,
+                  COUNT(*) AS total
+                FROM system.access.column_lineage
+                WHERE target_table_full_name = '{fqn}'
+            """)
+        except Exception as e:
+            logger.warning("diagnose query failed for %s: %s", fqn, e)
+            return TransformDiagnosis(
+                reason_code="unknown",
+                title="Couldn't determine the reason",
+                detail=("Unable to read system.access.column_lineage to diagnose. Check that the "
+                        "app's service principal has SELECT on system.access."),
+            )
+
+        r = rows[0] if rows else [None, 0, 0]
+        last_produced = r[0]
+        in_window = int(r[1] or 0)
+        total = int(r[2] or 0)
+
+        days_ago = None
+        if last_produced:
+            try:
+                lp = datetime.fromisoformat(str(last_produced).replace("Z", "+00:00"))
+                days_ago = (datetime.now(timezone.utc) - lp).days
+            except Exception:
+                pass
+
+        if total == 0:
+            return TransformDiagnosis(
+                reason_code="no_producer",
+                title="No producing pipeline found",
+                detail=("Unity Catalog has no record of any job or query writing to this table, so "
+                        "there's no transformation logic to extract. It's most likely a source / base "
+                        "table (ingested from files, a stream, or an external / federated / "
+                        "Delta-Sharing source), or it's written by a process UC lineage doesn't capture."),
+            )
+
+        ago = f"{days_ago} days ago" if days_ago is not None else "an indeterminate time ago"
+        if in_window == 0:
+            title = (
+                f"Producer last ran {ago} — outside the {lookback_days}-day window"
+                if days_ago is not None
+                else f"Producer last ran outside the {lookback_days}-day discovery window"
+            )
+            return TransformDiagnosis(
+                reason_code="producer_outside_window",
+                title=title,
+                detail=(f"The build only discovers producers that wrote to this table within the last "
+                        f"{lookback_days} days. This table was last written {ago}, so discovery found no "
+                        f"run to parse and the job finished without generating lineage — which is why it "
+                        f"still shows \u201cnot generated yet\u201d even though the job succeeded. Re-run the "
+                        f"job or pipeline that populates this table, then click Generate again."),
+                last_produced_at=str(last_produced), days_ago=days_ago, in_window=False,
+            )
+
+        skips = _latest_extraction_skip_reasons()
+        if "no_resolvable_tasks" in skips:
+            title = "Producer found, but its source couldn't be read"
+            detail = (f"A producer wrote to this table within the last {lookback_days} days, but the most "
+                      f"recent build couldn't read the producing job/notebook to parse it. Grant the app's "
+                      f"service principal CAN_VIEW on the producing job and CAN_READ on its notebook, then "
+                      f"Generate again.")
+        else:
+            title = "A recent producer exists — try Generate"
+            detail = (f"A job or query wrote to this table within the last {lookback_days} days, so generating "
+                      f"transformation lineage should discover it — click Generate. If you've already generated "
+                      f"and it still shows nothing, the producer is likely a SQL / DLT / external writer the "
+                      f"parser doesn't yet support, or its source couldn't be fetched.")
+        return TransformDiagnosis(
+            reason_code="producer_unresolved",
+            title=title,
+            detail=detail,
+            last_produced_at=str(last_produced), days_ago=days_ago, in_window=True,
+            skip_reasons=skips,
+        )
 
     return _transform_cached_fetch(cache_key, _fetch)
 

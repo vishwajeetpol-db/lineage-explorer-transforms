@@ -59,6 +59,7 @@ from backend.transform_service import (
     get_transform_categories,
     invalidate_transform_cache,
     clear_transform_lineage,
+    diagnose_missing_lineage,
 )
 from backend.build_service import (
     submit_build_job,
@@ -834,6 +835,25 @@ async def api_transform_freshness(
         return result
     except Exception as e:
         logger.error(f"Error checking transform freshness: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/transform/diagnose")
+async def api_transform_diagnose(
+    catalog: str = Query(...),
+    schema: str = Query(...),
+    table: str = Query(...),
+):
+    """Explain why a table has no transformation lineage (e.g. producer outside the
+    discovery window, unresolvable producer, or a source table) — shown instead of
+    a generic "not generated yet" when a build materialized nothing."""
+    catalog = _validate_identifier(catalog, "catalog")
+    schema = _validate_identifier(schema, "schema")
+    table = _validate_identifier(table, "table")
+    try:
+        return await asyncio.to_thread(diagnose_missing_lineage, catalog, schema, table)
+    except Exception as e:
+        logger.error(f"Error diagnosing transform lineage for {catalog}.{schema}.{table}: {e}")
         raise HTTPException(status_code=500, detail=_safe_error(e))
 
 

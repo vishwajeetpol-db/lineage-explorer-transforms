@@ -154,6 +154,18 @@ class FreshnessInfo(BaseModel):
     is_stale: bool = True
 
 
+class TransformDiagnosis(BaseModel):
+    """Why a table has no transformation lineage — shown instead of a generic
+    "not generated yet" so a no-op build is self-explanatory."""
+    reason_code: str = "unknown"          # no_producer | producer_outside_window | producer_unresolved | unknown
+    title: str = ""
+    detail: str = ""
+    last_produced_at: Optional[str] = None
+    days_ago: Optional[int] = None
+    in_window: bool = False
+    skip_reasons: list[str] = []
+
+
 class BuildJobRequest(BaseModel):
     """Request to trigger a transformation lineage build."""
     table_fqn: str                        # e.g. "catalog.schema.table"

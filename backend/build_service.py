@@ -138,6 +138,11 @@ def submit_build_job(
                     # A forced/regenerate build must re-parse even if the source
                     # content is byte-identical (else change-detection skips it).
                     "FORCE_REPARSE": "true" if force_reparse else "false",
+                    # Producer-discovery window (hours). Passed through so the
+                    # build can discover producers that last ran a while ago
+                    # instead of silently finding nothing. Kept in sync with the
+                    # app's diagnose window via the same env var.
+                    "DISCOVERY_LOOKBACK_HOURS": os.environ.get("DISCOVERY_LOOKBACK_HOURS", "8760"),
                 },
             },
             "environment_key": "Default",
