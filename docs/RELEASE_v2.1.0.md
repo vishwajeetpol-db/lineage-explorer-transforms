@@ -1,4 +1,4 @@
-# LineageForge v2.1.0 Release Notes
+# BrickRoute v2.1.0 Release Notes
 
 **Date**: 2025-06-22  
 **Type**: Critical Integrity Patch  
@@ -41,7 +41,7 @@ Import Check:   All transformation_lineage.* imports resolve correctly
 
 ## Deployment Name & Branding
 
-### Recommended Name: **LineageForge**
+### Recommended Name: **BrickRoute**
 
 **Tagline**: *Column-level lineage, forged from source code*
 
@@ -49,14 +49,14 @@ Import Check:   All transformation_lineage.* imports resolve correctly
 - "Lineage" is the core domain
 - "Forge" conveys both construction (building lineage graphs from raw code) and strength/precision
 - Professional, memorable, deployment-friendly (no spaces, no special chars)
-- Works as: `lineage-forge` (URL), `lineageforge` (package), `LineageForge` (display)
+- Works as: `brickroute` (URL), `brickroute` (package), `BrickRoute` (display)
 
 ### Logo Concept
 
 ```
     ╱╲
    ╱  ╲
-  ╱ ⚡ ╲    LineageForge
+  ╱ ⚡ ╲    BrickRoute
  ╱______╲
  │ ════ │   Column-level lineage,
  │ ════ │   forged from source code
@@ -75,18 +75,18 @@ Import Check:   All transformation_lineage.* imports resolve correctly
 ```yaml
 # databricks.yml
 bundle:
-  name: lineage-forge
+  name: brickroute
 
 resources:
   apps:
-    lineage-forge:
-      name: LineageForge
+    brickroute:
+      name: BrickRoute
       description: "Column-level transformation lineage explorer"
 ```
 
 ### App URL
 
-Once deployed: `https://<workspace>.databricks.com/apps/lineage-forge`
+Once deployed: `https://<workspace>.databricks.com/apps/brickroute`
 
 ---
 

@@ -1,5 +1,5 @@
 bundle:
-  name: nexus-lineage
+  name: brickroute
 
 variables:
   warehouse_id:
@@ -42,7 +42,7 @@ variables:
     default: "24"
   app_name:
     description: "Databricks App name. Override to avoid collisions in a shared workspace or to run multiple instances."
-    default: "lineage-explorer"
+    default: "brickroute"
 
 # Files excluded from `databricks bundle deploy` uploads.
 # `.databricksignore` is best-effort across CLI versions — `sync.exclude` is authoritative.
@@ -99,12 +99,12 @@ targets:
     #   databricks bundle deploy -t dev --profile <profile> --var warehouse_id=<id>
     variables:
       rate_limit_max_requests: "200"  # higher cap for dev (admin dashboard polls every 10s)
-      app_name: "lineage-explorer-direct"
+      app_name: "brickroute-dev"
     resources:
       apps:
-        lineage-explorer:
+        brickroute:
           name: ${var.app_name}
-          description: "Unity Catalog Lineage Explorer — Interactive DAG visualization"
+          description: "BrickRoute — Interactive Unity Catalog lineage visualization"
           source_code_path: .
           resources:
             - name: sql-warehouse
@@ -153,9 +153,9 @@ targets:
     #   databricks bundle deploy -t prod --profile <profile> --var warehouse_id=<id>
     resources:
       apps:
-        lineage-explorer:
+        brickroute:
           name: ${var.app_name}
-          description: "Unity Catalog Lineage Explorer — Interactive DAG visualization"
+          description: "BrickRoute — Interactive Unity Catalog lineage visualization"
           source_code_path: .
           resources:
             - name: sql-warehouse

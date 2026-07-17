@@ -32,7 +32,7 @@ Add a scheduled pipeline that runs `python monitoring/healthcheck.py` every 5 mi
 | Failure mode | Detection |
 |---|---|
 | App crashed / warehouse offline | `/health` returns 5xx or times out |
-| Frontend bundle missing | `/` returns HTML but not the Lineage Explorer page |
+| Frontend bundle missing | `/` returns HTML but not the BrickRoute page |
 | OAuth config broken | `/` returns login redirect instead of app |
 | Whole workspace down | Both checks fail |
 

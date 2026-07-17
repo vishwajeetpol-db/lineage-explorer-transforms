@@ -1,6 +1,6 @@
 import { memo, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import { GitBranch, Search, FolderOpen, ChevronRight, Loader2, RefreshCw, Database, Eye, Layers, Zap, HardDrive, Clock, FolderTree } from "lucide-react";
+import { Search, FolderOpen, ChevronRight, Loader2, RefreshCw, Database, Eye, Layers, Zap, HardDrive, Clock, FolderTree } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
 import { api } from "../../api/client";
 import { useRecents } from "../../hooks/useRecents";
@@ -62,9 +62,11 @@ function Landing({ onSelectTable }: Props) {
       <div className="h-screen w-screen flex flex-col items-center justify-center bg-surface">
         <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(99,102,241,0.06)_0%,transparent_70%)]" />
         <div className="relative z-10 flex flex-col items-center gap-4">
-          <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-accent to-purple-500 flex items-center justify-center shadow-[0_0_40px_rgba(99,102,241,0.25)]">
-            <GitBranch size={26} className="text-white" />
-          </div>
+          <svg width="52" height="52" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style={{filter: "drop-shadow(0 0 18px rgba(255,85,32,0.35))"}}>
+            <polygon points="16,3 28,10 16,17 4,10" fill="#FF5520"/>
+            <polygon points="4,10 16,17 16,28 4,21" fill="#BB2700"/>
+            <polygon points="28,10 16,17 16,28 28,21" fill="#DD3700"/>
+          </svg>
           <Loader2 size={24} className="text-accent animate-spin" />
           <p className="text-sm text-slate-500">Loading tables...</p>
         </div>
@@ -78,9 +80,11 @@ function Landing({ onSelectTable }: Props) {
       <div className="h-screen w-screen flex flex-col items-center justify-center bg-surface">
         <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(99,102,241,0.06)_0%,transparent_70%)]" />
         <div className="relative z-10 flex flex-col items-center gap-4">
-          <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-accent to-purple-500 flex items-center justify-center shadow-[0_0_40px_rgba(99,102,241,0.25)]">
-            <GitBranch size={26} className="text-white" />
-          </div>
+          <svg width="52" height="52" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style={{filter: "drop-shadow(0 0 18px rgba(255,85,32,0.35))"}}>
+            <polygon points="16,3 28,10 16,17 4,10" fill="#FF5520"/>
+            <polygon points="4,10 16,17 16,28 4,21" fill="#BB2700"/>
+            <polygon points="28,10 16,17 16,28 28,21" fill="#DD3700"/>
+          </svg>
           <p className="text-sm text-slate-500">Unable to load table index</p>
           <button
             onClick={() => {
@@ -115,11 +119,13 @@ function Landing({ onSelectTable }: Props) {
           animate={{ opacity: 1, y: 0 }}
           className="flex items-center gap-4"
         >
-          <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-accent to-purple-500 flex items-center justify-center shadow-[0_0_40px_rgba(99,102,241,0.3)]">
-            <GitBranch size={22} className="text-white" />
-          </div>
+          <svg width="44" height="44" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style={{filter: "drop-shadow(0 0 18px rgba(255,85,32,0.45))"}}>
+            <polygon points="16,3 28,10 16,17 4,10" fill="#FF5520"/>
+            <polygon points="4,10 16,17 16,28 4,21" fill="#BB2700"/>
+            <polygon points="28,10 16,17 16,28 28,21" fill="#DD3700"/>
+          </svg>
           <div>
-            <h1 className="text-[22px] font-semibold text-white tracking-tight">NEXUS Lineage</h1>
+            <h1 className="text-[22px] font-semibold text-white tracking-tight">BrickRoute</h1>
             <p className="text-[12px] text-slate-500">Click any table to explore its data lineage</p>
           </div>
         </motion.div>

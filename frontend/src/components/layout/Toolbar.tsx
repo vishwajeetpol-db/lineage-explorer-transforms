@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { GitBranch, Search, ChevronDown, Columns3, Zap, Info, Lock, AlertTriangle, ArrowLeft, Percent, FolderTree, Layers, Download, SlidersHorizontal } from "lucide-react";
+import { Search, ChevronDown, Columns3, Zap, Info, Lock, AlertTriangle, ArrowLeft, Percent, FolderTree, Layers, Download, SlidersHorizontal } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
 import { api, setLiveMode } from "../../api/client";
 import { goLanding, goSchemas, goCatalogs } from "../../hooks/useRouter";
@@ -131,12 +131,14 @@ function Toolbar({ onGenerate }: Props) {
         title="Back to home"
         aria-label="Back to home"
       >
-        <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-red-500 via-purple-500 to-blue-500 flex items-center justify-center shadow-[0_0_12px_rgba(255,54,33,0.3)]">
-          <GitBranch size={16} className="text-white" />
-        </div>
+        <svg width="30" height="30" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style={{filter: "drop-shadow(0 0 8px rgba(255,85,32,0.45))"}}>
+          <polygon points="16,3 28,10 16,17 4,10" fill="#FF5520"/>
+          <polygon points="4,10 16,17 16,28 4,21" fill="#BB2700"/>
+          <polygon points="28,10 16,17 16,28 28,21" fill="#DD3700"/>
+        </svg>
         <div className="text-left">
           <div className="font-semibold text-[14px] text-white tracking-tight leading-none">
-            NEXUS Lineage
+            BrickRoute
           </div>
           <div className="text-[9px] text-slate-600 tracking-wider uppercase mt-0.5">
             Unity Catalog
@@ -157,9 +159,9 @@ function Toolbar({ onGenerate }: Props) {
       {focusTable ? (
         <>
           <button
-            onClick={() => setFocusTable(null)}
+            onClick={goLanding}
             className="flex items-center gap-1.5 px-2.5 py-1.5 flex-shrink-0 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] border border-white/[0.06] hover:border-white/[0.12] transition-all duration-200 group"
-            title="Back to search"
+            title="Back to home"
           >
             <ArrowLeft size={13} className="text-slate-500 group-hover:text-slate-300 transition-colors" />
             <span className="text-[11px] text-slate-500 group-hover:text-slate-300 font-medium transition-colors">Back</span>

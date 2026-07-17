@@ -8,7 +8,8 @@ export type Route =
   | { view: "lineage"; table: string }
   | { view: "schemaLineage"; catalog: string; schema: string }
   | { view: "catalogLineage"; catalog: string }
-  | { view: "admin" };
+  | { view: "admin" }
+  | { view: "controlPanel" };
 
 const ROUTE_CHANGE_EVENT = "lineage-route-change";
 
@@ -16,6 +17,7 @@ function parseRoute(): Route {
   const params = new URLSearchParams(window.location.search);
 
   if (params.get("admin") === "true") return { view: "admin" };
+  if (params.get("controlPanel") === "true") return { view: "controlPanel" };
 
   const table = params.get("table");
   if (table && table.split(".").length === 3) {
@@ -64,6 +66,8 @@ function routeToSearch(route: Route): string {
       return `?view=catalogLineage&catalog=${encodeURIComponent(route.catalog)}`;
     case "admin":
       return "?admin=true";
+    case "controlPanel":
+      return "?controlPanel=true";
   }
 }
 
@@ -104,3 +108,4 @@ export const goSchemaLineage = (catalog: string, schema: string) =>
   navigate({ view: "schemaLineage", catalog, schema });
 export const goCatalogLineage = (catalog: string) =>
   navigate({ view: "catalogLineage", catalog });
+export const goControlPanel = () => navigate({ view: "controlPanel" });

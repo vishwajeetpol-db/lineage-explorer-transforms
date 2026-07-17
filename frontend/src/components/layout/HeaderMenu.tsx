@@ -1,8 +1,8 @@
 import { memo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Menu, Activity, FolderOpen, Home } from "lucide-react";
+import { Menu, Activity, FolderOpen, Home, SlidersHorizontal } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
-import { goLanding, goCatalogs } from "../../hooks/useRouter";
+import { goLanding, goCatalogs, goControlPanel } from "../../hooks/useRouter";
 
 interface Props {
   variant?: "default" | "floating";
@@ -63,6 +63,16 @@ function HeaderMenu({ variant = "default" }: Props) {
               >
                 <FolderOpen size={14} className="text-indigo-400" />
                 <span className="text-[12px] text-slate-300 font-medium">Browse catalogs</span>
+              </button>
+              <button
+                onClick={() => {
+                  setOpen(false);
+                  goControlPanel();
+                }}
+                className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.04] text-left"
+              >
+                <SlidersHorizontal size={14} className="text-violet-400" />
+                <span className="text-[12px] text-slate-300 font-medium">Control Panel</span>
               </button>
               {isAdmin && (
                 <a

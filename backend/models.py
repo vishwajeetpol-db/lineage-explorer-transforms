@@ -186,3 +186,63 @@ class BuildJobStatus(BaseModel):
     total_steps: int = 8
     steps: list[str] = []                 # ordered step names for progress bar
     run_page_url: str = ""                # link to the job run in Databricks UI
+
+
+# ---------------------------------------------------------------------------
+# Control Panel Models — feature-flag registry, workspace impact/access
+# metadata, and status cards for the Runtime Plan Capture and Federated Sync
+# modules. See backend/feature_flags.py, backend/plan_capture_service.py,
+# backend/federated_sync.py.
+# ---------------------------------------------------------------------------
+
+
+class AccessRequirement(BaseModel):
+    privilege: str
+    scope: str
+    reason: str
+    satisfied: Optional[bool] = None      # None = could not be verified automatically
+    detail: Optional[str] = None
+
+
+class FeatureFlagCard(BaseModel):
+    id: str
+    module: str
+    module_label: str
+    accent: str = "indigo"
+    name: str
+    description: str
+    cost: str = "low"                     # low | medium | high
+    risk: str = "low"                     # low | medium | high
+    side_effects: list[str] = []
+    access_requirements: list[dict] = []
+    depends_on: list[str] = []
+    enabled: bool = False
+    kill_switched: bool = False           # True when an ops env-var forces this off regardless of the DB flag
+
+
+class FeatureFlagsResponse(BaseModel):
+    flags: list[FeatureFlagCard] = []
+
+
+class PlanCaptureStatus(BaseModel):
+    enabled: bool = False
+    table_reachable: bool = False
+    captured_plan_count: int = 0
+    captured_cdc_spec_count: int = 0
+    distinct_targets: int = 0
+
+
+class FederatedPeer(BaseModel):
+    peer_alias: str
+    share_name: str
+    direction: str = "both"               # inbound | outbound | both
+    registered_by: Optional[str] = None
+    registered_at: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class FederatedSyncStatus(BaseModel):
+    enabled: bool = False
+    registered_peers: int = 0
+    known_shares: int = 0
+    reachable_overlap: int = 0

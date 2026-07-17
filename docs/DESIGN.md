@@ -1,8 +1,8 @@
-# NEXUS Lineage — Unified Design Document
+# BrickRoute — Unified Design Document
 
 ## Overview
 
-NEXUS Lineage combines two lineage capabilities into a single app with a **macro → micro** interaction model:
+BrickRoute combines two lineage capabilities into a single app with a **macro → micro** interaction model:
 
 | Zoom Level | Source | What You See |
 | --- | --- | --- |

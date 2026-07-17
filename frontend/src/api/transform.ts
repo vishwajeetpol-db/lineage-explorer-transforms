@@ -79,6 +79,22 @@ export interface BuildConfig {
   configured: boolean;
 }
 
+/** A runtime-captured expression for one column, from the Runtime Plan Capture
+ * module (backend/plan_capture_service.py). Only ever populated when the
+ * `lineage_tracking.plan_capture` Control Panel flag is enabled AND a plan has
+ * been captured for the target table — otherwise getCapturedExpression()
+ * resolves to null. */
+export interface CapturedExpression {
+  target_column: string;
+  source_columns: string[];
+  expression: string;
+  confidence: number;
+  notes: string;
+  captured_via: string | null;
+  captured_at: string | null;
+  version: number | null;
+}
+
 const BASE = '/api/transform';
 
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
@@ -143,4 +159,24 @@ export async function getTransformCategories(): Promise<TransformCategories> {
 /** Check if build pipeline is configured. */
 export async function getBuildConfig(): Promise<BuildConfig> {
   return fetchJson<BuildConfig>(`${BASE}/build-configured`);
+}
+
+/** Additive enrichment (Captured-Plan Precedence, gated by the
+ * `column_transformation.captured_plan_precedence` flag): the runtime-captured
+ * expression for one column, if available. Returns null rather than throwing
+ * when the module is disabled or nothing has been captured for this column —
+ * callers should treat this as a "nice to have" alongside the static-parse
+ * expression already present on the TransformEdge, never a replacement path
+ * that can fail the drill-down. */
+export async function getCapturedExpression(
+  catalog: string,
+  schema: string,
+  table: string,
+  column: string,
+): Promise<CapturedExpression | null> {
+  const params = new URLSearchParams({ catalog, schema, table, column });
+  const result = await fetchJson<{ captured: CapturedExpression | null }>(
+    `${BASE}/captured-expression?${params}`,
+  );
+  return result.captured;
 }

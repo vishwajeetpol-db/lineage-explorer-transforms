@@ -30,7 +30,7 @@ function PageShell({ children }: Props) {
             <GitBranch size={20} className="text-white" />
           </div>
           <div className="text-left">
-            <h1 className="text-lg font-semibold text-white tracking-tight">Lineage Explorer</h1>
+            <h1 className="text-lg font-semibold text-white tracking-tight">BrickRoute</h1>
             <p className="text-[11px] text-slate-500">Click any table to explore its data lineage</p>
           </div>
         </button>

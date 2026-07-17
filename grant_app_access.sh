@@ -19,7 +19,7 @@
 # =============================================================================
 set -euo pipefail
 
-APP_NAME="${APP_NAME:-lineage-explorer-direct}"
+APP_NAME="${APP_NAME:-brickroute-dev}"
 PROFILE="${PROFILE:-DEFAULT}"
 WAREHOUSE_ID="${WAREHOUSE_ID:-}"
 CATALOGS="${CATALOGS:-}"

@@ -1,8 +1,39 @@
 # Changelog
 
-All notable changes to NEXUS Lineage are documented in this file.
+All notable changes to BrickRoute are documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+---
+
+## [2.4.0]
+
+> Adds a new **Control Panel** — admin-gated toggles for three opt-in, higher-cost/higher-risk capabilities, all OFF by default: **Runtime Plan Capture** (captures Spark's exact Analyzed Logical Plan from opted-in pipelines, for transformation logic the static parser can't read from source), **Captured-Plan Precedence** (additively surfaces that captured expression in the existing transformation drill-down), and **Federated Sync** (an admin-curated registry of known peer workspaces layered on the existing Delta Sharing overlay — a v1 scaffold, not live cross-workspace sync). See [docs/architecture.md](docs/architecture.md), [docs/capabilites.md](docs/capabilites.md), and [docs/testing_plan_for_Combined_App.md](docs/testing_plan_for_Combined_App.md) for full detail, including an explicit Known Gaps / follow-ups list.
+
+### Added
+
+- **Control Panel** (`backend/feature_flags.py`, `frontend/src/components/control-panel/`) — a Delta-backed feature-flag registry with three capability cards (cost/risk ratings, side effects, access requirements with a live-check button). Reachable from the header menu or `?controlPanel=true`. Reading flags is open to any authenticated user; toggling a flag is admin-gated (same `ADMIN_GROUP_NAME` check as `/api/cache/invalidate`). Every flag's *effective* state is the AND of its persisted DB value and a hard ops-level env-var kill switch (`ENABLE_PLAN_CAPTURE`, `ENABLE_CAPTURED_PLAN_PRECEDENCE`, `ENABLE_FEDERATED_SYNC` — default `true`), so an operator can force a capability off instantly without depending on the SQL warehouse being reachable.
+- **`GET /api/control-panel/flags`**, **`POST /api/control-panel/flags/{flag_id}`**, **`GET /api/control-panel/access-check/{flag_id}`** — Control Panel flag read/write/access-check endpoints.
+- **Runtime Plan Capture** (`lineage_tracking.plan_capture` flag) — vendored the `lineage-plan-capture` source project's `capture.py`/`plan_parser.py` into `backend/plan_capture/` (adapted so `DEFAULT_TABLE`/`DEFAULT_SPEC_TABLE` derive from this app's `LINEAGE_CATALOG`/`LINEAGE_SCHEMA` instead of the source project's hardcoded catalog). New `backend/plan_capture_service.py` provides the app-side, flag-gated *read* path (`get_plan_capture_status()`, `get_captured_expression()`); the *write* path runs only inside a pipeline notebook that explicitly opts in (two added cells — see docs/capabilites.md), never inside the app process itself.
+- **`GET /api/control-panel/plan-capture/status`** — status card endpoint (captured plan/CDC-spec counts, distinct target tables, table reachability).
+- **`GET /api/transform/captured-expression`** — returns the runtime-captured expression for a column when Captured-Plan Precedence (`column_transformation.captured_plan_precedence` flag, depends on Runtime Plan Capture) is enabled and a plan has been captured for it; `{"captured": null}` otherwise. Additive only — does not change the existing static-parse transformation trace.
+- **Federated Sync** (`federated_sync.cross_workspace` flag) — new `backend/federated_sync.py`: an admin-curated `federated_peers` registry cross-referenced against the existing `lineage_service.get_sharing_overview()` so a shared boundary node can be labeled as a known peer. `GET /api/control-panel/federated/status`, `GET /api/control-panel/federated/peers`, `POST /api/control-panel/federated/peers` (admin).
+- **Frontend**: `frontend/src/api/controlPanel.ts` (API client), `frontend/src/store/featureFlagStore.ts` (Zustand store + `useFeatureFlagEnabled` selector), `frontend/src/components/control-panel/` (`ControlPanel.tsx`, `ModuleSection.tsx`, `FeatureToggleCard.tsx` using Radix `Switch`, `ImpactBadges.tsx`, `AccessRequirementsModal.tsx`), a new `controlPanel` route in `useRouter.ts` (`?controlPanel=true`), and a "Control Panel" entry in `HeaderMenu.tsx`.
+- **New docs**: [docs/architecture.md](docs/architecture.md) (2.4.0 module architecture + data flow + Known Gaps), [docs/capabilites.md](docs/capabilites.md) (capability-by-capability reference with pipeline opt-in steps), [docs/testing_plan_for_Combined_App.md](docs/testing_plan_for_Combined_App.md) (unit/frontend/manual-QA test plan for the additions above).
+- **Pydantic models** (`backend/models.py`): `AccessRequirement`, `FeatureFlagCard`, `FeatureFlagsResponse`, `PlanCaptureStatus`, `FederatedPeer`, `FederatedSyncStatus`.
+
+### Changed
+
+- **`APP_VERSION` bumped to `2.4.0`** (`backend/main.py`) — was still `2.2.0`, out of sync with this changelog since the 2.3.0 release.
+- **`frontend/package.json` version bumped to `2.4.0`** — was still `2.2.0`, same drift as above.
+- **`docs/ARCHITECTURE.md`** brought current: version header updated from the stale `2.2.0` / `2026-06-29` pin to `2.4.0`, with a new §1.2 summarizing the 2.4.0 additions, updated directory structure, a new Control Panel endpoints table, and updated grants/env-var reference for the five new app-owned tables (`feature_flags`, `feature_flags_audit`, `captured_plans`, `captured_cdc_specs`, `federated_peers`).
+
+### Known limitations (see docs/architecture.md §5 for full detail)
+
+- Federated Sync is an admin-curated registry cross-referenced against existing sharing metadata — it does **not** implement live cross-workspace API calls, trust handshakes, or peer-initiated sync jobs. Treat it as informational, not a trust boundary.
+- Runtime Plan Capture has no automated installer; opting a pipeline in is a manual, documented two-cell addition to the pipeline notebook.
+- Captured-Plan Precedence is additive (shown alongside the static-parse result) — it does not yet change which upstream columns the transformation BFS itself walks.
+- `check_access_requirements()` can verify `CREATE TABLE` and `SELECT` requirements automatically; `WRITE VOLUME`, `CAN_MANAGE`, and "Workspace Admin" requirements currently return an unverifiable (`satisfied: null`) result.
 
 ---
 

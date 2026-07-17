@@ -3,6 +3,7 @@ import { ReactFlowProvider } from "reactflow";
 import Toolbar from "./components/layout/Toolbar";
 import LineageCanvas from "./components/graph/LineageCanvas";
 import AdminDashboard from "./components/AdminDashboard";
+import ControlPanel from "./components/control-panel/ControlPanel";
 import Landing from "./components/landing/Landing";
 import GlobalSearch from "./components/landing/GlobalSearch";
 import LineagePreview from "./components/lineage/LineagePreview";
@@ -12,7 +13,7 @@ import SchemaListView from "./components/browse/SchemaListView";
 import TableListView from "./components/browse/TableListView";
 import { useLineageStore } from "./store/lineageStore";
 import { api, setLiveMode } from "./api/client";
-import { useRouter, goLineage } from "./hooks/useRouter";
+import { useRouter, goLineage, goLanding } from "./hooks/useRouter";
 import { useRecents } from "./hooks/useRecents";
 
 const TABLE_LOAD_MAX_RETRIES = 3;
@@ -189,6 +190,13 @@ export default function App() {
       );
     }
     return <AdminDashboard open={true} onClose={() => window.close()} />;
+  }
+
+  if (route.view === "controlPanel") {
+    // Readable by any authenticated user — toggles are admin-gated inside the
+    // panel itself (see FeatureToggleCard), so a non-admin can still see what
+    // capabilities exist and their access requirements.
+    return <ControlPanel open={true} onClose={goLanding} />;
   }
 
   if (route.view === "lineage" || route.view === "schemaLineage" || route.view === "catalogLineage") {

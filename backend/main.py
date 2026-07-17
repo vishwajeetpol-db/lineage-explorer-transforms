@@ -10,7 +10,7 @@ import resource
 import threading
 from collections import deque, OrderedDict
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.4.0"
 
 RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "60"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
@@ -68,6 +68,9 @@ from backend.build_service import (
     BUILD_STEPS,
 )
 from backend.models import BuildJobRequest
+from backend.feature_flags import list_flags, set_flag_state, check_access_requirements
+from backend.plan_capture_service import get_plan_capture_status, get_captured_expression
+from backend.federated_sync import get_federated_sync_status, list_federated_peers, register_federated_peer
 
 class _JsonLogFormatter(logging.Formatter):
     """Structured JSON logs — one line per record so downstream log queries
@@ -230,7 +233,7 @@ async def lifespan(app: FastAPI):
     import concurrent.futures
     loop = asyncio.get_running_loop()
     loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=64))
-    logger.info("Lineage Explorer starting up — thread pool set to 64 workers, clearing stale caches")
+    logger.info("BrickRoute starting up — thread pool set to 64 workers, clearing stale caches")
     invalidate_cache()
     # Pre-fetch per-entity cost cache in background so first lineage load shows cost.
     # The aggregation can take a few minutes against busy system.billing — it must
@@ -249,7 +252,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        logger.info("Lineage Explorer shutting down — cancelling background tasks, clearing caches")
+        logger.info("BrickRoute shutting down — cancelling background tasks, clearing caches")
         if prefetch_task and not prefetch_task.done():
             prefetch_task.cancel()
             try:
@@ -259,7 +262,7 @@ async def lifespan(app: FastAPI):
         invalidate_cache()
 
 
-app = FastAPI(title="NEXUS Lineage", version=APP_VERSION, lifespan=lifespan)
+app = FastAPI(title="BrickRoute", version=APP_VERSION, lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +413,7 @@ async def api_admin_status(request: Request):
 
     now = time.time()
 
-    # Memory — Linux: /proc/self/status, fallback to resource module
+    # Memory — Linux: read VmRSS from /proc/self/status; fall back to resource module.
     rss_mb = 0.0
     try:
         with open("/proc/self/status") as f:
@@ -987,6 +990,134 @@ async def api_transform_categories():
 async def api_transform_build_configured():
     """Check if the build pipeline is configured (PIPELINE_NOTEBOOK_PATH set)."""
     return {"configured": is_build_configured()}
+
+
+# ---------------------------------------------------------------------------
+# Control Panel — feature flags, workspace impact/access metadata, and the
+# gated read paths for Runtime Plan Capture and Federated Sync. Every flag
+# defaults to OFF; enabling one only changes behavior in the modules that
+# explicitly check get_flag_state() (plan_capture_service, federated_sync).
+# See backend/feature_flags.py, backend/plan_capture_service.py,
+# backend/federated_sync.py, and docs/architecture.md.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/control-panel/flags")
+async def api_control_panel_flags():
+    """List all Control Panel capabilities with current enabled state, cost/risk/
+    side-effect metadata, and static access requirements."""
+    try:
+        flags = await asyncio.to_thread(list_flags)
+        return {"flags": flags}
+    except Exception as e:
+        logger.error(f"Error listing feature flags: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/control-panel/access-check/{flag_id}")
+async def api_control_panel_access_check(flag_id: str):
+    """Best-effort live check of the access requirements for one flag."""
+    try:
+        requirements = await asyncio.to_thread(check_access_requirements, flag_id)
+        return {"flag_id": flag_id, "requirements": requirements}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error checking access for flag {flag_id}: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.post("/api/control-panel/flags/{flag_id}")
+async def api_control_panel_set_flag(request: Request, flag_id: str, body: dict):
+    """Enable/disable a Control Panel capability. ADMIN ONLY — a toggle here
+    changes app-wide behavior (e.g. whether plan-capture reads are consulted),
+    not just this user's session."""
+    email, is_admin = await asyncio.to_thread(_get_user_info, request)
+    if not is_admin:
+        logger.warning(f"Non-admin feature-flag change attempt by {email} on {flag_id}")
+        raise HTTPException(status_code=403, detail="Admin access required")
+    enabled = bool(body.get("enabled", False))
+    try:
+        result = await asyncio.to_thread(set_flag_state, flag_id, enabled, email or "unknown")
+        return {"status": "ok", **result}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error setting feature flag {flag_id}: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/control-panel/plan-capture/status")
+async def api_plan_capture_status():
+    """Runtime Plan Capture status card — captured plan/CDC-spec counts. Returns
+    all-zero/disabled when the flag is off or the table isn't reachable yet."""
+    try:
+        return await asyncio.to_thread(get_plan_capture_status)
+    except Exception as e:
+        logger.error(f"Error getting plan capture status: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/transform/captured-expression")
+async def api_transform_captured_expression(
+    catalog: str = Query(...), schema: str = Query(...), table: str = Query(...), column: str = Query(...),
+):
+    """Additive enrichment: the Runtime-Captured-Plan expression for one column,
+    if Runtime Plan Capture is enabled and a plan has been captured for this
+    target. Returns null (not an error) when unavailable — the frontend falls
+    back to the static-parse expression it already has from /api/transform/trace."""
+    catalog = _validate_identifier(catalog, "catalog")
+    schema = _validate_identifier(schema, "schema")
+    table = _validate_identifier(table, "table")
+    column = _validate_identifier(column, "column")
+    try:
+        result = await asyncio.to_thread(get_captured_expression, catalog, schema, table, column)
+        return {"captured": result}
+    except Exception as e:
+        logger.error(f"Error getting captured expression: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/control-panel/federated/status")
+async def api_federated_sync_status():
+    """Federated Sync status card — registered peers vs. known Delta Shares."""
+    try:
+        return await asyncio.to_thread(get_federated_sync_status)
+    except Exception as e:
+        logger.error(f"Error getting federated sync status: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/control-panel/federated/peers")
+async def api_federated_list_peers():
+    try:
+        return {"peers": await asyncio.to_thread(list_federated_peers)}
+    except Exception as e:
+        logger.error(f"Error listing federated peers: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.post("/api/control-panel/federated/peers")
+async def api_federated_register_peer(request: Request, body: dict):
+    """Register a known peer workspace/metastore for the Federated Sync overlay.
+    ADMIN ONLY — this changes what every user sees as a 'known' shared boundary."""
+    email, is_admin = await asyncio.to_thread(_get_user_info, request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    peer_alias = str(body.get("peer_alias", "")).strip()
+    share_name = str(body.get("share_name", "")).strip()
+    direction = str(body.get("direction", "both")).strip()
+    notes = str(body.get("notes", "")).strip()
+    if not peer_alias or not share_name:
+        raise HTTPException(status_code=400, detail="peer_alias and share_name are required")
+    try:
+        result = await asyncio.to_thread(
+            register_federated_peer, peer_alias, share_name, direction, email or "unknown", notes
+        )
+        return {"status": "ok", **result}
+    except Exception as e:
+        logger.error(f"Error registering federated peer: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
 
 
 # ---------------------------------------------------------------------------

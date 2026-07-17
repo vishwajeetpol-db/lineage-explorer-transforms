@@ -75,7 +75,7 @@ def main() -> int:
         return 0
 
     message = (
-        f":rotating_light: *Lineage Explorer [{args.env}] unhealthy*\n"
+        f":rotating_light: *BrickRoute [{args.env}] unhealthy*\n"
         f"URL: {args.url}\n" + "\n".join(summary_lines)
     )
     print(message, file=sys.stderr)

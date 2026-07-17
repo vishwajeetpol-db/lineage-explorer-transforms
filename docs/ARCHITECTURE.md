@@ -1,14 +1,16 @@
-# NEXUS Lineage — Architecture & Functionality Reference
+# BrickRoute — Architecture & Functionality Reference
 
-> **Version**: 2.2.0  
-> **Last Updated**: 2026-06-29  
+> **Version**: 2.4.0
 > **Tech Stack**: FastAPI · React · TypeScript · ReactFlow · ELK.js · Databricks Apps · DABs
+> See [CHANGELOG.md](../CHANGELOG.md) for full release history — this file's own "Last Updated"
+> date is intentionally omitted since it previously went stale (was pinned at 2026-06-29 under
+> the "2.2.0" label while the app had already moved to 2.4.0).
 
 ---
 
 ## 1. Overview
 
-NEXUS Lineage is a unified, self-contained Databricks App that provides:
+BrickRoute is a unified, self-contained Databricks App that provides:
 
 1. **Table-level lineage** — end-to-end DAG visualization across all Unity Catalog catalogs
 2. **Column-level lineage** — traced from `system.access.column_lineage` edges
@@ -18,6 +20,7 @@ NEXUS Lineage is a unified, self-contained Databricks App that provides:
 6. **Serverless cost** — per-entity 30-day billing from `system.billing`
 7. **Admin dashboard** — real-time P50/P95/P99 latency, memory, cache inventory, and transformation-lineage invalidate controls
 8. **Excel export** — styled multi-sheet workbook of lineage data
+9. **Control Panel** (2.4.0) — admin-gated toggles for three opt-in, higher-cost/higher-risk capabilities: Runtime Plan Capture, Captured-Plan Precedence, and Federated Sync. See §1.2.
 
 All functionality is **self-contained** — zero external code references. The app deploys as a single unit via Declarative Automation Bundles.
 
@@ -25,7 +28,7 @@ All functionality is **self-contained** — zero external code references. The a
 
 ## 1.1 Expression-Level Transformation Lineage: Reconstructing the "How" Behind Every Column
 
-**This is what makes NEXUS Lineage unique.** Unity Catalog records column *dependency* edges — that "column A depends on column B." NEXUS Lineage goes a layer deeper: it reconstructs the **actual transformation expression** that produced each column — the precise SQL/PySpark logic (`cast`, `sum`, `concat`, `CASE`, window functions, CTE chains) — and tags each derivation with a transform category. It does this by *genuinely parsing the producing code*, then serves it as an interactive, per-column upstream drill-down.
+**This is what makes BrickRoute unique.** Unity Catalog records column *dependency* edges — that "column A depends on column B." BrickRoute goes a layer deeper: it reconstructs the **actual transformation expression** that produced each column — the precise SQL/PySpark logic (`cast`, `sum`, `concat`, `CASE`, window functions, CTE chains) — and tags each derivation with a transform category. It does this by *genuinely parsing the producing code*, then serves it as an interactive, per-column upstream drill-down.
 
 What makes that hard — and what the engine does:
 
@@ -35,6 +38,27 @@ What makes that hard — and what the engine does:
 - **Python-defined DLT** handled where `SHOW CREATE TABLE` can't help — the AST parser detects `@dlt.table`/`@dlt.view` decorators, scopes a symbol table per dataset function, and walks the returned DataFrame chain.
 - **Precise source attribution, no false fan-out.** Each derive edge pins the exact resolved source node via `meta_json.src_node_id`, so the endpoints builder joins source by node id (not column name) — preventing an output column from cross-joining to every table that shares a column name. Self-loop and duplicate-hop guards keep edges clean.
 - **Honest boundary handling.** Lakehouse Federation (`table_type` FOREIGN) and Delta Sharing sources are surfaced as an explicit `external_source` skip rather than a misleading empty result; a local job that *reads* a shared/foreign table still captures it as an upstream source.
+
+---
+
+## 1.2 What's New in 2.4.0
+
+Three new opt-in capabilities, all OFF by default and gated behind the new
+**Control Panel** (header menu → Control Panel, or `?controlPanel=true`).
+Full detail lives in the dedicated docs added alongside this release —
+this section is intentionally a summary, not a duplicate:
+
+- **[docs/architecture.md](architecture.md)** — architecture of the three new modules (Control Panel, Runtime Plan Capture, Federated Sync), their data flow, and an explicit Known Gaps section.
+- **[docs/capabilites.md](capabilites.md)** — capability-by-capability reference: what each toggle does, its access requirements, and how to opt a pipeline into Runtime Plan Capture.
+- **[docs/testing_plan_for_Combined_App.md](testing_plan_for_Combined_App.md)** — unit test plan, frontend checks, and a manual QA checklist for the 2.4.0 additions.
+
+In one line each:
+
+- **Runtime Plan Capture** (`lineage_tracking.plan_capture`) — captures Spark's actual Analyzed Logical Plan from an opted-in pipeline run, for exact per-column expressions the static parser can't read from source (e.g. wheel-based/dynamically-built DataFrames).
+- **Captured-Plan Precedence** (`column_transformation.captured_plan_precedence`) — additively surfaces that captured expression alongside the existing static-parse result in the transformation drill-down (depends on Runtime Plan Capture).
+- **Federated Sync** (`federated_sync.cross_workspace`) — an admin-curated registry of known peer workspaces, cross-referenced against the existing Delta Sharing overlay so shared boundary nodes can be labeled as a known peer. v1 scaffold — no live cross-workspace calls yet.
+
+None of these change how the always-on table/column/transformation lineage engine described in §1.1 and §4 works; they are additive modules layered on top, following the same non-fatal, degrade-to-disabled design principle as the rest of the app.
 
 ---
 
@@ -51,6 +75,13 @@ lineage_app/
 │   ├── build_service.py             # Lineage Builder (job submission & polling)
 │   ├── excel_export.py              # Styled .xlsx export generation
 │   ├── models.py                    # Pydantic models for all API responses
+│   ├── feature_flags.py             # (2.4.0) Control Panel flag registry + admin-gated set/check
+│   ├── plan_capture_service.py      # (2.4.0) Runtime Plan Capture — app-side read path (gated)
+│   ├── plan_capture/                # (2.4.0) Vendored Runtime Plan Capture write-path module
+│   │   ├── __init__.py
+│   │   ├── capture.py               #   capture()/capture_cdc_spec() — runs inside opted-in pipelines
+│   │   └── plan_parser.py           #   pure-stdlib Analyzed Plan parser
+│   ├── federated_sync.py            # (2.4.0) Peer registry + Delta Sharing overview cross-reference
 │   └── tests/                       # Unit tests
 ├── frontend/                        # React + TypeScript SPA
 │   ├── src/
@@ -59,9 +90,10 @@ lineage_app/
 │   │   │   ├── transform/           # TransformPanel, TransformCanvas, BuildProgress, PruningControls
 │   │   │   ├── lineage/             # Column drill-down
 │   │   │   ├── browse/ landing/ layout/ ui/
+│   │   │   ├── control-panel/       # (2.4.0) ControlPanel, ModuleSection, FeatureToggleCard, ImpactBadges, AccessRequirementsModal
 │   │   │   ├── AdminDashboard.tsx   # Ops dashboard + transformation-lineage invalidate controls
-│   │   ├── api/                     # Typed fetch client (client.ts, transform.ts)
-│   │   ├── store/                   # Zustand stores (lineageStore, transformStore)
+│   │   ├── api/                     # Typed fetch client (client.ts, transform.ts, controlPanel.ts)
+│   │   ├── store/                   # Zustand stores (lineageStore, transformStore, featureFlagStore)
 │   │   └── lib/                     # Utilities, ELK worker
 │   └── dist/                        # Production build (served by FastAPI; committed)
 ├── transformation_lineage/          # Transformation-lineage engine (imported by app AND run by build job)
@@ -128,6 +160,7 @@ The Lineage Builder submits serverless one-time jobs to construct transformation
 - **Single-flight coalescing** — bounded per-key lock pool prevents thundering herd
 - **Memory-bounded TTL cache** — 64MB max, configurable TTL
 - **Parallel SQL** — thread pool for concurrent edge/category queries
+- **Captured-Plan Precedence enrichment (2.4.0)** — when the `column_transformation.captured_plan_precedence` flag is on, the frontend additionally calls `GET /api/transform/captured-expression` (backed by `backend/plan_capture_service.get_captured_expression`) to show a runtime-captured expression alongside the result of this read path. This is additive only — it does not change what `backtrack_transform_lineage()` itself returns. See docs/architecture.md §3 and §5 for the full scope decision and its follow-up.
 
 ### 4.3 Pipeline (`transformation_lineage/pipeline.py`)
 
@@ -153,6 +186,7 @@ The transformation lineage pipeline:
 | BuildProgress | `BuildProgress.tsx` | Real-time job progress with step DAG |
 | PruningControls | `PruningControls.tsx` | **Category filter + path isolation** (the depth slider was removed — the popup always shows the column's full end-to-end lineage) |
 | AdminDashboard | `AdminDashboard.tsx` | Ops dashboard + **Flush cache** / **Wipe lineage** invalidate controls (`POST /api/transform/invalidate`) |
+| ControlPanel (2.4.0) | `control-panel/ControlPanel.tsx` | Admin-gated toggles for Runtime Plan Capture, Captured-Plan Precedence, Federated Sync, with per-flag access-requirement checks |
 
 ---
 
@@ -166,11 +200,15 @@ Transformation lineage is only as good as the engine's ability to find the *code
 4. **PIPELINE / DLT** — resolve a Lakeflow/DLT pipeline via `pipelines.get(...).spec.libraries` to its notebook/file libraries. Python-defined DLT (`@dlt.table` / `@dlt.view`) is handled by the AST parser where `SHOW CREATE TABLE` cannot help.
 5. **Query-history fallback** — tables with **no tracked producing entity** (ad-hoc SQL / SQL editor / scripts → `entity_type=NULL` in `column_lineage`) are recovered from `system.query.history`: the latest FINISHED write statement whose parsed output equals the target is parsed. *Identity-scoped* — the build SP only sees query history it has visibility into; otherwise the table degrades to a `no_producing_query` skip. (`extraction/pipeline.py:_extract_from_query_history`)
 
+**Runtime Plan Capture (2.4.0, opt-in, separate module)** is a complementary, not competing, sixth path: rather than parsing *source code*, it captures Spark's actual Analyzed Logical Plan at execution time inside a pipeline that has explicitly opted in (see docs/capabilites.md). It is read by the app only via `backend/plan_capture_service.py`, gated by its own feature flag, and does not participate in the `transformation_lineage/` pipeline's extraction/parse/graph flow described above.
+
 ### 4.6 Dedicated Lineage Store (Option A)
 
 All transformation-lineage Delta tables live in one app-SP-owned schema, `LINEAGE_CATALOG.LINEAGE_SCHEMA` (env vars; default `lattice_lineage.lineage` — **override per deployment**, see §8). Node ids embed the real data catalog (`col:<catalog>.<schema>.<table>::<col>`), so the build SP needs **CREATE/MODIFY only on the dedicated store — zero write on any data catalog**.
 
 The store has **12 Delta tables** (`storage/schema.py`): `lineage_nodes`, `lineage_edges`, `lineage_edge_endpoints` (the serve table), `lineage_raw_code`, `lineage_code_versions`, `lineage_parse_metrics`, `lineage_graph_cache`, `lineage_reconciliation`, `lineage_extraction_reports`, `lineage_sublineage_cache`, `lineage_notebook_path_cache`, and `lineage_pyspark_to_sql_cache`. A global **Wipe lineage** clears the lineage tables (including `code_versions`, so rebuilds fully re-parse) but retains the two expensive caches (`notebook_path_cache`, `pyspark_to_sql_cache`).
+
+**2.4.0 adds five more tables to this same app-owned schema** (same ownership model, same "zero write on data catalogs" guarantee): `feature_flags`, `feature_flags_audit`, `captured_plans`, `captured_cdc_specs`, `federated_peers`. See docs/architecture.md §1 for the full data-flow diagram.
 
 ---
 
@@ -199,6 +237,18 @@ The store has **12 Delta tables** (`storage/schema.py`): `lineage_nodes`, `linea
 | GET | `/api/transform/categories` | Category→color mapping |
 | GET | `/api/transform/build-configured` | Check if pipeline is configured |
 | POST | `/api/transform/invalidate?scope=cache\|table\|all` | Invalidate transform cache / wipe stored lineage (admin) |
+| GET | `/api/transform/captured-expression?...` | (2.4.0) Runtime-captured expression for a column, or `{"captured": null}` when unavailable/disabled |
+
+### Control Panel (2.4.0)
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/control-panel/flags` | All capability flags + live enabled state |
+| POST | `/api/control-panel/flags/{flag_id}` | Enable/disable a capability (admin) |
+| GET | `/api/control-panel/access-check/{flag_id}` | Best-effort live check of a flag's access requirements |
+| GET | `/api/control-panel/plan-capture/status` | Runtime Plan Capture status card (counts, reachability) |
+| GET | `/api/control-panel/federated/status` | Federated Sync status card (peer/overlap counts) |
+| GET | `/api/control-panel/federated/peers` | List registered federated peers |
+| POST | `/api/control-panel/federated/peers` | Register a federated peer (admin) |
 
 ### Delta Sharing
 | Method | Path | Description |
@@ -264,6 +314,8 @@ The store has **12 Delta tables** (`storage/schema.py`): `lineage_nodes`, `linea
 | Token abuse | SHA256 hashed tokens for rate-limit keys; LRU-bounded cache |
 | Non-admin accessing admin APIs | 403 with identity check via `x-forwarded-access-token` |
 | Startup failures | Performance patches are non-fatal; app continues without them |
+| Feature-flag table not created yet (2.4.0) | `list_flags()`/`get_flag_state()` degrade to all-disabled rather than raising — see docs/testing_plan_for_Combined_App.md §1 |
+| Ops kill switch set (2.4.0) | `get_flag_state()` returns `False` regardless of the persisted DB value — takes effect without a warehouse round-trip |
 
 ---
 
@@ -272,7 +324,7 @@ The store has **12 Delta tables** (`storage/schema.py`): `lineage_nodes`, `linea
 ```bash
 # Deploy to dev
 databricks bundle deploy -t dev --profile <profile> --var warehouse_id=<id>
-databricks bundle run lineage-explorer -t dev --profile <profile>
+databricks bundle run brickroute -t dev --profile <profile>
 
 # Deploy to prod
 databricks bundle deploy -t prod --profile <profile> --var warehouse_id=<id>
@@ -291,7 +343,7 @@ GRANT SELECT ON TABLE system.query.history TO `<app-spn>`;        -- query-histo
 -- Dedicated lineage store (Option A): the build SP owns ONE schema and needs no write on data catalogs:
 GRANT ALL PRIVILEGES ON SCHEMA <LINEAGE_CATALOG>.<LINEAGE_SCHEMA> TO `<app-spn>`;
 ```
-> **Option A:** transformation-lineage tables are written only to `LINEAGE_CATALOG.LINEAGE_SCHEMA`; node ids embed the real data catalog, so the build SP needs **zero write** on any data catalog. `system.query.history` is identity-scoped — without account-admin-level visibility the query-history fallback only sees the SP's own queries, so entity-less tables produced by other users won't resolve.
+> **Option A:** transformation-lineage tables are written only to `LINEAGE_CATALOG.LINEAGE_SCHEMA`; node ids embed the real data catalog, so the build SP needs **zero write** on any data catalog. `system.query.history` is identity-scoped — without account-admin-level visibility the query-history fallback only sees the SP's own queries, so entity-less tables produced by other users won't resolve. The same `ALL PRIVILEGES` grant on `LINEAGE_CATALOG.LINEAGE_SCHEMA` already covers the five new 2.4.0 tables (`feature_flags`, `feature_flags_audit`, `captured_plans`, `captured_cdc_specs`, `federated_peers`) — no additional grant is required for Control Panel / Runtime Plan Capture / Federated Sync themselves. A pipeline opting into Runtime Plan Capture separately needs `CAN_MANAGE`/`CAN_MANAGE_RUN` on itself — see docs/capabilites.md.
 
 ### Environment Variables
 | Variable | Default | Description |
@@ -308,6 +360,9 @@ GRANT ALL PRIVILEGES ON SCHEMA <LINEAGE_CATALOG>.<LINEAGE_SCHEMA> TO `<app-spn>`
 | `BUILD_CACHE_TTL_HOURS` | `24` | Hours before lineage is stale |
 | `ADMIN_GROUP_NAME` | `admins` | Group for admin access |
 | `RATE_LIMIT_MAX_REQUESTS` | `60` | Max requests/user/window |
+| `ENABLE_PLAN_CAPTURE` | `true` | (2.4.0) Ops kill switch — set `false` to force Runtime Plan Capture off regardless of the Control Panel toggle |
+| `ENABLE_CAPTURED_PLAN_PRECEDENCE` | `true` | (2.4.0) Ops kill switch for Captured-Plan Precedence |
+| `ENABLE_FEDERATED_SYNC` | `true` | (2.4.0) Ops kill switch for Federated Sync |
 
 > **Build-job parameters** (set by `build_service.py`, read by `notebooks/run_pipeline.py`) are separate from app env vars: `TARGET_CATALOG`/`TARGET_SCHEMA`, `KPI_TABLES`, `BUILD_ONLY`, `FORCE_REPARSE`, `DISCOVERY_LOOKBACK_HOURS` (default 1080 = 45 days), `SRC_PATH`. Entity types discovered: `JOB, NOTEBOOK, PIPELINE`.
 
@@ -322,3 +377,4 @@ GRANT ALL PRIVILEGES ON SCHEMA <LINEAGE_CATALOG>.<LINEAGE_SCHEMA> TO `<app-spn>`
 - **Admin gating**: Group membership check via user's own OAuth token
 - **Error sanitization**: Internal paths/SQL never exposed in API responses
 - **No row data access**: App reads only metadata + system tables
+- **Control Panel write-gating (2.4.0)**: `POST /api/control-panel/flags/{flag_id}` and `POST /api/control-panel/federated/peers` use the same admin group-membership check as the existing `/api/cache/invalidate`; reading flags/status is open to any authenticated user.
