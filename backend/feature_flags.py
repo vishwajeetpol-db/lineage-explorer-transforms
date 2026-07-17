@@ -139,6 +139,103 @@ FLAG_DEFINITIONS: list[dict] = [
 _flags_by_id = {f["id"]: f for f in FLAG_DEFINITIONS}
 
 
+# ---------------------------------------------------------------------------
+# Cap 31 — Live billing signals for cost/risk badges
+#
+# Computes actual DBU cost from system.billing.usage for each capability's
+# specific write patterns, replacing the static editorial "cost: medium" ratings
+# on Control Panel cards.
+#
+# system.billing.usage row format (relevant columns):
+#   usage_date, sku_name, usage_quantity (DBUs), pricing_unit ("DBU"), list_price ($/DBU)
+# We look at usage associated with the app SPN's job runs that write to the
+# capability-specific tables.
+# ---------------------------------------------------------------------------
+
+_CAPABILITY_WRITE_TABLE_MAP: dict[str, list[str]] = {
+    "lineage_tracking.plan_capture": [
+        f"{FLAGS_TABLE.rsplit('.', 2)[0]}.captured_plans",
+        f"{FLAGS_TABLE.rsplit('.', 2)[0]}.captured_cdc_specs",
+    ],
+    "column_transformation.captured_plan_precedence": [
+        f"{FLAGS_TABLE.rsplit('.', 2)[0]}.captured_plans",
+    ],
+    "federated_sync.cross_workspace": [
+        f"{FLAGS_TABLE.rsplit('.', 2)[0]}.federated_peers",
+    ],
+}
+
+_LIVE_COST_CACHE: dict[str, tuple[float, str]] = {}  # flag_id -> (timestamp, cost_label)
+_LIVE_COST_LOCK = threading.Lock()
+_LIVE_COST_TTL = 3600  # 1 hour
+
+
+def get_capability_live_billing(flag_id: str) -> dict:
+    """Return a live billing summary for a capability's write patterns.
+
+    Queries system.billing.usage for DBU consumption associated with the
+    app SPN's jobs that write to the capability's app-owned tables over the
+    last 30 days.  Returns {cost_label, dbu_total, usd_estimate, window_days,
+    confidence} where confidence is 'live' or 'static' (fallback).
+
+    Non-fatal — always returns a result; falls back to the static editorial
+    rating when billing data is unavailable.
+    """
+    import time as _time
+    now = _time.time()
+
+    with _LIVE_COST_LOCK:
+        cached = _LIVE_COST_CACHE.get(flag_id)
+        if cached and (now - cached[0]) < _LIVE_COST_TTL:
+            return cached[1]
+
+    flag_def = _flags_by_id.get(flag_id, {})
+    static_cost = flag_def.get("cost", "medium")
+
+    try:
+        tables = _CAPABILITY_WRITE_TABLE_MAP.get(flag_id, [])
+        if not tables:
+            return {"cost_label": static_cost, "confidence": "static",
+                    "dbu_total": None, "usd_estimate": None, "window_days": 30}
+
+        table_names = ", ".join(f"'{t}'" for t in tables)
+        rows = _execute_sql(
+            f"SELECT "
+            f"  SUM(usage_quantity) AS total_dbu, "
+            f"  SUM(usage_quantity * list_price) AS total_usd "
+            f"FROM system.billing.usage "
+            f"WHERE usage_date >= dateadd(DAY, -30, current_date()) "
+            f"  AND custom_tags.brickroute_target_table IN ({table_names})"
+        )
+        r = rows[0] if rows else {}
+        dbu = float(r.get("total_dbu") or 0.0)
+        usd = float(r.get("total_usd") or 0.0)
+
+        # Map DBU total to cost label
+        if dbu < 1.0:
+            cost_label = "low"
+        elif dbu < 10.0:
+            cost_label = "medium"
+        else:
+            cost_label = "high"
+
+        result = {
+            "cost_label": cost_label,
+            "confidence": "live",
+            "dbu_total": round(dbu, 3),
+            "usd_estimate": round(usd, 4),
+            "window_days": 30,
+        }
+    except Exception as e:
+        logger.debug(f"feature_flags: live billing unavailable for {flag_id}: {e}")
+        result = {"cost_label": static_cost, "confidence": "static",
+                  "dbu_total": None, "usd_estimate": None, "window_days": 30}
+
+    with _LIVE_COST_LOCK:
+        _LIVE_COST_CACHE[flag_id] = (now, result)
+    return result
+
+
 def _execute_sql(sql: str) -> list[dict]:
     if not WAREHOUSE_ID:
         raise RuntimeError("No SQL warehouse available. Set DATABRICKS_WAREHOUSE_ID.")

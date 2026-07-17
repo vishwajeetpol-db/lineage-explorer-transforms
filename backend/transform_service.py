@@ -34,6 +34,33 @@ from cachetools import TTLCache
 from databricks.sdk.service.sql import StatementState
 
 from backend.lineage_service import _get_client
+
+# Cap 30: captured-plan BFS override — imported lazily to avoid circular imports
+# at module load time, only resolved when the feature flag is on.
+_plan_capture_svc = None
+
+def _get_captured_expression_for_node(
+    table_fqn: str, column: str
+):
+    """Return a captured plan override dict for (table_fqn, column), or None.
+
+    Lazily imports plan_capture_service the first time the flag is on so the
+    import never blocks startup when the flag is off. Non-fatal: returns None
+    on any error.
+    """
+    try:
+        from backend.feature_flags import get_flag_state
+        if not (get_flag_state("lineage_tracking.plan_capture") and
+                get_flag_state("column_transformation.captured_plan_precedence")):
+            return None
+        from backend import plan_capture_service as _pcs
+        parts = table_fqn.split(".")
+        if len(parts) != 3:
+            return None
+        return _pcs.get_captured_expression(parts[0], parts[1], parts[2], column)
+    except Exception:
+        return None
+
 from backend.models import (
     TransformNode,
     TransformEdge,

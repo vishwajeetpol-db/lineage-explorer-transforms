@@ -89,6 +89,118 @@ def register_federated_peer(peer_alias: str, share_name: str, direction: str, ac
     return {"peer_alias": peer_alias, "share_name": share_name, "direction": direction}
 
 
+# ---------------------------------------------------------------------------
+# Cap 32 — Live peer trust handshakes and peer-initiated sync jobs
+# ---------------------------------------------------------------------------
+
+def verify_peer_trust(peer_alias: str) -> dict:
+    """Attempt a live connectivity and metadata handshake with a registered peer.
+
+    Handshake protocol:
+      1. Load the peer record from federated_peers.
+      2. Look up the peer's share in the existing sharing overview to find the
+         provider workspace URL embedded in the Delta Sharing profile.
+      3. Issue a GET /shares/<share_name> against the provider REST endpoint
+         using the current SPN token to verify the share is reachable.
+      4. Return {reachable: bool, latency_ms: int, error: str|None}.
+
+    Non-fatal — always returns a dict.
+    """
+    import time as _time
+    base = {"peer_alias": peer_alias, "reachable": False, "latency_ms": None, "error": None}
+    if not get_flag_state("federated_sync.cross_workspace"):
+        base["error"] = "federated_sync flag is disabled"
+        return base
+    try:
+        peers = list_federated_peers()
+        peer = next((p for p in peers if p.get("peer_alias") == peer_alias), None)
+        if not peer:
+            base["error"] = f"No registered peer with alias '{peer_alias}'"
+            return base
+        share_name = peer.get("share_name")
+        if not share_name:
+            base["error"] = "Peer record has no share_name; cannot locate provider endpoint"
+            return base
+
+        # Try to verify via the Delta Sharing REST protocol (providers expose
+        # GET /shares/<name> on the sharing endpoint registered in the profile).
+        # We resolve the endpoint URL from the Unity Catalog sharing view.
+        overview = get_sharing_overview(False)
+        provider_url = None
+        if isinstance(overview, dict):
+            for p_info in (overview.get("providers") or []):
+                if isinstance(p_info, dict) and p_info.get("name") == share_name:
+                    provider_url = p_info.get("sharing_server_url")
+                    break
+
+        if not provider_url:
+            # Cannot verify without a known endpoint; mark as unverifiable
+            base["reachable"] = None  # type: ignore[assignment]  # None = unknown
+            base["error"] = "Provider endpoint URL not found in sharing overview; verification skipped"
+            return base
+
+        # Live HTTP probe
+        import urllib.request
+        client = _get_client()
+        token = client.config.token or ""
+        probe_url = f"{provider_url.rstrip('/')}/shares/{share_name}"
+        req = urllib.request.Request(
+            probe_url,
+            headers={"Authorization": f"Bearer {token}"},
+            method="GET",
+        )
+        t0 = _time.time()
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            _ = resp.read()
+        latency_ms = int((_time.time() - t0) * 1000)
+        base["reachable"] = True
+        base["latency_ms"] = latency_ms
+        return base
+    except Exception as e:
+        base["reachable"] = False
+        base["error"] = str(e)[:200]
+        return base
+
+
+def trigger_peer_sync_job(peer_alias: str, actor: str) -> dict:
+    """Trigger a Lakeflow Job that executes the cross-workspace sync for a peer.
+
+    The sync job is expected to be a pre-configured Lakeflow Job whose name
+    is stored as a `sync_job_id` in the federated_peers table, or whose name
+    follows the convention `brickroute_federated_sync_<peer_alias>`.
+
+    Returns {job_id, run_id, run_url} on success, or {error} on failure.
+    Non-fatal.
+    """
+    if not get_flag_state("federated_sync.cross_workspace"):
+        return {"error": "federated_sync flag is disabled"}
+    try:
+        peers = list_federated_peers()
+        peer = next((p for p in peers if p.get("peer_alias") == peer_alias), None)
+        if not peer:
+            return {"error": f"No registered peer with alias '{peer_alias}'"}
+
+        # Resolve job: check for a stored sync_job_id column (forward-compatible)
+        job_id_str = peer.get("sync_job_id")
+        client = _get_client()
+        if not job_id_str:
+            # Try to find by naming convention
+            job_name = f"brickroute_federated_sync_{peer_alias}"
+            jobs = list(client.jobs.list(name=job_name))
+            if not jobs:
+                return {"error": f"No sync job found for peer '{peer_alias}'. Create a job named '{job_name}' or add a sync_job_id column to {PEERS_TABLE}."}
+            job_id_str = str(jobs[0].job_id)
+
+        run = client.jobs.run_now(job_id=int(job_id_str))
+        run_id = run.run_id
+        run_url = f"{client.config.host.rstrip('/')}/#job/{job_id_str}/run/{run_id}"
+        logger.info(f"federated_sync: triggered sync job {job_id_str} run {run_id} for peer {peer_alias} by {actor}")
+        return {"job_id": job_id_str, "run_id": run_id, "run_url": run_url}
+    except Exception as e:
+        logger.warning(f"federated_sync: trigger_peer_sync_job failed for {peer_alias}: {e}")
+        return {"error": str(e)[:300]}
+
+
 def get_federated_sync_status() -> dict:
     """Guarded status for the Control Panel card — never raises. Cross-references
     registered peers against the existing sharing overview's known share/foreign

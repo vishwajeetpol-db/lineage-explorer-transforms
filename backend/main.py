@@ -72,6 +72,18 @@ from backend.feature_flags import list_flags, set_flag_state, check_access_requi
 from backend.plan_capture_service import get_plan_capture_status, get_captured_expression
 from backend.federated_sync import get_federated_sync_status, list_federated_peers, register_federated_peer
 
+# --- Routers for capabilities 17-36 ---
+from backend.routes.governance import router as governance_router
+from backend.routes.impact import router as impact_router
+from backend.routes.observability import router as observability_router
+from backend.routes.access import router as access_router
+from backend.routes.ml import router as ml_router
+from backend.routes.discovery import router as discovery_router
+from backend.routes.dq import router as dq_router
+from backend.routes.lineage import router as lineage_ext_router, analyze_router
+from backend.routes.pipeline_installer import router as pipeline_installer_router
+from backend.routes.diagnostics import router as diagnostics_router
+
 class _JsonLogFormatter(logging.Formatter):
     """Structured JSON logs — one line per record so downstream log queries
     (Databricks app logs, Datadog, etc.) can filter by level/logger/message."""
