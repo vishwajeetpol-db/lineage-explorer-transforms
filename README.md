@@ -1,4 +1,4 @@
-# NEXUS Lineage
+# NEXUS Lineage App
 
 **Unified lineage visualization with transformation drill-down** — end-to-end table & column lineage, expression-level transformation graphs, pipeline/job visibility, serverless cost, and Delta Sharing, across every catalog in your metastore. One command to deploy; zero access to your row data.
 
