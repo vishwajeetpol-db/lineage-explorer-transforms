@@ -18,7 +18,7 @@
   <img src="https://img.shields.io/badge/TypeScript-3178C6?style=flat&logo=typescript&logoColor=white" alt="TypeScript"/>
   <img src="https://img.shields.io/badge/Databricks_Apps-FF3621?style=flat&logo=databricks&logoColor=white" alt="Databricks"/>
   <img src="https://img.shields.io/badge/ELK.js-layout-orange" alt="ELK.js"/>
-  <img src="https://img.shields.io/badge/version-2.4.0-6366F1" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-2.5.0-6366F1" alt="Version"/>
 </p>
 
 ---
@@ -45,14 +45,25 @@ This is the user-visible capability inventory. `docs/capability_code_map.md` is 
 - **Excel export + preview.** Export lineage as a styled multi-sheet `.xlsx` (`GET /api/lineage/export`) and preview the rows in-app before download.
 - **Scales to thousands of users on one query** — request coalescing + a memory-bounded LRU/TTL cache mean the warehouse is barely touched.
 - **Metadata-only access** — the app reads `BROWSE` + system tables, never your table data. Transformation-lineage builds write only to one dedicated app-owned schema — never to your data catalogs.
-- **Control Panel (v2.4.0)** — an admin-gated toggle center for three opt-in capabilities, all OFF by default: **Runtime Plan Capture** (captures Spark's exact per-column expression at execution time — the only path for transformation logic the static parser can't read from source), **Captured-Plan Precedence** (surfaces that captured expression in the transformation drill-down), and **Federated Sync** (a curated registry of known peer workspaces layered on the existing Delta Sharing overlay). Every user can see what each capability does and its access requirements; only workspace admins can flip a toggle. See [docs/capabilites.md](docs/capabilites.md).
+- **Control Panel (v2.4.0)** — an admin-gated toggle center for opt-in capabilities, all OFF by default: **Runtime Plan Capture**, **Captured-Plan Precedence**, and **Federated Sync**. Every user can see what each capability does and its access requirements; only workspace admins can flip a toggle. See [docs/capabilites.md](docs/capabilites.md).
+- **Governance & classification (v2.5.0)** — ownership + column sensitivity from `information_schema` + app-owned rules; downstream sensitivity propagation. (`GET /api/governance`)
+- **Impact analysis / blast radius (v2.5.0)** — BFS walk over `system.access.table_lineage` enumerating all downstream tables with owner and sensitivity enrichment. (`GET /api/impact`)
+- **Observability / run health (v2.5.0)** — per-entity success-rate and failure counts from `system.lakeflow.job_run_timeline` / `pipeline_update_timeline`. (`GET /api/observability`)
+- **Access & security lineage (v2.5.0)** — declared UC grants joined with empirical access from `system.access.audit`; surfaces dormant grants. (`GET /api/access`)
+- **AI/ML lineage (v2.5.0)** — serving endpoint inventory, daily usage, and model→training-data lineage. (`GET /api/ml/endpoints`, `/api/ml/models-for-table`)
+- **Search & discovery (v2.5.0)** — full-text UC asset search, PII/sensitive-column finder, orphan-table detector. (`GET /api/search`, `/api/discover/sensitive`, `/api/discover/orphans`)
+- **Data quality rules (v2.5.0)** — per-column DQ expectations (NOT_NULL, UNIQUE, RANGE, REGEX, CUSTOM) persisted in an app-owned Delta table, separate from pipeline expectations. (`GET|POST|DELETE /api/dq-rules`)
+- **Diagnostics suite (v2.5.0)** — root-cause tracing from a failing column (`POST /api/diagnostics/root-cause`), SCD/CDC spec viewer (`GET /api/diagnostics/scd`), schema-change / breaking-change detector (`GET /api/diagnostics/schema-changes`), column profiling overlay (`GET /api/diagnostics/profile`), live billing for Control Panel cards (`GET /api/diagnostics/billing/{flag_id}`), and live federated peer trust handshakes + sync triggering (`GET|POST /api/diagnostics/federated/...`).
+- **LLM producer source analysis (v2.5.0)** — fetches producer source code and calls the workspace LLM to infer per-column transformations; results versioned in an app-owned `producer_analysis` store. (`POST /api/analyze-producer`)
+- **Automated pipeline capture installer (v2.5.0)** — admin action that injects the `%pip install` + `capture()` cells into a pipeline notebook via the Workspace API (idempotent). (`POST /api/pipeline/install-capture`)
+- **BFS captured-plan precedence override (v2.5.0)** — when both plan-capture flags are enabled, runtime-captured expressions now *override* (not just augment) the BFS walk in `backtrack_transform_lineage`. (no new route — `transform_service._get_captured_expression_for_node`)
 
 ## Quick start
 
 Deploying to your own workspace is a short ordered checklist — not every step is automated, so follow them in order. Run `/api/diagnostics` at the end to confirm.
 
 **0. Account-admin prerequisites** (do these once, before deploying):
-- **Enable system tables** (Account console → Settings → System tables): `system.access` (lineage — *required*, the #1 "empty app" cause if missing), `system.billing` (cost), `system.information_schema` (Delta Sharing).
+- **Enable system tables** (Account console → Settings → System tables): `system.access` (lineage — *required*, the #1 "empty app" cause if missing), `system.billing` (cost), `system.information_schema` (Delta Sharing), `system.lakeflow` (observability), `system.serving` (ML lineage).
 - A **SQL warehouse** (serverless or pro) and **Unity Catalog**. Databricks CLI **v0.239+**.
 
 **1. Deploy** (creates the app + its service principal):
@@ -73,7 +84,7 @@ Or do it by hand: fill the `:APP_SP` / `:CATALOG` placeholders in **[`setup.sql`
 
 **4. Verify** — open `https://<app-url>/api/diagnostics`. It reports exactly which prerequisites the SP can reach (warehouse, `system.access`, `system.billing`, `information_schema`, catalog BROWSE), so a misconfigured deploy surfaces a clear reason instead of an empty graph.
 
-**5. (Optional) Enable an opt-in capability** — open the app, click the header menu → **Control Panel**, and as a workspace admin toggle on Runtime Plan Capture, Captured-Plan Precedence, and/or Federated Sync. All three are OFF by default and take no action on their own until you also complete the capability-specific setup described in [docs/capabilites.md](docs/capabilites.md) (e.g. adding a capture call to a pipeline notebook, or registering a federated peer).
+**5. (Optional) Enable opt-in capabilities** — open the app, click the header menu → **Control Panel**, and as a workspace admin toggle on Runtime Plan Capture, Captured-Plan Precedence, and/or Federated Sync. All are OFF by default. See [docs/capabilites.md](docs/capabilites.md) for setup steps. The v2.5.0 API capabilities (governance, impact, observability, access, ML, discovery, DQ, diagnostics) are always-on — no toggle required.
 
 ## Documentation
 
@@ -99,6 +110,17 @@ The full reference lives in **[docs/REFERENCE.md](docs/REFERENCE.md)**:
 | [Capabilities catalog](docs/capabilites.md) | What each Control Panel toggle does, access requirements, pipeline opt-in steps |
 | [Capability → code map](docs/capability_code_map.md) | Top-level capability families mapped to their backend routes, service functions, frontend entries, and key data tables — for fast debugging |
 | [Testing plan](docs/testing_plan_for_Combined_App.md) | Unit tests, frontend checks, and a manual QA checklist for the additions above |
+
+**New in v2.5.0** — Governance, impact, observability, access, ML lineage, discovery, DQ, LLM analysis, diagnostics suite:
+
+| Topic | |
+|---|---|
+| [Capability → code map (caps 17-36)](docs/capability_code_map.md) | Routes, service functions, system-table sources, frontend entries, and debug checklists for all 20 new capabilities |
+| [Capabilities catalog](docs/capabilites.md) | Updated: live billing badges (cap 31), live federated trust (cap 32), BFS override (cap 30), pipeline installer (cap 29) |
+| `/api/diagnostics` router | Caps 29-36 consolidated under `backend/routes/diagnostics.py` (`prefix="/api/diagnostics"`) |
+| `/api/governance`, `/api/impact`, `/api/observability`, `/api/access`, `/api/ml`, `/api/search`, `/api/dq-rules` | Dedicated `APIRouter` modules for caps 17-23, all registered in `backend/main.py` lines 75-85 |
+| `/api/lineage/column-path`, `/api/lineage/entities`, `/api/lineage/freshness`, `/api/analyze-producer` | Caps 24-28 via `backend/routes/lineage.py` (`lineage_ext_router` + `analyze_router`) |
+| `/api/pipeline/install-capture` | Cap 29 via `backend/routes/pipeline_installer.py` |
 
 `docs/ARCHITECTURE.md` (the pre-existing, all-caps reference covering the core lineage/transformation engine) has been updated for v2.4.0 as well — its new §1.2 links out to the docs above rather than duplicating them.
 
