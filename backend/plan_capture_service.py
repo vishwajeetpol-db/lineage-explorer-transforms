@@ -6,7 +6,7 @@ capture only happens inside a Lakeflow Job/Pipeline that has the vendored
 backend/plan_capture wheel/module installed and calls
 `plan_capture.capture(df, target)` before a write (see
 docs/capabilites.md for the opt-in steps). This module only *reads* what those
-jobs already wrote, and only when the flag is on.
+jobs already wrote, and only when the relevant flags are on.
 """
 from __future__ import annotations
 
@@ -27,6 +27,8 @@ CAPTURED_PLANS_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.captured_plans"
 CAPTURED_CDC_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.captured_cdc_specs"
 WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")
+PLAN_CAPTURE_FLAG = "lineage_tracking.plan_capture"
+CAPTURED_PLAN_PRECEDENCE_FLAG = "column_transformation.captured_plan_precedence"
 
 
 def _execute_sql(sql: str) -> list[dict]:
@@ -47,7 +49,7 @@ def _execute_sql(sql: str) -> list[dict]:
 
 def get_plan_capture_status() -> dict:
     """Guarded status probe for the Control Panel card — never raises."""
-    enabled = get_flag_state("lineage_tracking.plan_capture")
+    enabled = get_flag_state(PLAN_CAPTURE_FLAG)
     status = {
         "enabled": enabled,
         "table_reachable": False,
@@ -78,7 +80,7 @@ def get_plan_capture_status() -> dict:
 
 def get_captured_expression(catalog: str, schema: str, table: str, column: str) -> Optional[dict]:
     """Best-effort: latest captured plan for the target table, parsed, matched to
-    `column`. Returns None (never raises) when the flag is off, the table is
+    `column`. Returns None (never raises) when the flags are off, the table is
     unreachable, or the column isn't present in the captured plan.
 
     Callers MUST validate catalog/schema/table/column (e.g. via
@@ -86,7 +88,7 @@ def get_captured_expression(catalog: str, schema: str, table: str, column: str) 
     interpolated into SQL, matching the convention used throughout
     lineage_service.py / transform_service.py.
     """
-    if not get_flag_state("lineage_tracking.plan_capture"):
+    if not (get_flag_state(PLAN_CAPTURE_FLAG) and get_flag_state(CAPTURED_PLAN_PRECEDENCE_FLAG)):
         return None
     target = f"{catalog}.{schema}.{table}"
     try:

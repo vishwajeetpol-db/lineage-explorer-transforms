@@ -27,17 +27,23 @@ Unity Catalog captures lineage from every SQL operation — but reading it means
 
 ## Features
 
-- **Expression-level transformation lineage — the part that's genuinely unique.** Unity Catalog records that "column A depends on column B." BrickRoute goes a layer deeper and reconstructs the **actual SQL/PySpark expression** that produced each column — `cast`, `sum`, `concat`, `CASE`, window functions, CTE chains — tagged with a transform category, by genuinely **parsing the producing code**. Coverage spans every producer type: notebook/Python/SQL-file jobs, Python- and SQL-defined DLT pipelines, view/materialized-view/streaming-table definitions, and ad-hoc query history. Click any column → see *how* it was derived, traced upstream. *(See [docs/DESIGN.md](docs/DESIGN.md).)*
-- **Transformation lineage diagnostics** — when a build materialises nothing, the app explains *why* instead of a generic "not generated yet": no producing pipeline found (source/ingested table), producer last ran outside the discovery window (with the exact age), or producer source couldn't be read (with the missing permission). Each reason includes a suggested fix. (`GET /api/transform/diagnose`)
+This is the user-visible capability inventory. `docs/capability_code_map.md` is a debugging index of top-level capability families and code anchors, not an exhaustive list of every UX surface, route, or always-on workflow.
+
+- **Landing explorer + browse flows.** Browse catalogs, schemas, and tables; open schema-wide or catalog-wide lineage from picker flows; use recents and global search to jump back into prior objects quickly.
+- **Deep-link routing for every major surface.** `?table=catalog.schema.table` opens table lineage directly; `?view=schemaLineage` and `?view=catalogLineage` open broader scopes; `?admin=true` opens the ops dashboard; `?controlPanel=true` opens the Control Panel.
 - **Select anything → full end-to-end lineage.** Pick any table (search or browse) and it auto-traces the complete lineage cone — every upstream source back to every downstream target — **across all catalogs and schemas**, with the mediating pipeline/job nodes. No buttons to press; the only control is the view mode.
+- **Three view modes + depth control.** Switch between **Tables**, **Pipelines**, or **Full**, then cap the rendered graph to N table hops when you want a local slice instead of the whole cone.
+- **In-graph exploration tools.** Cmd/Ctrl+K graph search, drag-to-rearrange, reset/fit-view behavior, hover tooltips, orphan highlighting, and large-graph layout retries are built in.
 - **Column-level lineage** traced from real `system.access.column_lineage` edges — no name-matching heuristics, zero false positives.
+- **Cross-schema / cross-catalog node enrichment.** External-in-scope tables render as distinct nodes with full metadata and remain expandable/clickable for lineage tracing rather than collapsing into anonymous placeholders.
+- **Expression-level transformation lineage — the part that's genuinely unique.** Unity Catalog records that "column A depends on column B." BrickRoute goes a layer deeper and reconstructs the **actual SQL/PySpark expression** that produced each column — `cast`, `sum`, `concat`, `CASE`, window functions, CTE chains — tagged with a transform category, by genuinely **parsing the producing code**. Coverage spans every producer type: notebook/Python/SQL-file jobs, Python- and SQL-defined DLT pipelines, view/materialized-view/streaming-table definitions, and ad-hoc query history. Click any column → see *how* it was derived, traced upstream. *(See [docs/DESIGN.md](docs/DESIGN.md).)*
+- **Transformation freshness + on-demand Lineage Builder.** The transform panel checks whether a table's transformation lineage exists or is stale, can submit a build/regenerate job, and polls build progress when serverless build execution is configured.
+- **Transformation lineage diagnostics** — when a build materialises nothing, the app explains *why* instead of a generic "not generated yet": no producing pipeline found (source/ingested table), producer last ran outside the discovery window (with the exact age), or producer source couldn't be read (with the missing permission). Each reason includes a suggested fix. (`GET /api/transform/diagnose`)
 - **Delta Sharing, always in the picture.** Shared-in sources and shared-out targets show up as part of lineage (with provider/recipient boundary nodes). The trace stops honestly at the metastore boundary — we can't read the other account.
 - **Serverless cost on pipeline/job nodes** — 30-day list price from `system.billing`, with a client-side discount control.
-- **Three view modes** — Tables, Pipelines, or Full.
+- **Admin live mode + built-in ops dashboard** (P50/P95/P99 latency, memory, cache inventory, manual eviction, request metrics, and transformation-lineage invalidate controls).
+- **Excel export + preview.** Export lineage as a styled multi-sheet `.xlsx` (`GET /api/lineage/export`) and preview the rows in-app before download.
 - **Scales to thousands of users on one query** — request coalescing + a memory-bounded LRU/TTL cache mean the warehouse is barely touched.
-- **Admin live mode + built-in ops dashboard** (P50/P95/P99 latency, memory, cache inventory, transformation-lineage invalidate controls).
-- **Excel export** — styled multi-sheet `.xlsx` of the lineage data (`GET /api/lineage/export`).
-- **Deep-link embeddable** — `?table=catalog.schema.table` from any dashboard or tool.
 - **Metadata-only access** — the app reads `BROWSE` + system tables, never your table data. Transformation-lineage builds write only to one dedicated app-owned schema — never to your data catalogs.
 - **Control Panel (v2.4.0)** — an admin-gated toggle center for three opt-in capabilities, all OFF by default: **Runtime Plan Capture** (captures Spark's exact per-column expression at execution time — the only path for transformation logic the static parser can't read from source), **Captured-Plan Precedence** (surfaces that captured expression in the transformation drill-down), and **Federated Sync** (a curated registry of known peer workspaces layered on the existing Delta Sharing overlay). Every user can see what each capability does and its access requirements; only workspace admins can flip a toggle. See [docs/capabilites.md](docs/capabilites.md).
 
@@ -91,7 +97,7 @@ The full reference lives in **[docs/REFERENCE.md](docs/REFERENCE.md)**:
 |---|---|
 | [Architecture of the new modules](docs/architecture.md) | Data flow, module boundaries, and an explicit Known Gaps list |
 | [Capabilities catalog](docs/capabilites.md) | What each Control Panel toggle does, access requirements, pipeline opt-in steps |
-| [Capability → code map](docs/capability_code_map.md) | Every capability (new and pre-existing) mapped to its exact backend route, service function, frontend component, and data table — for fast debugging |
+| [Capability → code map](docs/capability_code_map.md) | Top-level capability families mapped to their backend routes, service functions, frontend entries, and key data tables — for fast debugging |
 | [Testing plan](docs/testing_plan_for_Combined_App.md) | Unit tests, frontend checks, and a manual QA checklist for the additions above |
 
 `docs/ARCHITECTURE.md` (the pre-existing, all-caps reference covering the core lineage/transformation engine) has been updated for v2.4.0 as well — its new §1.2 links out to the docs above rather than duplicating them.

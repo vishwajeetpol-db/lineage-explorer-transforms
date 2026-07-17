@@ -5,6 +5,7 @@
  * - Freshness status for the selected table
  * - Build job lifecycle (submit → poll → complete)
  * - Backtrack trace results (levels, nodes, edges)
+ * - Optional runtime-captured expression enrichment for the selected target column
  * - UI state (panel open/closed, selected column, loading states)
  * - Pruning controls (depth slider, category filter, path isolation)
  */
@@ -14,11 +15,13 @@ import {
   type TransformResponse,
   type FreshnessInfo,
   type BuildJobStatus,
+  type CapturedExpression,
   getTransformFreshness,
   getTransformTrace,
   submitTransformBuild,
   getBuildStatus,
   getTransformCategories,
+  getCapturedExpression,
 } from '../api/transform';
 
 export type TransformPanelState =
@@ -51,6 +54,10 @@ interface TransformState {
   traceResult: TransformResponse | null;
   traceLoading: boolean;
 
+  // Optional runtime-captured expression for the selected target column
+  capturedExpression: CapturedExpression | null;
+  capturedExpressionLoading: boolean;
+
   // Categories (for legend)
   categories: Record<string, string>;
 
@@ -74,6 +81,7 @@ interface TransformState {
   triggerBuild: (tableFqn: string, forceRebuild?: boolean) => Promise<void>;
   pollBuild: () => Promise<void>;
   loadTrace: (catalog: string, schema: string, table: string, column: string, depth?: number) => Promise<void>;
+  loadCapturedExpression: (catalog: string, schema: string, table: string, column: string) => Promise<void>;
   loadCategories: () => Promise<void>;
   reset: () => void;
 
@@ -98,6 +106,8 @@ const INITIAL_STATE = {
   buildPolling: false,
   traceResult: null,
   traceLoading: false,
+  capturedExpression: null,
+  capturedExpressionLoading: false,
   categories: {} as Record<string, string>,
   maxDepth: 8,
   hiddenCategories: new Set<string>(),
@@ -121,6 +131,8 @@ export const useTransformStore = create<TransformState>((set, get) => ({
       selectedTable: tableFqn,
       selectedColumn: column,
       traceResult: null,
+      capturedExpression: null,
+      capturedExpressionLoading: false,
       buildPolling: false,
       buildRunId: null,
       buildStatus: null,
@@ -140,6 +152,7 @@ export const useTransformStore = create<TransformState>((set, get) => ({
       }
 
       set({ freshness });
+      void get().loadCapturedExpression(catalog, schema, table, column);
 
       if (!freshness.exists || freshness.is_stale) {
         // Do NOT auto-build. Transformation lineage is an explicit, opt-in,
@@ -267,12 +280,30 @@ export const useTransformStore = create<TransformState>((set, get) => ({
         traceLoading: false,
         panelState: 'ready',
       });
+      void get().loadCapturedExpression(catalog, schema, table, column);
     } catch (err: any) {
       set({
         traceLoading: false,
         panelState: 'error',
         panelError: err.message || 'Failed to load transformation trace',
       });
+    }
+  },
+
+  loadCapturedExpression: async (catalog: string, schema: string, table: string, column: string) => {
+    const tableFqn = `${catalog}.${schema}.${table}`;
+    set({ capturedExpressionLoading: true });
+    try {
+      const capturedExpression = await getCapturedExpression(catalog, schema, table, column);
+      if (get().selectedTable !== tableFqn || get().selectedColumn !== column || get().panelState === 'closed') {
+        return;
+      }
+      set({ capturedExpression, capturedExpressionLoading: false });
+    } catch {
+      if (get().selectedTable !== tableFqn || get().selectedColumn !== column || get().panelState === 'closed') {
+        return;
+      }
+      set({ capturedExpression: null, capturedExpressionLoading: false });
     }
   },
 

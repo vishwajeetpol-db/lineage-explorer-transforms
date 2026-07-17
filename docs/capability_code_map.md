@@ -5,6 +5,12 @@
 > straight to the exact backend route, service function, frontend component, and data
 > table responsible — without grepping the whole tree.
 >
+> This is now the **implemented capability-family map for the combined app**, not just the
+> original 12-module addendum. It covers the broader app surfaces that were folded into
+> `/Workspace/Users/ayaskanta.ratha@databricks.com/lineage_app/lineage-explorer-transforms_combined`,
+> including browse flows, scoped lineage entrypoints, in-graph controls, and the LLM-backed
+> PySpark-expression enrichment stage used by transformation lineage builds.
+>
 > Every entry below is a real snippet (route decorator + signature, or the top of the
 > function) copied verbatim from the current source, not a paraphrase — line numbers are
 > current as of v2.4.0 but will drift as the files change; if a snippet doesn't match, the
@@ -23,9 +29,13 @@
 | 7 | Excel export | `GET /api/lineage/export` | `excel_export.build_lineage_workbook` | `api/client.ts → api.lineageExportUrl` | No |
 | 8 | Admin ops dashboard / live mode | `GET /api/admin/status`, `POST /api/admin/evict-cache`, `POST /api/cache/invalidate` | `lineage_service.get_cache_snapshot`, in-`main.py` metrics globals | `components/AdminDashboard.tsx` | Admin-gated |
 | 9 | Control Panel (flag registry) | `GET /api/control-panel/flags`, `POST /api/control-panel/flags/{flag_id}`, `GET /api/control-panel/access-check/{flag_id}` | `feature_flags.list_flags/set_flag_state/check_access_requirements` | `components/control-panel/ControlPanel.tsx`, `store/featureFlagStore.ts` | — (this *is* the flag system) |
-| 10 | Runtime Plan Capture | `GET /api/control-panel/plan-capture/status` (read); write path is out-of-process | `plan_capture_service.get_plan_capture_status`; `plan_capture/capture.py:capture()` | `components/control-panel/ControlPanel.tsx` (status card) | `lineage_tracking.plan_capture` |
-| 11 | Captured-Plan Precedence | `GET /api/transform/captured-expression` | `plan_capture_service.get_captured_expression` | `api/transform.ts → getCapturedExpression` | `column_transformation.captured_plan_precedence` |
+| 10 | Runtime Plan Capture plugin integration | `GET /api/control-panel/plan-capture/status` (read); write path is out-of-process | `plan_capture_service.get_plan_capture_status`; `plan_capture/capture.py:capture()` | `components/control-panel/ControlPanel.tsx` (status card) | `lineage_tracking.plan_capture` |
+| 11 | Captured-Plan Precedence | `GET /api/transform/captured-expression` | `plan_capture_service.get_captured_expression` | `store/transformStore.ts`, `components/transform/TransformPanel.tsx`, `api/transform.ts` | `column_transformation.captured_plan_precedence` |
 | 12 | Federated Sync | `GET /api/control-panel/federated/status`, `/federated/peers`, `POST /federated/peers` | `federated_sync.get_federated_sync_status/list_federated_peers/register_federated_peer` | `components/control-panel/ControlPanel.tsx` (status card) | `federated_sync.cross_workspace` |
+| 13 | LLM-assisted PySpark → SQL enrichment | *(pipeline build phase; no direct app route)* | `expression_enricher.enrich_pyspark_expressions` | surfaced through `components/transform/TransformPanel.tsx` after `getTransformTrace` | No (best-effort during build) |
+| 14 | Landing explorer & browse flows | `GET /api/tables`, `/api/catalogs`, `/api/schemas`, `/api/sharing/overview` | `lineage_service.list_all_tables/list_catalogs/list_schemas/get_sharing_overview` | `components/landing/Landing.tsx`, `components/browse/*` | No |
+| 15 | Deep-link routing & scoped lineage entrypoints | `GET /api/lineage`, `GET /api/lineage/trace` | `lineage_service.get_table_lineage/get_lineage_trace` | `hooks/useRouter.ts`, `App.tsx`, `components/landing/LineagePicker.tsx` | No |
+| 16 | In-graph exploration controls | *(frontend-only; consumes `/api/lineage*`, `/api/column-lineage`, `/api/sharing/overlay`)* | — | `components/graph/LineageCanvas.tsx`, `components/layout/Toolbar.tsx`, `components/ui/SearchDialog.tsx` | No |
 
 ---
 
@@ -182,7 +192,7 @@ Frontend: `frontend/src/components/graph/SharingNode.tsx` renders the synthetic 
 
 **Debug checklist**:
 * `SharingOverlay.available` is `False` when `system.information_schema` (shares/recipients/providers) isn't readable — check `setup.sql` grants, not this code, first.
-* This overlay is the same data source `federated_sync.get_federated_sync_status` cross-references (capability 12) — if the *overlay* itself is broken, Federated Sync's "reachable_overlap" count will also silently be wrong; fix this one first.
+* This overlay is the same data source `federated_sync.get_federated_sync_status` cross-references (capability 12) — if the *overlay* itself is broken, Federated Sync's `reachable_overlap` count will also silently be wrong; fix this one first.
 
 ---
 
@@ -295,7 +305,7 @@ Frontend: `frontend/src/store/featureFlagStore.ts` (state + `useFeatureFlagEnabl
 
 ---
 
-## 10. Runtime Plan Capture
+## 10. Runtime Plan Capture plugin integration
 
 **What breaks visibly**: status card shows `table_reachable: false` or zero counts after you thought you captured plans; a pipeline notebook's capture call silently does nothing.
 
@@ -341,16 +351,14 @@ async def api_transform_captured_expression(
 ):
     """Additive enrichment: the Runtime-Captured-Plan expression for one column..."""
 ```
-Depends on `lineage_tracking.plan_capture` (capability 10) being enabled too — `feature_flags.py`'s `depends_on: ["lineage_tracking.plan_capture"]` on this flag's definition is metadata only; the actual dependency enforcement is that `get_captured_expression` calls `get_flag_state("lineage_tracking.plan_capture")`, not its own flag id, notice this in `plan_capture_service.py`.
+Depends on *both* `lineage_tracking.plan_capture` and `column_transformation.captured_plan_precedence` being enabled — `plan_capture_service.get_captured_expression` now short-circuits unless both effective flag states are `True`.
 
-Frontend: `frontend/src/api/transform.ts`:
-```typescript
-export async function getCapturedExpression(...): Promise<CapturedExpression | null> { ... }
-```
+Frontend: `frontend/src/store/transformStore.ts` (`loadCapturedExpression`) → `frontend/src/components/transform/TransformPanel.tsx` (best-effort Runtime-captured card, shown in both the `needs_build` and `ready` panel states when available) → `frontend/src/api/transform.ts`.
 
 **Debug checklist**:
-* Confirm *both* `lineage_tracking.plan_capture` AND `column_transformation.captured_plan_precedence` are on — this endpoint's gate is actually keyed to the **plan_capture** flag inside `plan_capture_service.get_captured_expression`, so toggling only the precedence flag does nothing on the backend today; the precedence flag currently only exists to gate the frontend's decision to *call* this endpoint at all. If the frontend calls it without checking the precedence flag, that's the bug to fix — check `useFeatureFlagEnabled("column_transformation.captured_plan_precedence")` usage in the transform components.
-* Returns `null` (not an error) whenever there's no captured plan for that exact `target_full_name`, or the column name isn't present in the parsed plan — check `plan_capture_service.get_captured_expression`'s three early-return branches before assuming the parser is broken.
+* Confirm *both* `lineage_tracking.plan_capture` AND `column_transformation.captured_plan_precedence` are on — the backend returns `null` unless both effective flag states are enabled.
+* If Control Panel counts are non-zero but no Runtime-captured card appears, check `transformStore.loadCapturedExpression` and `TransformPanel.tsx` before blaming plan parsing — the frontend now fetches this best-effort alongside freshness/trace loads.
+* Returns `null` (not an error) whenever there's no captured plan for that exact `target_full_name`, or the column name isn't present in the parsed plan — check `plan_capture_service.get_captured_expression`'s early-return branches before assuming the parser is broken.
 
 ---
 
@@ -386,6 +394,147 @@ Frontend: status card in `ControlPanel.tsx` (`federatedSyncStatus`) via `control
 
 ---
 
+## 13. LLM-assisted PySpark → SQL enrichment
+
+**What breaks visibly**: a PySpark-derived transformation shows no SQL-normalized expression, or the displayed SQL form looks stale/wrong even though the build completed.
+
+Backend — `transformation_lineage/pipeline.py`:
+```python
+# ── Phase 8: Expression Enrichment (best-effort, non-blocking) ─────
+with _phase("expression enrichment (ai_query LLM)"):
+    try:
+        enrich_stats = enrich_pyspark_expressions(
+            spark,
+            pipeline_run_id=pipeline_run_id,
+            endpoints_table=tables["edge_endpoints"],
+            cache_table=tables["pyspark_to_sql_cache"],
+        )
+```
+
+Backend — `transformation_lineage/sublineage/expression_enricher.py`:
+```python
+"""Translate PySpark column expressions to SQL via Databricks `ai_query`."""
+DEFAULT_MODEL = "databricks-meta-llama-3-3-70b-instruct"
+
+def enrich_pyspark_expressions(...):
+    """Translate PySpark `expr` -> SQL `expr_sql` for the given pipeline run.
+    Returns counts: pending, translated, backfilled."""
+```
+
+Important scope note: this is **not** an LLM that invents lineage edges. It is a best-effort enrichment stage that translates already-discovered PySpark expressions into SQL text and backfills `expr_sql` for existing transformation-edge endpoints.
+
+Frontend: surfaced indirectly through `frontend/src/components/transform/TransformPanel.tsx` after `frontend/src/api/transform.ts → getTransformTrace`; there is no standalone app endpoint for this phase.
+
+**Debug checklist**:
+* If the lineage graph/column dependency is missing entirely, this stage is irrelevant — it only enriches expression text after the transformation build already found the edge.
+* Failures here are intentionally non-blocking (`logger.warning("expression enrichment failed (continuing): %s", e)`) — a successful build with missing SQL-normalized expressions can still be an LLM-enrichment failure.
+* The cache table is `lineage_pyspark_to_sql_cache`; stale/wrong repeats are usually a cache-content issue, not a route/UI issue.
+* This only runs for rows where `expr_lang = 'pyspark'` and `expr_sql IS NULL`; SQL-native expressions do not go through the LLM path at all.
+
+---
+
+## 14. Landing explorer & browse flows
+
+**What breaks visibly**: the landing page is empty, Browse/Schema lineage/Catalog lineage cards dead-end, or catalog/schema pickers look incomplete.
+
+Backend — `backend/main.py`:
+```python
+@app.get("/api/tables")
+async def api_list_tables():
+    """Return all tables across all catalogs (cached). Frontend filters client-side."""
+
+@app.get("/api/catalogs")
+async def api_list_catalogs(): ...
+
+@app.get("/api/schemas")
+async def api_list_schemas(catalog: str = Query(...)):
+    catalog = _validate_identifier(catalog, "catalog")
+```
+
+Backend — `backend/lineage_service.py`:
+```python
+def list_catalogs() -> list[str]: ...
+def list_all_tables() -> list[dict]: ...
+def list_schemas(catalog: str) -> list[str]: ...
+```
+
+Frontend: `frontend/src/components/landing/Landing.tsx`, `components/landing/LineagePicker.tsx`, `components/browse/CatalogListView.tsx`, `components/browse/SchemaListView.tsx`, plus `hooks/useRecents.ts`.
+
+**Debug checklist**:
+* Empty landing explorer almost always traces back to `GET /api/tables` returning nothing because accessible catalogs/schemas were filtered out or `BROWSE` is missing — rule out permissions before debugging React.
+* Schema/Catalog lineage picker flows rely on the same browse APIs plus the scope routes in capability 15; if the list renders but clicking through fails, the bug is probably routing/state, not listing.
+* The landing Sharing overview card also depends on `GET /api/sharing/overview`; if only that card is empty while tables load fine, debug capability 5, not browse listing.
+
+---
+
+## 15. Deep-link routing & scoped lineage entrypoints
+
+**What breaks visibly**: `?table=...` or `?view=schemaLineage` opens the wrong screen, browser history behaves strangely, or scoped lineage loads the wrong granularity.
+
+Frontend routing — `frontend/src/hooks/useRouter.ts`:
+```typescript
+export type Route =
+  | { view: "landing" }
+  | { view: "catalogs" }
+  | { view: "schemas"; catalog: string }
+  | { view: "tables"; catalog: string; schema: string }
+  | { view: "lineage"; table: string }
+  | { view: "schemaLineage"; catalog: string; schema: string }
+  | { view: "catalogLineage"; catalog: string }
+  | { view: "admin" }
+  | { view: "controlPanel" };
+```
+
+Backend entrypoints — `backend/main.py`:
+```python
+@app.get("/api/lineage")
+async def api_get_lineage(request: Request, catalog: str = Query(...), schema: str | None = Query(None), live: bool = Query(False)):
+    # schema is optional: omitting it builds catalog-wide lineage across all schemas
+    ...
+
+@app.get("/api/lineage/trace")
+async def api_lineage_trace(request: Request, table: str = Query(...), live: bool = Query(False)):
+    """End-to-end cross-catalog lineage trace from a single seed table."""
+```
+
+Frontend callers: `frontend/src/App.tsx` coordinates route → page selection; `components/landing/LineagePicker.tsx`, `components/browse/CatalogListView.tsx`, and `components/browse/SchemaListView.tsx` trigger `goLineage`, `goSchemaLineage`, and `goCatalogLineage`.
+
+**Debug checklist**:
+* `?table=catalog.schema.table` should land on the table-focused trace path (`/api/lineage/trace`), while `?view=schemaLineage` / `?view=catalogLineage` go through `/api/lineage` with schema optional. If the wrong graph shape appears, confirm the route parser first.
+* History/back-button bugs almost always live in `navigate()` / `routeToSearch()` / `parseRoute()` in `useRouter.ts`, not in the lineage services.
+* If scoped lineage works from in-app buttons but fails from pasted URLs, the bug is route parsing/encoding, not backend lineage logic.
+
+---
+
+## 16. In-graph exploration controls
+
+**What breaks visibly**: view-mode toggles do nothing, depth filtering is wrong, Cmd/Ctrl+K search fails to center a node, or reset/fitView behaves badly on large graphs.
+
+Frontend state — `frontend/src/store/lineageStore.ts` tracks:
+```typescript
+lineageView: "full" | "table" | "pipeline"
+lineageDepth: number
+columnLineageEnabled: boolean
+expandedNodes: Set<string>
+selectedNode: ...
+selectedColumn: ...
+searchOpen: boolean
+globalSearchOpen: boolean
+previewOpen: boolean
+```
+
+Frontend rendering: `frontend/src/components/graph/LineageCanvas.tsx`, `components/layout/Toolbar.tsx`, `components/ui/SearchDialog.tsx`, `components/graph/TableNode.tsx`, `components/graph/EntityNode.tsx`.
+
+Important scope note: this capability family is mostly **frontend behavior over already-fetched lineage data**. The bugs here are usually state/layout/filtering bugs, not bad system-table reads.
+
+**Debug checklist**:
+* `lineageDepth` only limits rendered table hops; entity nodes are treated as transparent connectors. A "depth is wrong" complaint can be expected behavior.
+* Column lineage is intentionally disabled in pipeline-only view and in catalog-wide scope (`columnsDisabled = lineageView === "pipeline" || (isScopeLineage && scope === "catalog")`) — if the toggle disappears there, that is by design.
+* Large-graph centering issues usually live in the `fitView` retry path inside `LineageCanvas.tsx`, not in ELK layout input generation.
+* Search bugs are usually graph-state bugs (`SearchDialog`/selected node/zoom-to-node), not backend search/listing bugs; the in-graph search only searches the **currently rendered graph**, not all workspace tables.
+
+---
+
 ## Cross-cutting debug entry points
 
 These aren't tied to one capability but are the fastest first checks for *any* symptom above:
@@ -400,4 +549,4 @@ These aren't tied to one capability but are the fastest first checks for *any* s
 
 ---
 
-*Added in v2.4.0 alongside [docs/architecture.md](architecture.md), [docs/capabilites.md](capabilites.md), and [docs/testing_plan_for_Combined_App.md](testing_plan_for_Combined_App.md). See [CHANGELOG.md](../CHANGELOG.md) for the full release history.*
+*Updated for the fully combined app in `/Workspace/Users/ayaskanta.ratha@databricks.com/lineage_app/lineage-explorer-transforms_combined`. Added coverage for browse flows, scoped routing, in-graph controls, and the LLM-backed PySpark-expression enrichment stage, alongside [docs/architecture.md](architecture.md), [docs/capabilites.md](capabilites.md), and [docs/testing_plan_for_Combined_App.md](testing_plan_for_Combined_App.md). See [CHANGELOG.md](../CHANGELOG.md) for the full release history.*
