@@ -23,7 +23,7 @@ SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")
 IMPACT_LOOKBACK_DAYS = int(os.environ.get("LINEAGE_WINDOW_DAYS", "90"))
 IMPACT_MAX_HOPS = int(os.environ.get("IMPACT_MAX_HOPS", "5"))
 
-_IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_]{1,255}$")
+_IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{1,255}$")  # canonical: backend/validators.py
 
 
 def _validate(value: str, name: str) -> str:

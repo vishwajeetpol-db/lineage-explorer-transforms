@@ -40,7 +40,7 @@ async def discover_sensitive(
     schema: Optional[str] = Query(None),
 ):
     """Return tables that contain at least one PII/PCI column."""
-    _IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_]{1,255}$")
+    _IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{1,255}$")  # canonical: backend/validators.py
     if catalog and not _IDENTIFIER_RE.match(catalog):
         raise HTTPException(status_code=400, detail="Invalid catalog")
     if schema and not _IDENTIFIER_RE.match(schema):
@@ -59,7 +59,7 @@ async def discover_orphans(
     schema: Optional[str] = Query(None),
 ):
     """Return tables that have no lineage events (orphaned / stale)."""
-    _IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_]{1,255}$")
+    _IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{1,255}$")  # canonical: backend/validators.py
     if catalog and not _IDENTIFIER_RE.match(catalog):
         raise HTTPException(status_code=400, detail="Invalid catalog")
     if schema and not _IDENTIFIER_RE.match(schema):

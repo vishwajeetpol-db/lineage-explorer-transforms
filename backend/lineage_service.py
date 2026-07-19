@@ -96,6 +96,28 @@ _INTERNAL_TABLE_FILTER = (
     "table_name NOT RLIKE '^(__materialization_mat_|event_log_|__apply_changes)'"
 )
 
+# ---------------------------------------------------------------------------
+# Optional catalog allowlist — hard cap on list_all_tables fan-out.
+#
+# On workspaces with thousands of catalogs the cold-start cost of querying
+# every catalog's information_schema.tables is O(N / 8) × SQL_WAIT_TIMEOUT.
+# CATALOG_ALLOWLIST limits the fan-out to an explicit set.
+#
+# Format: comma-separated names, e.g. "main,analytics,my_catalog"
+# When unset (default): all accessible catalogs are enumerated.
+# ---------------------------------------------------------------------------
+_CATALOG_ALLOWLIST: frozenset[str] | None = (
+    frozenset(c.strip() for c in os.environ["CATALOG_ALLOWLIST"].split(",") if c.strip())
+    if os.environ.get("CATALOG_ALLOWLIST")
+    else None
+)
+if _CATALOG_ALLOWLIST:
+    logger.info(
+        f"CATALOG_ALLOWLIST active: {len(_CATALOG_ALLOWLIST)} catalog(s) — "
+        + ", ".join(sorted(_CATALOG_ALLOWLIST)[:10])
+        + (" ..." if len(_CATALOG_ALLOWLIST) > 10 else "")
+    )
+
 # Conservative whitelist for entity ids interpolated into system-table queries
 # (job ids, pipeline/notebook/dashboard ids, notebook paths). No quotes/semicolons.
 _SAFE_ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9_./@ +:-]{1,512}$")

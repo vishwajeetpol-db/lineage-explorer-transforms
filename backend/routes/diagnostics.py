@@ -20,8 +20,8 @@ from backend.server.column_profiling import get_column_profile
 
 router = APIRouter(prefix="/api/diagnostics", tags=["diagnostics"])
 
-_IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_]{1,255}$")
-_COL_RE = __import__("re").compile(r"^[A-Za-z0-9_]{1,255}$")
+_IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{1,255}$")  # canonical: backend/validators.py
+_COL_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{1,255}$")
 
 
 def _validate(value: str, name: str) -> str:

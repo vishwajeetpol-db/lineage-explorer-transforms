@@ -36,6 +36,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from databricks.sdk import WorkspaceClient
 from backend.lineage_service import (
+    _CATALOG_ALLOWLIST,
     list_catalogs,
     list_schemas,
     list_all_tables,
@@ -83,6 +84,12 @@ from backend.routes.dq import router as dq_router
 from backend.routes.lineage import router as lineage_ext_router, analyze_router
 from backend.routes.pipeline_installer import router as pipeline_installer_router
 from backend.routes.diagnostics import router as diagnostics_router
+from backend.routes.root_cause import router as root_cause_router
+from backend.routes.glossary import router as glossary_router
+from backend.routes.notifications import router as notifications_router
+from backend.routes.openlineage import router as openlineage_router
+from backend.routes.external_sources import router as external_sources_router
+from backend.routes.graph_snapshots import router as graph_snapshots_router
 
 class _JsonLogFormatter(logging.Formatter):
     """Structured JSON logs — one line per record so downstream log queries
@@ -246,6 +253,10 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
     loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=64))
     logger.info("BrickRoute starting up — thread pool set to 64 workers, clearing stale caches")
+    # Activate performance patches (parallelism wrappers for catalog enumeration,
+    # BFS trace walks, cost cache refresh, and column fetch). Idempotent.
+    from backend.startup import activate as _activate_perf
+    _activate_perf()
     invalidate_cache()
     # Pre-fetch per-entity cost cache in background so first lineage load shows cost.
     # The aggregation can take a few minutes against busy system.billing — it must
@@ -379,6 +390,28 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(SecurityHeadersMiddleware)
 
+# ---------------------------------------------------------------------------
+# Register all API routers — capabilities 05-22+
+# ---------------------------------------------------------------------------
+app.include_router(governance_router)
+app.include_router(impact_router)
+app.include_router(observability_router)
+app.include_router(access_router)
+app.include_router(ml_router)
+app.include_router(discovery_router)
+app.include_router(dq_router)
+app.include_router(lineage_ext_router)
+app.include_router(analyze_router)
+app.include_router(pipeline_installer_router)
+app.include_router(diagnostics_router)
+# New capability routers (closing gaps + completing partials)
+app.include_router(root_cause_router)
+app.include_router(glossary_router)
+app.include_router(notifications_router)
+app.include_router(openlineage_router)
+app.include_router(external_sources_router)
+app.include_router(graph_snapshots_router)
+
 
 def _safe_error(e: Exception) -> str:
     """Return a sanitized error message safe for API responses (no internal paths/query details)."""
@@ -486,6 +519,8 @@ async def api_admin_status(request: Request):
             "uptime_human": f"{int((now - _start_time) / 3600)}h {int((now - _start_time) % 3600 / 60)}m",
             "python_version": sys.version.split()[0],
             "pid": os.getpid(),
+            "catalog_allowlist_active": _CATALOG_ALLOWLIST is not None,
+            "catalog_allowlist": sorted(_CATALOG_ALLOWLIST) if _CATALOG_ALLOWLIST else None,
         },
         "memory": {
             "rss_mb": rss_mb,

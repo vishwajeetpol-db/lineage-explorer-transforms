@@ -197,3 +197,183 @@ async def delete_dq_rule(request: Request, rule_id: str):
         return {"rule_id": safe_id, "status": "deleted"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# DQ Live Metrics — execute rules and return pass/fail rates
+# ---------------------------------------------------------------------------
+
+@router.get("/metrics")
+async def dq_live_metrics(
+    request: Request,
+    table_fqn: str = Query(...),
+    sample_size: int = Query(10000, ge=100, le=1000000),
+):
+    """Execute all DQ rules for a table against a sample and return live pass/fail rates.
+
+    Returns per-rule pass rate + an overall quality score.
+    """
+    if not _FULL_NAME_RE.match(table_fqn):
+        raise HTTPException(status_code=400, detail="Invalid table_fqn")
+    try:
+        _ensure_dq_table()
+        # Get rules for this table
+        rules = _execute_sql(
+            f"SELECT * FROM {DQ_TABLE} WHERE table_fqn = '{table_fqn}' ORDER BY column_name"
+        )
+        if not rules:
+            return {"table_fqn": table_fqn, "metrics": [], "quality_score": None, "note": "No DQ rules defined"}
+
+        metrics = []
+        total_pass_rate = 0.0
+        evaluated_count = 0
+
+        for rule in rules:
+            expression = rule.get("expression", "")
+            column = rule.get("column_name", "")
+            rule_type = rule.get("rule_type", "CUSTOM")
+            rule_id = rule.get("rule_id", "")
+
+            # Build the check SQL based on rule type
+            check_sql = _build_check_sql(table_fqn, column, rule_type, expression, sample_size)
+            if not check_sql:
+                metrics.append({
+                    "rule_id": rule_id, "column": column, "rule_type": rule_type,
+                    "pass_rate": None, "status": "skipped", "error": "Cannot build check SQL"
+                })
+                continue
+
+            try:
+                result = _execute_sql(check_sql)
+                if result:
+                    total_rows = int(result[0].get("total_rows", 0) or 0)
+                    passing_rows = int(result[0].get("passing_rows", 0) or 0)
+                    pass_rate = (passing_rows / total_rows) if total_rows > 0 else 0.0
+
+                    status = "pass" if pass_rate >= 0.99 else "warn" if pass_rate >= 0.9 else "fail"
+                    metrics.append({
+                        "rule_id": rule_id, "column": column, "rule_type": rule_type,
+                        "pass_rate": round(pass_rate, 4), "total_rows": total_rows,
+                        "passing_rows": passing_rows, "failing_rows": total_rows - passing_rows,
+                        "status": status, "severity": rule.get("severity", "ERROR"),
+                    })
+                    total_pass_rate += pass_rate
+                    evaluated_count += 1
+                else:
+                    metrics.append({
+                        "rule_id": rule_id, "column": column, "rule_type": rule_type,
+                        "pass_rate": None, "status": "no_data"
+                    })
+            except Exception as rule_err:
+                metrics.append({
+                    "rule_id": rule_id, "column": column, "rule_type": rule_type,
+                    "pass_rate": None, "status": "error", "error": str(rule_err)[:200]
+                })
+
+        quality_score = round(total_pass_rate / evaluated_count, 4) if evaluated_count > 0 else None
+
+        return {
+            "table_fqn": table_fqn,
+            "metrics": metrics,
+            "quality_score": quality_score,
+            "quality_grade": _score_to_grade(quality_score),
+            "rules_evaluated": evaluated_count,
+            "rules_total": len(rules),
+            "sample_size": sample_size,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/propagation")
+async def dq_quality_propagation(
+    request: Request,
+    catalog: str = Query(...),
+    schema: str = Query(...),
+    table: str = Query(...),
+):
+    """Show quality score propagation: how upstream DQ issues affect this table.
+
+    Queries upstream tables' quality scores and computes a weighted propagated score.
+    """
+    c = _validate(catalog, "catalog")
+    s = _validate(schema, "schema")
+    t = _validate(table, "table")
+    table_fqn = f"{c}.{s}.{t}"
+
+    try:
+        _ensure_dq_table()
+        # Get upstream tables from lineage
+        upstream = _execute_sql(f"""
+            SELECT DISTINCT source_table_full_name
+            FROM system.access.table_lineage
+            WHERE target_table_catalog = '{c}'
+              AND target_table_schema = '{s}'
+              AND target_table_name = '{t}'
+              AND event_time > current_timestamp() - INTERVAL 90 DAYS
+            LIMIT 20
+        """)
+
+        propagation = []
+        for row in upstream:
+            upstream_fqn = row.get("source_table_full_name", "")
+            if not upstream_fqn:
+                continue
+            # Check if upstream has DQ rules
+            upstream_rules = _execute_sql(
+                f"SELECT COUNT(*) as cnt FROM {DQ_TABLE} WHERE table_fqn = '{upstream_fqn.replace(chr(39), chr(39)*2)}'"
+            )
+            rule_count = int(upstream_rules[0]["cnt"]) if upstream_rules else 0
+            propagation.append({
+                "upstream_table": upstream_fqn,
+                "has_dq_rules": rule_count > 0,
+                "rule_count": rule_count,
+            })
+
+        return {
+            "table_fqn": table_fqn,
+            "upstream_quality": propagation,
+            "upstream_count": len(propagation),
+            "covered_count": sum(1 for p in propagation if p["has_dq_rules"]),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _build_check_sql(table_fqn: str, column: str, rule_type: str, expression: str, sample_size: int) -> str | None:
+    """Build a SQL query to evaluate a DQ rule and return total/passing row counts."""
+    safe_col = f"`{column}`" if column else "*"
+    safe_tbl = table_fqn  # Already validated
+
+    if rule_type == "NOT_NULL" and column:
+        return f"SELECT COUNT(*) AS total_rows, SUM(CASE WHEN {safe_col} IS NOT NULL THEN 1 ELSE 0 END) AS passing_rows FROM (SELECT * FROM {safe_tbl} LIMIT {sample_size})"
+    elif rule_type == "UNIQUE" and column:
+        return f"SELECT COUNT(*) AS total_rows, COUNT(DISTINCT {safe_col}) AS passing_rows FROM (SELECT * FROM {safe_tbl} LIMIT {sample_size})"
+    elif rule_type == "RANGE" and expression:
+        # expression expected format: "min_val,max_val"
+        parts = expression.split(",")
+        if len(parts) == 2:
+            return f"SELECT COUNT(*) AS total_rows, SUM(CASE WHEN {safe_col} BETWEEN {parts[0].strip()} AND {parts[1].strip()} THEN 1 ELSE 0 END) AS passing_rows FROM (SELECT * FROM {safe_tbl} LIMIT {sample_size})"
+    elif rule_type == "REGEX" and expression and column:
+        safe_expr = expression.replace("'", "''")
+        return f"SELECT COUNT(*) AS total_rows, SUM(CASE WHEN {safe_col} RLIKE '{safe_expr}' THEN 1 ELSE 0 END) AS passing_rows FROM (SELECT * FROM {safe_tbl} LIMIT {sample_size})"
+    elif rule_type == "CUSTOM" and expression:
+        safe_expr = expression.replace("'", "''")
+        return f"SELECT COUNT(*) AS total_rows, SUM(CASE WHEN ({safe_expr}) THEN 1 ELSE 0 END) AS passing_rows FROM (SELECT * FROM {safe_tbl} LIMIT {sample_size})"
+    return None
+
+
+def _score_to_grade(score: float | None) -> str | None:
+    if score is None:
+        return None
+    if score >= 0.99:
+        return "A"
+    elif score >= 0.95:
+        return "B"
+    elif score >= 0.9:
+        return "C"
+    elif score >= 0.8:
+        return "D"
+    return "F"

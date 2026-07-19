@@ -21,7 +21,7 @@ from backend.server.governance import (
 
 router = APIRouter(prefix="/api/governance", tags=["governance"])
 
-_IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_]{1,255}$")
+_IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{1,255}$")  # canonical: backend/validators.py
 
 
 def _validate(value: str, name: str) -> str:

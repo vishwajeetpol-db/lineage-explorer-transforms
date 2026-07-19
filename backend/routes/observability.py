@@ -16,7 +16,7 @@ from backend.server.observability import (
 
 router = APIRouter(prefix="/api/observability", tags=["observability"])
 
-_IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_]{1,255}$")
+_IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{1,255}$")  # canonical: backend/validators.py
 _ENTITY_ID_RE = __import__("re").compile(r"^[A-Za-z0-9_./@ +-]{1,256}$")
 
 

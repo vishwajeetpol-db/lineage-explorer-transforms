@@ -108,6 +108,11 @@ def find_sensitive_tables(catalog: Optional[str] = None, schema: Optional[str] =
     heuristics as governance.py.  For each matching table, returns the
     list of sensitive columns found.
     """
+    # Require at least one scope filter — a filterless scan of system.information_schema.columns
+    # touches every column in the entire metastore and can return millions of rows.
+    if not catalog and not schema:
+        logger.info("find_sensitive_tables: catalog or schema required; returning empty.")
+        return []
     cat_filter = f"AND table_catalog = '{catalog}'" if catalog else ""
     sch_filter = f"AND table_schema = '{schema}'" if schema else ""
     try:
@@ -116,7 +121,8 @@ def find_sensitive_tables(catalog: Optional[str] = None, schema: Optional[str] =
             f"FROM system.information_schema.columns "
             f"WHERE table_schema NOT IN ('information_schema') "
             f"{cat_filter} {sch_filter} "
-            f"ORDER BY table_catalog, table_schema, table_name, ordinal_position"
+            f"ORDER BY table_catalog, table_schema, table_name, ordinal_position "
+            f"LIMIT 5000"  # guard: prevents full-metastore column scans on large deployments
         )
     except Exception as e:
         logger.info(f"discovery: find_sensitive_tables failed: {e}")
@@ -156,6 +162,11 @@ def find_orphan_tables(catalog: Optional[str] = None, schema: Optional[str] = No
     An "orphan" is a table no pipeline reads and no pipeline writes to —
     useful for spotting stale/abandoned assets.
     """
+    # Require at least one scope filter — without one, the NOT IN subqueries against
+    # system.access.table_lineage execute as full 90-day scans over the entire metastore.
+    if not catalog and not schema:
+        logger.info("find_orphan_tables: catalog or schema required; returning empty.")
+        return []
     cat_filter = f"AND t.table_catalog = '{catalog}'" if catalog else ""
     sch_filter = f"AND t.table_schema = '{schema}'" if schema else ""
     try:

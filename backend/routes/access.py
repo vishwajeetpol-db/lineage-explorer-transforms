@@ -12,7 +12,7 @@ from backend.server.access import get_access_summary, get_schema_access_summary
 
 router = APIRouter(prefix="/api/access", tags=["access"])
 
-_IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_]{1,255}$")
+_IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{1,255}$")  # canonical: backend/validators.py
 
 
 def _validate(value: str, name: str) -> str:
