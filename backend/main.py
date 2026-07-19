@@ -48,6 +48,7 @@ from backend.lineage_service import (
     get_table_edges,
     get_sharing_overlay,
     get_sharing_overview,
+    get_federated_source_overlay,
     resolve_entity_name,
     invalidate_cache,
     evict_cache_entry,
@@ -86,10 +87,12 @@ from backend.routes.pipeline_installer import router as pipeline_installer_route
 from backend.routes.diagnostics import router as diagnostics_router
 from backend.routes.root_cause import router as root_cause_router
 from backend.routes.glossary import router as glossary_router
+from backend.routes.capability_closures import router as capability_closures_router
 from backend.routes.notifications import router as notifications_router
 from backend.routes.openlineage import router as openlineage_router
 from backend.routes.external_sources import router as external_sources_router
 from backend.routes.graph_snapshots import router as graph_snapshots_router
+from backend.routes.scalability import router as scalability_router
 
 class _JsonLogFormatter(logging.Formatter):
     """Structured JSON logs — one line per record so downstream log queries
@@ -407,10 +410,12 @@ app.include_router(diagnostics_router)
 # New capability routers (closing gaps + completing partials)
 app.include_router(root_cause_router)
 app.include_router(glossary_router)
+app.include_router(capability_closures_router)
 app.include_router(notifications_router)
 app.include_router(openlineage_router)
 app.include_router(external_sources_router)
 app.include_router(graph_snapshots_router)
+app.include_router(scalability_router)
 
 
 def _safe_error(e: Exception) -> str:
@@ -822,6 +827,25 @@ async def api_sharing_overview(request: Request, live: bool = Query(False)):
         return await asyncio.to_thread(get_sharing_overview, live)
     except Exception as e:
         logger.error(f"Error getting sharing overview: {e}")
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/api/lineage/federated-overlay")
+async def api_federated_overlay(
+    request: Request,
+    live: bool = Query(False),
+):
+    """Federated Source overlay for Lakehouse Federation — enriches FOREIGN table
+    nodes with connection metadata (type, remote schema/object). Mirrors the
+    Delta Sharing overlay pattern; lazy-loaded via a toolbar toggle."""
+    if live:
+        _, is_admin = await asyncio.to_thread(_get_user_info, request)
+        if not is_admin:
+            live = False
+    try:
+        return await asyncio.to_thread(get_federated_source_overlay, live)
+    except Exception as e:
+        logger.error(f"Error getting federated source overlay: {e}")
         raise HTTPException(status_code=500, detail=_safe_error(e))
 
 

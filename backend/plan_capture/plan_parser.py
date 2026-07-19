@@ -8,109 +8,198 @@ already produces, so downstream consumers (backend/plan_capture_service.py)
 can treat either source uniformly.
 """
 from __future__ import annotations
-import json
-import re
-import sys
+import re, json, sys
 
-# Attribute reference: `colName#123` or `colName#123L`
-ATTR_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)#(\d+)L?\b")
-
-_NODE_RE = re.compile(r"^(\+?-*'?)([A-Za-z][A-Za-z0-9]*)\b(.*)$")
+ATTR_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)#(\d+)L?")
+LEAF_PREFIXES = ("Range", "Relation", "LogicalRelation", "HiveTableRelation",
+                 "LocalRelation", "FileScan", "DataSourceV2", "JDBCRelation",
+                 "LogicalRDD", "StreamingRelation", "StreamingDataSourceV2")
 
 
-def clean_nodes(plan_text: str):
-    """[(indent:int, body:str), ...] — one entry per plan-tree line, comments/
-    blank lines dropped. `indent` is the raw leading-symbol column (used only to
-    walk top-to-bottom; the parser does not depend on exact tree depth)."""
-    nodes = []
-    for raw in plan_text.splitlines():
-        line = raw.rstrip()
-        if not line.strip():
-            continue
-        stripped = line.lstrip(" ")
-        indent = len(line) - len(stripped)
-        nodes.append((indent, stripped))
-    return nodes
+# ---------- depth-aware helpers ----------
 
-
-def parse_schema_header(plan_text: str):
-    """Column names from the trailing `root/schema` block if present, else None."""
-    m = re.search(r"root\s*\n((?:\s+\|--.*\n?)+)", plan_text)
-    if not m:
-        return None
-    names = re.findall(r"\|--\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", m.group(1))
-    return names or None
-
-
-def split_top(bracket_body: str):
-    """Split a `[...]` bracket body on top-level commas (ignores nested
-    brackets/parens so `array(a, b)` doesn't get split mid-call)."""
-    items, depth, cur = [], 0, []
-    for ch in bracket_body:
+def split_top(s: str, sep: str = ",") -> list[str]:
+    """Split on `sep` only at bracket/paren depth 0."""
+    out, depth, cur = [], 0, []
+    for ch in s:
         if ch in "([":
             depth += 1
         elif ch in ")]":
             depth -= 1
-        if ch == "," and depth == 0:
-            items.append("".join(cur).strip())
+        if ch == sep and depth == 0:
+            out.append("".join(cur))
             cur = []
         else:
             cur.append(ch)
     if cur:
-        items.append("".join(cur).strip())
-    return [i for i in items if i]
+        out.append("".join(cur))
+    return [x.strip() for x in out if x.strip()]
 
 
-def all_brackets(body: str):
-    """Every top-level `[...]` bracket's inner text found in `body`, in order."""
-    out, depth, start = [], 0, None
-    for i, ch in enumerate(body):
+def find_as(item: str):
+    """Return (expr, name, id) if `item` is `<expr> AS name#id` at depth 0, else None."""
+    depth = 0
+    for i in range(len(item) - 3):
+        ch = item[i]
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif depth == 0 and item[i:i + 4] == " AS ":
+            rhs = item[i + 4:].strip()
+            m = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)#(\d+)L?", rhs)
+            if m:
+                return item[:i].strip(), m.group(1), int(m.group(2))
+    return None
+
+
+def all_brackets(line: str):
+    """Yield the content of every top-level [...] group in a node line."""
+    depth, start = 0, None
+    for i, ch in enumerate(line):
         if ch == "[":
             if depth == 0:
-                start = i + 1
+                start = i
             depth += 1
         elif ch == "]":
             depth -= 1
             if depth == 0 and start is not None:
-                out.append(body[start:i])
+                yield line[start + 1:i]
                 start = None
-    return out
 
 
-def find_as(item: str):
-    """`(expr, alias_name, expr_id)` if `item` is `<expr> AS name#id`, else None."""
-    m = re.search(r"\bAS\s+([A-Za-z_][A-Za-z0-9_]*)#(\d+)L?\s*$", item, re.IGNORECASE)
-    if not m:
+def attr_bracket(line: str):
+    """The first top-level [...] that holds attribute refs (`name#id`).
+
+    Leaf nodes like `StreamingRelationV2 ..., [rowsPerSecond=1], [ts#1, val#2]`
+    have an options bracket *before* the schema bracket — skip to the one with #.
+    """
+    for b in all_brackets(line):
+        if "#" in b:
+            return b
+    return None
+
+
+def first_bracket(line: str):
+    """Return the content of the first top-level [...] in a node line, or None."""
+    start = line.find("[")
+    if start == -1:
         return None
-    expr = item[: m.start()].strip()
-    return expr, m.group(1), int(m.group(2))
+    depth, i = 0, start
+    while i < len(line):
+        if line[i] == "[":
+            depth += 1
+        elif line[i] == "]":
+            depth -= 1
+            if depth == 0:
+                return line[start + 1:i]
+        i += 1
+    return None
+
+
+# ---------- plan structure ----------
+
+def clean_nodes(plan_text: str):
+    """Yield (indent, body) per node; drops the schema header line.
+
+    Some leaf nodes (e.g. a Delta `StreamingRelation`/`Relation`) embed a
+    multi-line `CatalogTable(...)` dump. Those continuation lines carry no tree
+    connector, so we fold them back into the node they belong to — otherwise
+    they look like bogus indent-0 nodes and break parent-chain tracking.
+    """
+    raw = [ln for ln in plan_text.splitlines() if ln.strip()]
+    if raw and "[" not in raw[0] and "#" not in raw[0] and ":" in raw[0]:
+        raw = raw[1:]
+    merged = []
+    for ln in raw:
+        is_new_node = (not merged) or bool(re.search(r"(\+-|:-)", ln))
+        if is_new_node:
+            merged.append(ln)
+        else:
+            merged[-1] = merged[-1] + " " + ln.strip()
+    nodes = []
+    for ln in merged:
+        m = re.match(r"^([ :+\-]*)(.*)$", ln)
+        prefix, body = m.group(1), m.group(2)
+        body = re.sub(r"^[~*]+(\(\d+\))?\s*", "", body)  # strip ~streaming / *codegen markers
+        nodes.append((len(prefix), body))
+    return nodes
+
+
+def _table_context(body):
+    """Return a fully-qualified table name if this node names one, else None.
+
+    `Relation cat.sch.tbl[...]`            -> cat.sch.tbl
+    `SubqueryAlias cat.sch.tbl`            -> cat.sch.tbl   (DLT dlt.read upstream)
+    `SubqueryAlias o`                      -> None          (plain subquery alias)
+    """
+    m = re.match(r"SubqueryAlias\s+(`?[\w.]+`?)\s*$", body)
+    if m:
+        n = m.group(1).strip("`")
+        return n if "." in n else None
+    m = re.match(r"Relation\s+(`?[\w.]+`?)", body)
+    if m:
+        return m.group(1).strip("`")
+    return None
 
 
 def build_symbol_tables(nodes):
-    """(alias_def, out_name, base) — exprId -> defining expression / display name
-    / base-relation full name, scanned across every node in the plan."""
+    """alias_def[id]=expr, out_name[id]=name, base[id]=table_fqn|None (leaf cols).
+
+    Tracks the parent chain by indent so a leaf's base columns inherit the
+    qualified table name from the nearest enclosing SubqueryAlias/Relation.
+    """
     alias_def, out_name, base = {}, {}, {}
+    stack = []  # (indent, body) ancestor chain
     for indent, body in nodes:
-        m = re.match(r"^Relation\s+([A-Za-z0-9_.]+)", body) or re.match(r"^SubqueryAlias\s+([A-Za-z0-9_.]+)", body)
-        rel_name = m.group(1) if m else None
-        for b in all_brackets(body):
-            for item in split_top(b):
-                asx = find_as(item)
-                if asx:
-                    expr, name, sid = asx
-                    alias_def[sid] = expr
-                    out_name[sid] = name
-                    if rel_name:
-                        base[sid] = rel_name
-                else:
-                    m2 = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)#(\d+)L?", item.strip())
-                    if m2 and rel_name:
-                        base[int(m2.group(2))] = rel_name
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        ctx = _table_context(body)
+        if ctx is None:
+            for anc_ind, anc_body in reversed(stack):
+                t = _table_context(anc_body)
+                if t:
+                    ctx = t
+                    break
+        stack.append((indent, body))
+
+        is_leaf = body.startswith(LEAF_PREFIXES)
+        bracket = attr_bracket(body) if is_leaf else first_bracket(body)
+        for name, sid in ATTR_RE.findall(body):
+            out_name.setdefault(int(sid), name)
+        if bracket is None:
+            continue
+        for item in split_top(bracket):
+            asx = find_as(item)
+            if asx:
+                expr, name, sid = asx
+                alias_def[sid] = expr
+                out_name[sid] = name
+            elif is_leaf:
+                m = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)#(\d+)L?", item)
+                if m:
+                    base[int(m.group(2))] = ctx   # fqn or None
     return alias_def, out_name, base
 
 
-def _udf_call_names(item: str):
-    return []  # placeholder retained for interface parity; see _udf_names below
+def parse_schema_header(plan_text: str):
+    """Ordered output column names from the first line (`col: type, col: type`)."""
+    first = plan_text.splitlines()[0] if plan_text.strip() else ""
+    if not first or "[" in first or "#" in first or ":" not in first:
+        return []
+    names, depth, seg = [], 0, []
+    for ch in first:
+        if ch in "([<":
+            depth += 1
+        elif ch in ")]>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            names.append("".join(seg)); seg = []
+        else:
+            seg.append(ch)
+    if seg:
+        names.append("".join(seg))
+    return [s.split(":", 1)[0].strip() for s in names if s.split(":", 1)[0].strip()]
 
 
 def output_name(item: str):

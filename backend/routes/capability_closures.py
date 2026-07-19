@@ -1,0 +1,393 @@
+"""Capability gap closures — v2.5.2.
+
+Supplementary endpoints closing remaining scorecard gaps:
+  #02 End-to-End Lineage  → BI tool consumer detection + streaming topology
+  #07 Versioned Lineage   → Auto-capture scheduling + timeline view
+  #11 Data Quality        → DQ trend history + pipeline expectation sync
+  #20 Notifications       → Webhook registration + delivery queue
+
+Register this router in main.py: app.include_router(capability_closures.router)
+"""
+from __future__ import annotations
+
+import os
+import uuid
+import json
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel
+from databricks.sdk.service.sql import StatementState
+from backend.lineage_service import _get_client
+
+logger = logging.getLogger(__name__)
+router = APIRouter(tags=["capability-closures"])
+
+LINEAGE_CATALOG = os.environ.get("LINEAGE_CATALOG", "lattice_lineage")
+LINEAGE_SCHEMA = os.environ.get("LINEAGE_SCHEMA", "lineage")
+WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
+SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")
+DQ_HISTORY_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.dq_metrics_history"
+WEBHOOKS_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.notification_webhooks"
+DELIVERY_QUEUE_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.webhook_delivery_queue"
+SNAPSHOTS_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.graph_snapshots"
+
+
+def _execute_sql(sql: str) -> list[dict]:
+    if not WAREHOUSE_ID:
+        raise RuntimeError("No SQL warehouse available.")
+    client = _get_client()
+    resp = client.statement_execution.execute_statement(
+        statement=sql, warehouse_id=WAREHOUSE_ID, wait_timeout=SQL_WAIT_TIMEOUT,
+    )
+    if resp.status.state != StatementState.SUCCEEDED:
+        err = resp.status.error.message if resp.status.error else resp.status.state
+        raise RuntimeError(f"SQL failed: {err}")
+    if not resp.result or not resp.result.data_array:
+        return []
+    columns = [c.name for c in resp.manifest.schema.columns]
+    return [dict(zip(columns, row)) for row in resp.result.data_array]
+
+
+# ===========================================================================
+# #02 — BI Tool Consumer Detection + Streaming Topology
+# ===========================================================================
+
+@router.get("/api/lineage/bi-consumers")
+async def bi_tool_consumers(
+    request: Request,
+    catalog: Optional[str] = Query(None),
+    table: Optional[str] = Query(None),
+    days: int = Query(30, ge=1, le=365),
+):
+    """Detect BI tool consumers (Tableau, PowerBI, Looker, etc.)
+    via query history user-agent patterns. Returns tool type + frequency."""
+    filters = []
+    if catalog:
+        filters.append(f"lower(statement_text) LIKE '%{catalog.lower()}%'")
+    if table:
+        filters.append(f"lower(statement_text) LIKE '%{table.lower()}%'")
+    extra = ("AND " + " AND ".join(filters)) if filters else ""
+    try:
+        rows = await asyncio.to_thread(_execute_sql, f"""
+            SELECT client_application AS bi_tool, COUNT(*) AS query_count,
+                   COUNT(DISTINCT executed_by) AS distinct_users, MAX(start_time) AS last_accessed
+            FROM system.query.history
+            WHERE start_time >= current_timestamp() - INTERVAL {days} DAYS
+              AND lower(client_application) RLIKE '(tableau|power.?bi|looker|mode|metabase|sigma|thoughtspot|dbt.?cloud|redash|superset)'
+              AND status = 'FINISHED' {extra}
+            GROUP BY client_application ORDER BY query_count DESC LIMIT 50
+        """)
+        return {"bi_consumers": rows, "lookback_days": days}
+    except Exception as e:
+        return {"bi_consumers": [], "note": str(e)}
+
+
+@router.get("/api/lineage/streaming-topology")
+async def streaming_topology(request: Request, catalog: Optional[str] = Query(None)):
+    """Detect streaming tables + source edges for streaming topology view."""
+    cat_filter = f"AND t.table_catalog = '{catalog}'" if catalog else ""
+    try:
+        rows = await asyncio.to_thread(_execute_sql, f"""
+            SELECT t.table_catalog, t.table_schema, t.table_name, t.data_source_format, t.last_altered
+            FROM system.information_schema.tables t
+            WHERE t.table_type = 'STREAMING_TABLE' {cat_filter}
+            ORDER BY t.table_catalog, t.table_schema, t.table_name LIMIT 500
+        """)
+        edges = []
+        for row in rows[:50]:
+            fqn = f"{row['table_catalog']}.{row['table_schema']}.{row['table_name']}"
+            try:
+                e = _execute_sql(f"""
+                    SELECT DISTINCT source_table_full_name, entity_type
+                    FROM system.access.table_lineage
+                    WHERE target_table_full_name = '{fqn}' AND event_time > current_timestamp() - INTERVAL 30 DAYS LIMIT 10
+                """)
+                for r in e:
+                    edges.append({"target": fqn, "source": r.get("source_table_full_name", ""), "entity_type": r.get("entity_type", "")})
+            except Exception:
+                pass
+        return {"streaming_tables": rows, "streaming_edges": edges, "count": len(rows)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===========================================================================
+# #07 — Auto-Capture Scheduling + Timeline
+# ===========================================================================
+
+@router.post("/api/snapshots/auto-capture")
+async def auto_capture_all_scopes(request: Request):
+    """Auto-capture snapshots for all catalogs with recent activity.
+    Call on schedule (daily job) to build version history automatically."""
+    try:
+        catalogs = await asyncio.to_thread(_execute_sql, """
+            SELECT DISTINCT target_table_catalog AS catalog
+            FROM system.access.table_lineage
+            WHERE event_time > current_timestamp() - INTERVAL 24 HOURS LIMIT 20
+        """)
+        from backend.lineage_service import get_table_lineage
+        captured = []
+        for row in catalogs:
+            cat = row.get("catalog", "")
+            if not cat:
+                continue
+            try:
+                lineage = get_table_lineage(cat, None, False)
+                nodes = [{"id": n.id, "type": getattr(n, "node_type", "unknown")} for n in lineage.nodes]
+                edges_list = [{"source": e.source, "target": e.target} for e in lineage.edges]
+                graph_json = json.dumps({"nodes": nodes, "edges": edges_list})
+                if len(graph_json) > 10_000_000:
+                    continue
+                sid = str(uuid.uuid4())
+                now = datetime.now(timezone.utc).isoformat()
+                _execute_sql(f"""
+                    INSERT INTO {SNAPSHOTS_TABLE}
+                    (snapshot_id, scope, label, captured_at, captured_by, node_count, edge_count, graph_json, metadata)
+                    VALUES ('{sid}', '{cat}', 'Auto {now[:10]}', TIMESTAMP '{now}', 'scheduler',
+                            {len(nodes)}, {len(edges_list)}, '{graph_json.replace(chr(39), chr(39)*2)}', '{{"auto":true}}')
+                """)
+                captured.append({"catalog": cat, "snapshot_id": sid, "nodes": len(nodes), "edges": len(edges_list)})
+            except Exception as e:
+                logger.debug(f"Auto-capture failed for {cat}: {e}")
+        return {"status": "ok", "captured": captured}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/snapshots/timeline")
+async def snapshot_timeline(request: Request, scope: str = Query(...), days: int = Query(30)):
+    """Node/edge count timeline for a scope — visualize graph growth."""
+    try:
+        rows = await asyncio.to_thread(_execute_sql, f"""
+            SELECT snapshot_id, captured_at, node_count, edge_count, label
+            FROM {SNAPSHOTS_TABLE}
+            WHERE scope = '{scope.replace(chr(39), chr(39)*2)}'
+              AND captured_at >= current_timestamp() - INTERVAL {days} DAYS
+            ORDER BY captured_at ASC LIMIT 100
+        """)
+        return {"scope": scope, "timeline": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===========================================================================
+# #11 — DQ Trend History + Pipeline Expectation Sync
+# ===========================================================================
+
+def _ensure_dq_history():
+    try:
+        _execute_sql(f"""CREATE TABLE IF NOT EXISTS {DQ_HISTORY_TABLE} (
+            run_id STRING, table_fqn STRING, quality_score DOUBLE,
+            rules_evaluated INT, rules_passed INT, rules_failed INT,
+            evaluated_at TIMESTAMP, details STRING
+        ) USING DELTA""")
+    except Exception:
+        pass
+
+
+@router.post("/api/dq-rules/record-metrics")
+async def record_dq_metrics(request: Request, body: dict):
+    """Store a DQ metrics run for trending. Call after /api/dq-rules/metrics."""
+    _ensure_dq_history()
+    run_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    fqn = (body.get("table_fqn", "") or "").replace("'", "''")
+    try:
+        await asyncio.to_thread(_execute_sql, f"""
+            INSERT INTO {DQ_HISTORY_TABLE} VALUES (
+                '{run_id}', '{fqn}', {body.get('quality_score', 0)},
+                {body.get('rules_evaluated', 0)}, {body.get('rules_passed', 0)}, {body.get('rules_failed', 0)},
+                TIMESTAMP '{now}', '{json.dumps(body.get("details", {})).replace(chr(39), chr(39)*2)[:4000]}')
+        """)
+        return {"status": "ok", "run_id": run_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/dq-rules/trends")
+async def dq_trends(request: Request, table_fqn: str = Query(...), days: int = Query(30)):
+    """Quality score trend over time. Returns direction: improving/stable/degrading."""
+    _ensure_dq_history()
+    try:
+        rows = await asyncio.to_thread(_execute_sql, f"""
+            SELECT run_id, quality_score, rules_evaluated, rules_passed, rules_failed, evaluated_at
+            FROM {DQ_HISTORY_TABLE}
+            WHERE table_fqn = '{table_fqn.replace(chr(39), chr(39)*2)}'
+              AND evaluated_at >= current_timestamp() - INTERVAL {days} DAYS
+            ORDER BY evaluated_at ASC LIMIT 200
+        """)
+        trend = "stable"
+        if len(rows) >= 2:
+            first = float(rows[0].get("quality_score") or 0)
+            last = float(rows[-1].get("quality_score") or 0)
+            trend = "degrading" if last < first - 0.05 else "improving" if last > first + 0.05 else "stable"
+        return {"table_fqn": table_fqn, "trend": trend, "data_points": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/dq-rules/pipeline-expectations")
+async def pipeline_expectations(request: Request, catalog: Optional[str] = Query(None)):
+    """List SDP pipeline expectations from streaming/materialized tables."""
+    cat_filter = f"AND table_catalog = '{catalog}'" if catalog else ""
+    try:
+        rows = await asyncio.to_thread(_execute_sql, f"""
+            SELECT table_catalog, table_schema, table_name, table_type
+            FROM system.information_schema.tables
+            WHERE table_type IN ('STREAMING_TABLE', 'MATERIALIZED_VIEW') {cat_filter}
+            LIMIT 200
+        """)
+        expectations = []
+        for row in rows[:30]:
+            try:
+                props = _execute_sql(f"""
+                    SELECT property_key, property_value FROM system.information_schema.table_properties
+                    WHERE table_catalog='{row["table_catalog"]}' AND table_schema='{row["table_schema"]}'
+                      AND table_name='{row["table_name"]}' AND lower(property_key) LIKE '%expectation%'
+                """)
+                if props:
+                    expectations.append({"table_fqn": f"{row['table_catalog']}.{row['table_schema']}.{row['table_name']}", "expectations": props})
+            except Exception:
+                pass
+        return {"pipeline_tables": len(rows), "tables_with_expectations": expectations}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===========================================================================
+# #20 — Webhook Registration + Delivery Queue
+# ===========================================================================
+
+def _ensure_webhook_tables():
+    try:
+        _execute_sql(f"""CREATE TABLE IF NOT EXISTS {WEBHOOKS_TABLE} (
+            webhook_id STRING, name STRING, url STRING, event_types STRING,
+            enabled BOOLEAN, secret STRING, created_by STRING, created_at TIMESTAMP
+        ) USING DELTA""")
+        _execute_sql(f"""CREATE TABLE IF NOT EXISTS {DELIVERY_QUEUE_TABLE} (
+            delivery_id STRING, webhook_id STRING, webhook_url STRING,
+            payload STRING, status STRING, queued_at TIMESTAMP, delivered_at TIMESTAMP
+        ) USING DELTA""")
+    except Exception:
+        pass
+
+
+class WebhookIn(BaseModel):
+    name: str
+    url: str
+    event_types: str = "*"  # schema_change,dq_degradation,sensitive_flow,*
+    secret: Optional[str] = ""
+
+
+@router.get("/api/notifications/webhooks")
+async def list_webhooks(request: Request):
+    """List registered webhook endpoints."""
+    _ensure_webhook_tables()
+    try:
+        rows = await asyncio.to_thread(_execute_sql,
+            f"SELECT webhook_id, name, url, event_types, enabled, created_at FROM {WEBHOOKS_TABLE}")
+        return {"webhooks": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/notifications/webhooks")
+async def register_webhook(request: Request, body: WebhookIn):
+    """Register a webhook for push notifications. Admin-gated."""
+    from backend.main import _get_user_info
+    email, is_admin = _get_user_info(request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin required")
+    _ensure_webhook_tables()
+    wid = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    safe = lambda s: (s or "").replace("'", "''")[:500]
+    try:
+        await asyncio.to_thread(_execute_sql, f"""
+            INSERT INTO {WEBHOOKS_TABLE} VALUES (
+                '{wid}', '{safe(body.name)}', '{safe(body.url)}', '{safe(body.event_types)}',
+                true, '{safe(body.secret)}', '{safe(email)}', TIMESTAMP '{now}')
+        """)
+        return {"status": "ok", "webhook_id": wid}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/api/notifications/webhooks/{webhook_id}")
+async def delete_webhook(request: Request, webhook_id: str):
+    """Remove a webhook. Admin-gated."""
+    from backend.main import _get_user_info
+    _, is_admin = _get_user_info(request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin required")
+    try:
+        await asyncio.to_thread(_execute_sql,
+            f"DELETE FROM {WEBHOOKS_TABLE} WHERE webhook_id = '{webhook_id.replace(chr(39), chr(39)*2)[:100]}'")
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/notifications/enqueue-delivery")
+async def enqueue_delivery(request: Request):
+    """Queue unread notifications for webhook delivery.
+
+    Matches notifications against registered webhooks by event_type,
+    creates delivery queue entries. A separate Databricks job polls the
+    queue and performs the actual HTTP POST delivery (decoupled for security).
+    """
+    _ensure_webhook_tables()
+    NOTIF_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.notifications"
+    try:
+        notifications = await asyncio.to_thread(_execute_sql,
+            f"SELECT * FROM {NOTIF_TABLE} WHERE is_read = false ORDER BY detected_at DESC LIMIT 50")
+        webhooks = await asyncio.to_thread(_execute_sql,
+            f"SELECT * FROM {WEBHOOKS_TABLE} WHERE enabled = true")
+        if not notifications or not webhooks:
+            return {"status": "ok", "queued": 0}
+
+        queued = 0
+        now = datetime.now(timezone.utc).isoformat()
+        for wh in webhooks:
+            types = (wh.get("event_types", "") or "*").split(",")
+            url = wh.get("url", "")
+            wh_id = wh.get("webhook_id", "")
+            for n in notifications:
+                if "*" not in types and n.get("notif_type", "") not in types:
+                    continue
+                payload = json.dumps({
+                    "type": n.get("notif_type"), "severity": n.get("severity"),
+                    "title": n.get("title"), "detail": n.get("detail"),
+                    "table_fqn": n.get("table_fqn"), "detected_at": str(n.get("detected_at", "")),
+                }).replace("'", "''")[:4000]
+                did = str(uuid.uuid4())
+                _execute_sql(f"""
+                    INSERT INTO {DELIVERY_QUEUE_TABLE} VALUES (
+                        '{did}', '{wh_id}', '{url.replace(chr(39), chr(39)*2)}',
+                        '{payload}', 'pending', TIMESTAMP '{now}', NULL)
+                """)
+                queued += 1
+
+        return {"status": "ok", "queued": queued}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/notifications/delivery-status")
+async def delivery_status(request: Request, limit: int = Query(20)):
+    """Check webhook delivery queue status (pending/delivered/failed)."""
+    _ensure_webhook_tables()
+    try:
+        rows = await asyncio.to_thread(_execute_sql, f"""
+            SELECT delivery_id, webhook_id, status, queued_at, delivered_at
+            FROM {DELIVERY_QUEUE_TABLE}
+            ORDER BY queued_at DESC LIMIT {limit}
+        """)
+        pending = sum(1 for r in rows if r.get("status") == "pending")
+        return {"deliveries": rows, "pending": pending, "total": len(rows)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

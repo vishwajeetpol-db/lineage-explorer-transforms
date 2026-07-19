@@ -18,7 +18,7 @@
   <img src="https://img.shields.io/badge/TypeScript-3178C6?style=flat&logo=typescript&logoColor=white" alt="TypeScript"/>
   <img src="https://img.shields.io/badge/Databricks_Apps-FF3621?style=flat&logo=databricks&logoColor=white" alt="Databricks"/>
   <img src="https://img.shields.io/badge/ELK.js-layout-orange" alt="ELK.js"/>
-  <img src="https://img.shields.io/badge/version-2.5.0-6366F1" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-2.5.1-6366F1" alt="Version"/>
 </p>
 
 ---

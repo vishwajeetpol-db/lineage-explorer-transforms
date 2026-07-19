@@ -1929,3 +1929,92 @@ def get_sharing_overview(skip_cache: bool = False) -> dict:
     return _cached_fetch(cache_key, _fetch, skip_cache=skip_cache)
 
 
+
+
+# ---------------------------------------------------------------------------
+# Federated Source Overlay — Lakehouse Federation foreign table enrichment
+# (Tier 1 from FEDERATED_LINEAGE_DESIGN.docx). Queries information_schema to
+# find FOREIGN catalogs + connections and enriches graph nodes with metadata.
+# ---------------------------------------------------------------------------
+
+
+def get_federated_source_overlay(skip_cache: bool = False) -> dict:
+    """Return FederatedSourceOverlay: enriches FOREIGN table nodes with
+    connection metadata (type, remote schema/object). Mirrors the Delta Sharing
+    overlay pattern — lazy-loaded via a toolbar toggle."""
+    cache_key = "federated_source_overlay"
+
+    def _fetch():
+        try:
+            # 1. Discover all Lakehouse Federation connections
+            connections_sql = (
+                "SELECT connection_name, connection_type, owner, created_at "
+                "FROM system.information_schema.connections"
+            )
+            connections = _execute_sql(connections_sql)
+
+            # 2. Find all FOREIGN catalogs
+            foreign_cat_sql = (
+                "SELECT catalog_name, connection_name "
+                "FROM information_schema.catalogs "
+                "WHERE catalog_type = 'FOREIGN_CATALOG'"
+            )
+            foreign_cats = _execute_sql(foreign_cat_sql)
+
+            if not foreign_cats:
+                return {
+                    "federated_tables": [],
+                    "connections": connections,
+                    "available": True,
+                }
+
+            # 3. For each foreign catalog, list its tables
+            federated_tables = []
+            conn_map = {c["connection_name"]: c.get("connection_type", "UNKNOWN")
+                        for c in connections}
+
+            for fc in foreign_cats:
+                cat_name = fc["catalog_name"]
+                conn_name = fc.get("connection_name", "")
+                conn_type = conn_map.get(conn_name, "UNKNOWN")
+                try:
+                    tables_sql = (
+                        f"SELECT table_schema, table_name, table_type "
+                        f"FROM `{cat_name}`.information_schema.tables "
+                        f"WHERE table_type IN ('FOREIGN', 'TABLE', 'VIEW')"
+                    )
+                    tables = _execute_sql(tables_sql)
+                    for t in tables:
+                        schema_name = t.get("table_schema", "")
+                        table_name = t.get("table_name", "")
+                        table_type = t.get("table_type", "TABLE")
+                        full_name = f"{cat_name}.{schema_name}.{table_name}"
+                        federated_tables.append({
+                            "full_name": full_name,
+                            "connection_name": conn_name,
+                            "connection_type": conn_type,
+                            "remote_catalog": None,
+                            "remote_schema": schema_name,
+                            "remote_object": table_name,
+                            "object_type": "VIEW" if table_type == "VIEW" else "TABLE",
+                            "is_view": table_type == "VIEW",
+                            "column_count": 0,
+                        })
+                except Exception as e:
+                    logger.warning(f"Failed to list tables in foreign catalog {cat_name}: {e}")
+                    continue
+
+            return {
+                "federated_tables": federated_tables,
+                "connections": connections,
+                "available": True,
+            }
+        except Exception as e:
+            logger.warning(f"Federated source overlay unavailable: {e}")
+            return {
+                "federated_tables": [],
+                "connections": [],
+                "available": False,
+            }
+
+    return _cached_fetch(cache_key, _fetch, skip_cache=skip_cache)

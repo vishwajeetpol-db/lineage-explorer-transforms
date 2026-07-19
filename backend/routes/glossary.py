@@ -13,6 +13,9 @@ Endpoints:
   GET    /api/glossary/kpis           — list KPI definitions
   POST   /api/glossary/kpis           — create or update a KPI definition
   GET    /api/glossary/for-table      — terms linked to a specific table
+  POST   /api/glossary/link           — link a term to a table/column
+  GET    /api/glossary/propagate-suggestions — suggest term propagation downstream
+  GET    /api/glossary/lineage-overlay — term overlay for lineage graph nodes
 
 Persisted in app-owned Delta tables:
   - glossary_terms (term_id, name, definition, domain, owner, ...)
@@ -340,5 +343,164 @@ async def link_term(request: Request, body: TermLinkIn):
                     'app', TIMESTAMP '{now}')
         """)
         return {"status": "ok", "link_id": lid}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===========================================================================
+# Business Lineage closure: Term Propagation + Graph Overlay (v2.5.2)
+# ===========================================================================
+
+@router.get("/propagate-suggestions")
+async def propagate_suggestions(
+    request: Request,
+    catalog: str = Query(...),
+    schema: str = Query(...),
+    table: str = Query(...),
+):
+    """Suggest glossary term propagation downstream via table lineage.
+
+    Given a source table with linked terms, walks downstream lineage and
+    identifies tables that don't yet have those terms linked.
+    Returns suggestions only — use POST /link to apply each one.
+
+    Bridges business context to technical lineage: a "Revenue" term tagged
+    on a source table can propagate to every downstream gold table.
+    """
+    _lazy_ensure()
+    fqn = f"{catalog}.{schema}.{table}"
+    safe_fqn = fqn.replace("'", "''")
+
+    try:
+        # 1. Get terms linked to the source table
+        source_terms = await asyncio.to_thread(_execute_sql, f"""
+            SELECT DISTINCT l.term_id, t.name AS term_name, t.domain
+            FROM {LINKS_TABLE} l JOIN {TERMS_TABLE} t ON l.term_id = t.term_id
+            WHERE l.asset_fqn = '{safe_fqn}' AND l.asset_type = 'table'
+        """)
+        if not source_terms:
+            return {"status": "ok", "suggestions": [], "note": "No terms linked to source table"}
+
+        term_ids = [r["term_id"] for r in source_terms]
+
+        # 2. Walk downstream tables (BFS, 3 hops max)
+        downstream_tables: set = set()
+        frontier = [fqn]
+        visited = {fqn}
+        for _ in range(3):
+            if not frontier:
+                break
+            next_frontier = []
+            for src in frontier[:20]:
+                try:
+                    rows = _execute_sql(f"""
+                        SELECT DISTINCT target_table_full_name
+                        FROM system.access.table_lineage
+                        WHERE source_table_full_name = '{src.replace(chr(39), chr(39)*2)}'
+                          AND event_time > current_timestamp() - INTERVAL 90 DAYS
+                        LIMIT 30
+                    """)
+                    for r in rows:
+                        tgt = r.get("target_table_full_name", "")
+                        if tgt and tgt not in visited:
+                            visited.add(tgt)
+                            downstream_tables.add(tgt)
+                            next_frontier.append(tgt)
+                except Exception:
+                    pass
+            frontier = next_frontier
+
+        if not downstream_tables:
+            return {"status": "ok", "suggestions": [], "note": "No downstream tables found"}
+
+        # 3. Find which downstream tables are missing these terms
+        suggestions = []
+        for tgt_table in sorted(downstream_tables)[:50]:
+            safe_tgt = tgt_table.replace("'", "''")
+            existing = _execute_sql(f"""
+                SELECT term_id FROM {LINKS_TABLE}
+                WHERE asset_fqn = '{safe_tgt}' AND asset_type = 'table'
+            """)
+            existing_ids = {r["term_id"] for r in existing}
+            missing = [t for t in source_terms if t["term_id"] not in existing_ids]
+            if missing:
+                suggestions.append({
+                    "target_table": tgt_table,
+                    "missing_terms": [{"term_id": t["term_id"], "name": t["term_name"], "domain": t.get("domain", "")} for t in missing],
+                })
+
+        return {
+            "source_table": fqn,
+            "source_terms": source_terms,
+            "downstream_count": len(downstream_tables),
+            "suggestions": suggestions,
+            "suggestion_count": len(suggestions),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/lineage-overlay")
+async def lineage_overlay(
+    request: Request,
+    catalog: str = Query(...),
+    schema: Optional[str] = Query(None),
+):
+    """Return business glossary overlay for a lineage graph.
+
+    Given a catalog (optionally schema), returns all term links within scope,
+    grouped by table — enabling the frontend to render term badges, domain
+    colors, and KPI indicators on lineage graph nodes.
+    """
+    _lazy_ensure()
+    scope_filter = f"l.asset_fqn LIKE '{catalog}.{schema}.%'" if schema else f"l.asset_fqn LIKE '{catalog}.%'"
+    try:
+        rows = await asyncio.to_thread(_execute_sql, f"""
+            SELECT l.asset_fqn, l.column_name, l.asset_type,
+                   t.term_id, t.name AS term_name, t.domain, t.status,
+                   d.color AS domain_color
+            FROM {LINKS_TABLE} l
+            JOIN {TERMS_TABLE} t ON l.term_id = t.term_id
+            LEFT JOIN {DOMAINS_TABLE} d ON t.domain = d.name
+            WHERE {scope_filter}
+            ORDER BY l.asset_fqn, t.name
+            LIMIT 500
+        """)
+
+        # Group by table for graph overlay rendering
+        by_table: dict = {}
+        for r in rows:
+            fqn = r.get("asset_fqn", "")
+            if fqn not in by_table:
+                by_table[fqn] = {"table": fqn, "terms": [], "domains": []}
+            by_table[fqn]["terms"].append({
+                "term_id": r.get("term_id"),
+                "name": r.get("term_name"),
+                "domain": r.get("domain"),
+                "domain_color": r.get("domain_color"),
+                "column": r.get("column_name") or None,
+                "status": r.get("status"),
+            })
+            domain = r.get("domain")
+            if domain and domain not in by_table[fqn]["domains"]:
+                by_table[fqn]["domains"].append(domain)
+
+        overlay = list(by_table.values())
+
+        # Also fetch KPIs in scope
+        kpis = await asyncio.to_thread(_execute_sql, f"""
+            SELECT kpi_id, name, formula_sql, source_tables, domain, granularity
+            FROM {KPIS_TABLE}
+            WHERE source_tables LIKE '%{catalog}%'
+            LIMIT 100
+        """)
+
+        return {
+            "catalog": catalog,
+            "schema": schema,
+            "overlay": overlay,
+            "table_count": len(overlay),
+            "kpis": kpis,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

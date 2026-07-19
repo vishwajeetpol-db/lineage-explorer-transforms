@@ -4,9 +4,13 @@ Export lineage data in OpenLineage-compatible JSON format for interop
 with Marquez, Atlan, DataHub, OpenMetadata, and other catalog systems.
 
 Endpoints:
-  GET  /api/export/openlineage        — export graph as OpenLineage events
-  GET  /api/export/openlineage/schema  — export as OpenLineage dataset facets
-  POST /api/import/openlineage        — ingest OpenLineage events into the graph
+  GET  /api/export/openlineage                — export graph as OpenLineage events
+  GET  /api/export/openlineage/schema         — export as OpenLineage dataset facets
+  POST /api/import/openlineage                — ingest OpenLineage events into the graph
+  POST /api/openlineage/producer/configure    — register an external OL-compatible endpoint
+  GET  /api/openlineage/producer/config       — view producer configuration
+  POST /api/openlineage/producer/produce      — detect recent writes and queue OL events
+  GET  /api/openlineage/producer/events       — view queued/delivered producer events
 
 OpenLineage spec: https://openlineage.io/spec/2-0-2/OpenLineage.json
 """
@@ -240,5 +244,234 @@ async def import_openlineage(request: Request, body: dict):
             imported += 1
 
         return {"status": "ok", "imported": imported}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===========================================================================
+# Live OpenLineage Producer — closes #17 to HAVE (v2.5.2)
+#
+# Architecture (decoupled, same pattern as webhook delivery):
+#   1. POST /producer/configure — register external OL endpoint (Marquez, Atlan, etc.)
+#   2. POST /producer/produce — detect lineage changes since last run, build OL events,
+#      queue them in `openlineage_producer_queue` Delta table
+#   3. External scheduled job reads queue and delivers via HTTP POST
+#   4. GET /producer/events — view queue status (pending/delivered/failed)
+# ===========================================================================
+
+LINEAGE_CATALOG = os.environ.get("LINEAGE_CATALOG", "lattice_lineage")
+LINEAGE_SCHEMA_NAME = os.environ.get("LINEAGE_SCHEMA", "lineage")
+PRODUCER_CONFIG_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA_NAME}.openlineage_producer_config"
+PRODUCER_QUEUE_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA_NAME}.openlineage_producer_queue"
+
+
+def _ensure_producer_tables() -> None:
+    """Lazily create producer tables."""
+    try:
+        _execute_sql(f"""CREATE TABLE IF NOT EXISTS {PRODUCER_CONFIG_TABLE} (
+            config_id STRING, endpoint_url STRING, endpoint_name STRING,
+            api_key_secret_scope STRING, api_key_secret_key STRING,
+            active BOOLEAN, created_at TIMESTAMP, updated_at TIMESTAMP
+        ) USING DELTA""")
+        _execute_sql(f"""CREATE TABLE IF NOT EXISTS {PRODUCER_QUEUE_TABLE} (
+            event_id STRING, event_json STRING, target_endpoint STRING,
+            status STRING, produced_at TIMESTAMP, delivered_at TIMESTAMP,
+            error_message STRING
+        ) USING DELTA""")
+    except Exception as e:
+        logger.warning(f"openlineage producer: could not ensure tables: {e}")
+
+
+_producer_tables_ensured = False
+
+
+def _lazy_ensure_producer():
+    global _producer_tables_ensured
+    if not _producer_tables_ensured:
+        _ensure_producer_tables()
+        _producer_tables_ensured = True
+
+
+@router.post("/api/openlineage/producer/configure")
+async def configure_producer(request: Request, body: dict):
+    """Register an external OpenLineage-compatible endpoint for event delivery.
+
+    Body:
+      endpoint_url: str — The HTTP endpoint to POST OL events to
+      endpoint_name: str — Friendly name (e.g. "Marquez", "Atlan", "DataHub")
+      api_key_secret_scope: str — (optional) Databricks secret scope for auth
+      api_key_secret_key: str — (optional) Secret key within scope
+    """
+    _lazy_ensure_producer()
+    endpoint_url = body.get("endpoint_url", "").strip()
+    endpoint_name = body.get("endpoint_name", "default").strip()
+    if not endpoint_url:
+        raise HTTPException(status_code=400, detail="endpoint_url is required")
+
+    import uuid
+    config_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    scope = (body.get("api_key_secret_scope") or "").replace("'", "''")[:200]
+    key = (body.get("api_key_secret_key") or "").replace("'", "''")[:200]
+
+    try:
+        await asyncio.to_thread(_execute_sql, f"""
+            MERGE INTO {PRODUCER_CONFIG_TABLE} t
+            USING (SELECT '{endpoint_name.replace(chr(39), chr(39)*2)}' AS endpoint_name) s
+            ON t.endpoint_name = s.endpoint_name
+            WHEN MATCHED THEN UPDATE SET
+                endpoint_url = '{endpoint_url.replace(chr(39), chr(39)*2)[:2000]}',
+                api_key_secret_scope = '{scope}',
+                api_key_secret_key = '{key}',
+                active = true,
+                updated_at = TIMESTAMP '{now}'
+            WHEN NOT MATCHED THEN INSERT
+                (config_id, endpoint_url, endpoint_name, api_key_secret_scope, api_key_secret_key, active, created_at, updated_at)
+            VALUES ('{config_id}', '{endpoint_url.replace(chr(39), chr(39)*2)[:2000]}',
+                    '{endpoint_name.replace(chr(39), chr(39)*2)}', '{scope}', '{key}',
+                    true, TIMESTAMP '{now}', TIMESTAMP '{now}')
+        """)
+        return {"status": "ok", "config_id": config_id, "endpoint_name": endpoint_name}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/openlineage/producer/config")
+async def get_producer_config(request: Request):
+    """View all configured OpenLineage producer endpoints."""
+    _lazy_ensure_producer()
+    try:
+        rows = await asyncio.to_thread(
+            _execute_sql, f"SELECT config_id, endpoint_url, endpoint_name, active, created_at, updated_at FROM {PRODUCER_CONFIG_TABLE} ORDER BY endpoint_name"
+        )
+        return {"endpoints": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/openlineage/producer/produce")
+async def produce_events(
+    request: Request,
+    catalog: str = Query(...),
+    schema: Optional[str] = Query(None),
+    lookback_hours: int = Query(24, ge=1, le=168),
+):
+    """Detect recent lineage-producing write events and queue OpenLineage events.
+
+    Scans system.access.table_lineage for recent activity (default: last 24h),
+    builds OpenLineage RunEvents for each new write detected, and stores them
+    in the producer queue for asynchronous delivery to configured endpoints.
+
+    Designed to be called by a scheduled Databricks job (e.g. hourly/daily).
+    """
+    _lazy_ensure_producer()
+    try:
+        # 1. Find recent lineage-producing writes
+        schema_filter = f"AND target_table_catalog = '{catalog}' AND target_table_schema = '{schema}'" if schema else f"AND target_table_catalog = '{catalog}'"
+        recent_writes = await asyncio.to_thread(_execute_sql, f"""
+            SELECT DISTINCT
+                source_table_full_name, target_table_full_name,
+                entity_type, entity_id, event_time
+            FROM system.access.table_lineage
+            WHERE event_time > current_timestamp() - INTERVAL {lookback_hours} HOURS
+              {schema_filter}
+            ORDER BY event_time DESC
+            LIMIT 200
+        """)
+
+        if not recent_writes:
+            return {"status": "ok", "events_produced": 0, "note": "No recent writes detected"}
+
+        # 2. Build OpenLineage events for each write
+        import uuid
+        now = datetime.now(timezone.utc).isoformat()
+        events_produced = 0
+
+        # Group by target table + entity (to consolidate inputs)
+        from collections import defaultdict
+        grouped = defaultdict(lambda: {"inputs": set(), "entity_type": "", "entity_id": "", "event_time": ""})
+        for row in recent_writes:
+            target = row.get("target_table_full_name", "")
+            entity = row.get("entity_id", "unknown")
+            key = f"{target}|{entity}"
+            source = row.get("source_table_full_name", "")
+            if source:
+                grouped[key]["inputs"].add(source)
+            grouped[key]["entity_type"] = row.get("entity_type", "JOB")
+            grouped[key]["entity_id"] = entity
+            grouped[key]["event_time"] = row.get("event_time", now)
+            grouped[key]["target"] = target
+
+        # 3. Queue each event
+        for key, data in list(grouped.items())[:100]:
+            target = data.get("target", "")
+            tgt_parts = target.split(".")
+            if len(tgt_parts) != 3:
+                continue
+
+            # Build input datasets
+            input_datasets = []
+            for src in data["inputs"]:
+                src_parts = src.split(".")
+                if len(src_parts) == 3:
+                    input_datasets.append(_table_to_openlineage_dataset(src_parts[0], src_parts[1], src_parts[2]))
+
+            output_ds = _table_to_openlineage_dataset(tgt_parts[0], tgt_parts[1], tgt_parts[2])
+            event = _build_openlineage_run_event(
+                source_tables=input_datasets,
+                target_table=output_ds,
+                entity_type=data["entity_type"],
+                entity_id=data["entity_id"],
+                event_time=data.get("event_time", now),
+            )
+
+            # Queue the event
+            eid = str(uuid.uuid4())
+            event_json = json.dumps(event).replace("'", "''")[:16000]
+            _execute_sql(f"""
+                INSERT INTO {PRODUCER_QUEUE_TABLE}
+                (event_id, event_json, target_endpoint, status, produced_at, delivered_at, error_message)
+                VALUES ('{eid}', '{event_json}', 'all', 'pending', TIMESTAMP '{now}', NULL, NULL)
+            """)
+            events_produced += 1
+
+        return {
+            "status": "ok",
+            "events_produced": events_produced,
+            "lookback_hours": lookback_hours,
+            "catalog": catalog,
+            "schema": schema,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/openlineage/producer/events")
+async def producer_events(
+    request: Request,
+    status_filter: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """View the OpenLineage producer event queue (pending/delivered/failed).
+
+    Used to monitor production health and debug delivery issues.
+    """
+    _lazy_ensure_producer()
+    where = f"WHERE status = '{status_filter.replace(chr(39), chr(39)*2)}'" if status_filter else ""
+    try:
+        rows = await asyncio.to_thread(
+            _execute_sql, f"""
+                SELECT event_id, target_endpoint, status, produced_at, delivered_at, error_message
+                FROM {PRODUCER_QUEUE_TABLE}
+                {where}
+                ORDER BY produced_at DESC
+                LIMIT {limit}
+            """
+        )
+        # Also get summary counts
+        counts = await asyncio.to_thread(
+            _execute_sql, f"SELECT status, COUNT(*) as cnt FROM {PRODUCER_QUEUE_TABLE} GROUP BY status"
+        )
+        return {"events": rows, "counts": {r["status"]: int(r["cnt"]) for r in counts}}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

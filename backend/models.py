@@ -97,6 +97,38 @@ class SharingOverlay(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Federated Source overlay — Lakehouse Federation foreign table enrichment.
+#
+# Mirrors the Delta Sharing overlay pattern: a lens layered on the existing
+# table DAG that enriches FOREIGN table nodes with connection metadata.
+# The frontend matches full_name values against graph nodes and renders
+# connection-type badges, dashed borders, and external-source annotations.
+# See FEDERATED_LINEAGE_DESIGN.docx Tier 1.
+# ---------------------------------------------------------------------------
+
+
+class FederatedTableEntry(BaseModel):
+    """A Unity Catalog FOREIGN table backed by a Lakehouse Federation connection."""
+    full_name: str                       # catalog.schema.table in Databricks UC
+    connection_name: str                  # e.g. 'oracle_prod_connection'
+    connection_type: str                  # ORACLE | SQLSERVER | POSTGRESQL | MYSQL |
+                                         # SNOWFLAKE | REDSHIFT | BIGQUERY | DATABRICKS
+    remote_catalog: Optional[str] = None  # database/instance name in source
+    remote_schema: Optional[str] = None   # schema/owner in source system
+    remote_object: Optional[str] = None   # table or view name in source
+    object_type: Optional[str] = None     # TABLE | VIEW | SYNONYM | unknown
+    is_view: bool = False
+    column_count: int = 0
+
+
+class FederatedSourceOverlay(BaseModel):
+    """Overlay for Lakehouse Federation foreign tables in the lineage graph."""
+    federated_tables: list[FederatedTableEntry] = []
+    connections: list[dict] = []          # name, type, owner, created_at
+    available: bool = True                # False when foreign catalogs aren't accessible
+
+
+# ---------------------------------------------------------------------------
 # Transformation Lineage Models — column-level expression-aware lineage
 # from the LATTICE pipeline (transformation_lineage library).
 #

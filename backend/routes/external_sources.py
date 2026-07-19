@@ -11,9 +11,17 @@ Endpoints:
   DELETE /api/external/sources/{id}     — remove an external source
   GET  /api/external/lineage            — get external lineage edges for a table
 
-Persisted in app-owned Delta table:
+  # OL Producer Bridge — closes #05 to HAVE (v2.5.3)
+  POST /api/external/ol-bridge/register          — register an OL-emitting platform + get receive URL
+  POST /api/external/ol-bridge/ingest/{source_id} — receive endpoint for external OL pushes
+  GET  /api/external/ol-bridge/sources           — list bridge sources with push stats
+  GET  /api/external/ol-bridge/events            — inspect received OL events
+
+Persisted in app-owned Delta tables:
   - external_sources (source_id, platform, name, connection_info, ...)
   - external_lineage_edges (edge_id, source_platform, source_asset, target_asset, ...)
+  - external_ol_bridge_sources (source_id, platform, name, receive_token, ...)
+  - external_ol_bridge_events (event_id, source_id, platform, job_name, ...)
 """
 from __future__ import annotations
 
@@ -291,5 +299,253 @@ async def get_external_lineage(
             _execute_sql, f"SELECT * FROM {EDGES_TABLE} WHERE {where} ORDER BY created_at DESC LIMIT {limit}"
         )
         return {"edges": rows, "count": len(rows)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===========================================================================
+# OpenLineage Producer Bridge — closes #05 Multi-Platform to HAVE (v2.5.3)
+#
+# Problem: PARTIAL status came from only exposing foreign catalogs as boundary
+# nodes. In-platform expression tracing inside Snowflake/BigQuery is out of
+# scope — but we don't need it. Platforms that natively emit OpenLineage
+# (Snowflake Horizon, BigQuery lineage API via OL adapter, Apache Spark/Flink
+# with the openlineage-spark integration, dbt Cloud, etc.) can push their
+# events directly to us. This gives genuine cross-platform lineage without
+# requiring us to own any in-platform compute.
+#
+# Architecture:
+#   1. Admin registers an external OL-emitting system via /ol-bridge/register.
+#      Returns a source_id that doubles as the receive token + the push URL.
+#   2. External system is configured to POST standard OpenLineage RunEvents to
+#      POST /api/external/ol-bridge/ingest/{source_id}.
+#   3. Events are stored in external_ol_bridge_events, tagged by platform.
+#   4. GET /api/external/ol-bridge/sources shows all registered platforms +
+#      push statistics (last_push_at, total_events).
+#   5. GET /api/external/ol-bridge/events lets operators inspect received edges.
+#
+# Supported OL-native emitters (no custom adapter needed):
+#   Snowflake Horizon (OL transport), Apache Spark + openlineage-spark,
+#   Apache Flink + openlineage-flink, dbt Core/Cloud, Airflow (2.7+ native OL),
+#   Great Expectations, Trino, BigQuery via OL Proxy sidecar.
+# ===========================================================================
+
+OL_BRIDGE_SOURCES_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.external_ol_bridge_sources"
+OL_BRIDGE_EVENTS_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.external_ol_bridge_events"
+
+
+def _ensure_bridge_tables() -> None:
+    """Lazily create OL bridge tables."""
+    try:
+        _execute_sql(f"""CREATE TABLE IF NOT EXISTS {OL_BRIDGE_SOURCES_TABLE} (
+            source_id STRING, platform STRING, name STRING, description STRING,
+            receive_token STRING, active BOOLEAN,
+            created_at TIMESTAMP, last_push_at TIMESTAMP, total_events LONG
+        ) USING DELTA""")
+        _execute_sql(f"""CREATE TABLE IF NOT EXISTS {OL_BRIDGE_EVENTS_TABLE} (
+            event_id STRING, source_id STRING, platform STRING,
+            job_namespace STRING, job_name STRING, run_id STRING,
+            input_datasets STRING, output_datasets STRING,
+            event_type STRING, event_time TIMESTAMP, received_at TIMESTAMP
+        ) USING DELTA""")
+    except Exception as e:
+        logger.warning(f"ol_bridge: could not ensure tables: {e}")
+
+
+_bridge_tables_ensured = False
+
+
+def _lazy_ensure_bridge():
+    global _bridge_tables_ensured
+    if not _bridge_tables_ensured:
+        _ensure_bridge_tables()
+        _bridge_tables_ensured = True
+
+
+class OLBridgeSourceIn(BaseModel):
+    platform: str  # snowflake | bigquery | spark | flink | dbt_cloud | airflow | custom
+    name: str       # friendly label, e.g. "Snowflake PROD"
+    description: Optional[str] = ""
+
+
+@router.post("/ol-bridge/register")
+async def register_ol_bridge_source(request: Request, body: OLBridgeSourceIn):
+    """Register an external OL-emitting platform as a lineage bridge source.
+
+    Supports any platform with an OpenLineage transport: Snowflake Horizon,
+    BigQuery (via OL proxy), Spark + openlineage-spark, Flink, dbt Cloud, etc.
+
+    Returns a source_id and the receive URL to configure on the external system.
+    The source_id acts as the authentication token — keep it secret.
+    """
+    _lazy_ensure_bridge()
+    source_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    platform_safe = body.platform.replace("'", "''")[:100]
+    name_safe = body.name.replace("'", "''")[:300]
+    desc_safe = (body.description or "").replace("'", "''")[:1000]
+    try:
+        _execute_sql(f"""
+            INSERT INTO {OL_BRIDGE_SOURCES_TABLE}
+            (source_id, platform, name, description, receive_token, active,
+             created_at, last_push_at, total_events)
+            VALUES ('{source_id}', '{platform_safe}', '{name_safe}', '{desc_safe}',
+                    '{source_id}', true, TIMESTAMP '{now}', NULL, 0)
+        """)
+        base_url = str(request.base_url).rstrip("/")
+        receive_url = f"{base_url}/api/external/ol-bridge/ingest/{source_id}"
+        return {
+            "status": "ok",
+            "source_id": source_id,
+            "platform": body.platform,
+            "receive_url": receive_url,
+            "instructions": (
+                f"Point {body.platform} OpenLineage transport to: POST {receive_url}. "
+                "Send a JSON body of the form {{\"events\": [<OL RunEvent>, ...]}} or a "
+                "single RunEvent object. The source_id in the path authenticates each push."
+            ),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/ol-bridge/ingest/{source_id}")
+async def ingest_ol_bridge_events(request: Request, source_id: str, body: dict):
+    """Receive OpenLineage RunEvents from an externally registered platform.
+
+    External systems (Snowflake Horizon, BigQuery, Spark, Flink, dbt Cloud,
+    Airflow 2.7+, etc.) POST their native OpenLineage events here.
+
+    Accepts:
+      { "events": [<RunEvent>, ...] }  — batch (up to 200 per request)
+      <RunEvent>                        — single event (auto-wrapped)
+
+    The source_id path parameter authenticates the push. Events are stored and
+    surfaced through GET /api/external/ol-bridge/events for graph integration.
+    """
+    _lazy_ensure_bridge()
+    safe_id = source_id.replace("'", "''")[:100]
+
+    # Validate source
+    try:
+        rows = await asyncio.to_thread(
+            _execute_sql,
+            f"SELECT platform, name FROM {OL_BRIDGE_SOURCES_TABLE} "
+            f"WHERE source_id = '{safe_id}' AND active = true LIMIT 1",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="Unknown or inactive OL bridge source")
+
+    platform = rows[0]["platform"]
+    platform_safe = platform.replace("'", "''")[:100]
+
+    # Normalize to event list
+    if "events" in body:
+        events = body["events"]
+    elif "eventType" in body:
+        events = [body]
+    else:
+        events = body.get("events", [])
+
+    if not events:
+        return {"status": "ok", "ingested": 0}
+
+    now = datetime.now(timezone.utc).isoformat()
+    ingested = 0
+
+    try:
+        for event in events[:200]:
+            eid = str(uuid.uuid4())
+            job = event.get("job", {})
+            run = event.get("run", {})
+            ns = job.get("namespace", "").replace("'", "''")[:500]
+            jname = job.get("name", "").replace("'", "''")[:500]
+            run_id_val = run.get("runId", "").replace("'", "''")[:200]
+            evt_type = event.get("eventType", "COMPLETE").replace("'", "''")[:50]
+            raw_evt_time = str(event.get("eventTime", now))
+            evt_time = raw_evt_time.replace("'", "''")[:50]
+            inputs_json = json.dumps(event.get("inputs", [])).replace("'", "''")[:4000]
+            outputs_json = json.dumps(event.get("outputs", [])).replace("'", "''")[:4000]
+
+            _execute_sql(f"""
+                INSERT INTO {OL_BRIDGE_EVENTS_TABLE}
+                (event_id, source_id, platform, job_namespace, job_name, run_id,
+                 input_datasets, output_datasets, event_type, event_time, received_at)
+                VALUES ('{eid}', '{safe_id}', '{platform_safe}',
+                        '{ns}', '{jname}', '{run_id_val}',
+                        '{inputs_json}', '{outputs_json}',
+                        '{evt_type}', TIMESTAMP '{evt_time}', TIMESTAMP '{now}')
+            """)
+            ingested += 1
+
+        # Update push stats on source record
+        await asyncio.to_thread(
+            _execute_sql,
+            f"""UPDATE {OL_BRIDGE_SOURCES_TABLE}
+                SET last_push_at = TIMESTAMP '{now}',
+                    total_events = COALESCE(total_events, 0) + {ingested}
+                WHERE source_id = '{safe_id}'""",
+        )
+
+        return {"status": "ok", "ingested": ingested, "source_id": source_id, "platform": platform}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/ol-bridge/sources")
+async def list_ol_bridge_sources(request: Request):
+    """List all registered OL bridge sources with push statistics.
+
+    Shows which external platforms are configured, when they last pushed,
+    and the total number of events received from each.
+    """
+    _lazy_ensure_bridge()
+    try:
+        rows = await asyncio.to_thread(
+            _execute_sql,
+            f"""SELECT source_id, platform, name, description, active,
+                       created_at, last_push_at, total_events
+                FROM {OL_BRIDGE_SOURCES_TABLE}
+                ORDER BY platform, name""",
+        )
+        return {"sources": rows, "count": len(rows)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/ol-bridge/events")
+async def get_ol_bridge_events(
+    request: Request,
+    source_id: Optional[str] = Query(None),
+    platform: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Inspect OL events received via the bridge.
+
+    Filterable by source_id or platform. Returns job names, namespaces,
+    input/output datasets, and timestamps — enabling operators to verify
+    that external platform lineage is flowing correctly before graph integration.
+    """
+    _lazy_ensure_bridge()
+    conditions = ["1=1"]
+    if source_id:
+        conditions.append(f"source_id = '{source_id.replace(chr(39), chr(39)*2)[:100]}'")
+    if platform:
+        conditions.append(f"platform = '{platform.replace(chr(39), chr(39)*2)[:100]}'")
+    where = " AND ".join(conditions)
+    try:
+        rows = await asyncio.to_thread(
+            _execute_sql,
+            f"""SELECT event_id, source_id, platform, job_namespace, job_name,
+                       event_type, event_time, received_at
+                FROM {OL_BRIDGE_EVENTS_TABLE}
+                WHERE {where}
+                ORDER BY received_at DESC
+                LIMIT {limit}""",
+        )
+        return {"events": rows, "count": len(rows)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
