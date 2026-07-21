@@ -119,7 +119,13 @@ async def import_dbt_manifest(request: Request, body: dict):
     - Model definitions and their source dependencies
     - Column-level lineage from model SQL
     - Test definitions as DQ rules
+
+    A2 FIX: Admin-gated — imports inject external lineage edges into the graph.
     """
+    from backend.main import _get_user_info
+    _, is_admin = _get_user_info(request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin required to import external lineage")
     _lazy_ensure()
     manifest = body.get("manifest", {})
     if not manifest:
@@ -195,7 +201,14 @@ async def import_dbt_manifest(request: Request, body: dict):
 
 @router.post("/airflow/import")
 async def import_airflow_lineage(request: Request, body: dict):
-    """Import Airflow DAG lineage from the Airflow REST API response format."""
+    """Import Airflow DAG lineage from the Airflow REST API response format.
+
+    A2 FIX: Admin-gated — imports inject external lineage edges.
+    """
+    from backend.main import _get_user_info
+    _, is_admin = _get_user_info(request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin required to import external lineage")
     _lazy_ensure()
     dags = body.get("dags", [])
     if not dags:
@@ -377,7 +390,15 @@ async def register_ol_bridge_source(request: Request, body: OLBridgeSourceIn):
 
     Returns a source_id and the receive URL to configure on the external system.
     The source_id acts as the authentication token — keep it secret.
+
+    A2/A15 FIX: Admin-gated — registration creates a trust anchor. Non-admins
+    should not be able to create endpoints that inject lineage events.
     """
+    # A2/A15 FIX: Require admin for OL bridge registration
+    from backend.main import _get_user_info
+    _, is_admin = _get_user_info(request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin required to register OL bridge sources")
     _lazy_ensure_bridge()
     source_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -424,9 +445,14 @@ async def ingest_ol_bridge_events(request: Request, source_id: str, body: dict):
     surfaced through GET /api/external/ol-bridge/events for graph integration.
     """
     _lazy_ensure_bridge()
+    # A15 FIX: Validate source_id is a proper UUID format (not arbitrary string)
+    import re
+    _UUID_RE = re.compile(r"^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$")
+    if not _UUID_RE.match(source_id):
+        raise HTTPException(status_code=400, detail="Invalid source_id format")
     safe_id = source_id.replace("'", "''")[:100]
 
-    # Validate source
+    # Validate source exists and is active
     try:
         rows = await asyncio.to_thread(
             _execute_sql,
@@ -437,7 +463,8 @@ async def ingest_ol_bridge_events(request: Request, source_id: str, body: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
     if not rows:
-        raise HTTPException(status_code=404, detail="Unknown or inactive OL bridge source")
+        # A15 FIX: Do NOT reveal whether the UUID exists — prevent enumeration
+        raise HTTPException(status_code=403, detail="Authentication failed")
 
     platform = rows[0]["platform"]
     platform_safe = platform.replace("'", "''")[:100]

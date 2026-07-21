@@ -14,6 +14,7 @@ Design:
 
 import os
 import logging
+import threading
 from datetime import datetime
 
 import requests as http_client
@@ -35,22 +36,30 @@ _raw_notebook_path = os.environ.get("PIPELINE_NOTEBOOK_PATH", "")
 
 
 def _derive_pipeline_notebook_path() -> str:
-    """Auto-derive the pipeline notebook path from the app's deployment location.
+    """Return the configured pipeline notebook path.
 
-    The app deploys to /Workspace/Users/<user>/<app-folder>/ and our
-    run_pipeline notebook lives at notebooks/run_pipeline relative to it.
-    Falls back to env-configured path or raises if nothing resolves.
+    A7 FIX: No longer derives from __file__ — in a Databricks App container,
+    __file__ resolves to container paths (e.g. /app/backend/build_service.py),
+    and prefixing /Workspace produces nonsense paths that fail on submission.
+
+    Now: require PIPELINE_NOTEBOOK_PATH to be explicitly set. If not set,
+    return empty string — callers must check is_build_configured() and fail
+    closed with a clear error message.
     """
     if _raw_notebook_path:
+        # Validate that it looks like a workspace path
+        if not _raw_notebook_path.startswith("/Workspace"):
+            logger.warning(
+                f"PIPELINE_NOTEBOOK_PATH does not start with /Workspace: {_raw_notebook_path}. "
+                "This may fail when submitting jobs."
+            )
         return _raw_notebook_path
-    # Derive from __file__ — this module lives at <app_root>/backend/build_service.py
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    app_root = os.path.dirname(this_dir)  # go up from backend/
-    candidate = os.path.join(app_root, "notebooks", "run_pipeline")
-    # Databricks workspace paths start with /Workspace — normalise
-    if not candidate.startswith("/Workspace"):
-        candidate = "/Workspace" + candidate if candidate.startswith("/") else candidate
-    return candidate
+    # A7 FIX: Do NOT try to derive — fail closed instead of producing bad paths
+    logger.info(
+        "PIPELINE_NOTEBOOK_PATH not set. Transform build will be unavailable. "
+        "Set it in databricks.yml env section to enable builds."
+    )
+    return ""
 
 
 PIPELINE_NOTEBOOK_PATH = _derive_pipeline_notebook_path()
@@ -67,6 +76,11 @@ BUILD_STEPS = [
     "Edge Materialization",
     "Cache Update",
 ]
+
+# A12 FIX: Per-table build lock prevents concurrent duplicate Jobs for same FQN.
+# Maps table_fqn → run_id of the currently in-progress build.
+_build_locks: dict[str, str] = {}
+_build_lock = threading.Lock()
 
 
 def _estimate_step_from_progress(pct: int) -> int:
@@ -108,6 +122,16 @@ def submit_build_job(
             "PIPELINE_NOTEBOOK_PATH is not configured. Set it in databricks.yml "
             "(env section) to the workspace path of the run_all notebook."
         )
+
+    # A12 FIX: Prevent concurrent builds for the same table
+    with _build_lock:
+        existing_run = _build_locks.get(target_table_fqn)
+        if existing_run:
+            logger.info(f"Build already in progress for {target_table_fqn}: run_id={existing_run}")
+            raise RuntimeError(
+                f"A build is already in progress for {target_table_fqn} (run_id={existing_run}). "
+                "Wait for it to complete or check /api/transform/status/{run_id}."
+            )
 
     client = _get_client()
     host = client.config.host.rstrip('/')
@@ -170,6 +194,10 @@ def submit_build_job(
     resp.raise_for_status()
     run_id = str(resp.json()["run_id"])
 
+    # A12 FIX: Register this build in the per-table lock
+    with _build_lock:
+        _build_locks[target_table_fqn] = run_id
+
     logger.info(f"Submitted build job for {target_table_fqn}: run_id={run_id}")
     return run_id
 
@@ -210,6 +238,14 @@ def get_build_status(run_id: str) -> BuildJobStatus:
         progress = _PROGRESS_MAP.get(lc, 0)
         is_complete = lc in _TERMINAL_STATES
         is_success = (result == RunResultState.SUCCESS) if result else False
+
+        # A12 FIX: Release per-table lock when build completes
+        if is_complete:
+            with _build_lock:
+                # Remove any entry whose run_id matches this completed run
+                to_remove = [k for k, v in _build_locks.items() if v == run_id]
+                for k in to_remove:
+                    del _build_locks[k]
 
         current_step = _estimate_step_from_progress(progress)
 

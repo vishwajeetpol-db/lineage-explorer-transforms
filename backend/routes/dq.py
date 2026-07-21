@@ -158,6 +158,8 @@ async def upsert_dq_rule(request: Request, rule: DQRuleIn):
         raise HTTPException(status_code=403, detail="Admin required to modify DQ rules.")
     if not _FULL_NAME_RE.match(rule.table_fqn):
         raise HTTPException(status_code=400, detail="Invalid table_fqn")
+    # A1 FIX: Validate expression at write time to prevent stored injection
+    _validate_expression(rule.expression, rule.rule_type)
     safe = lambda s: (s or "").replace("'", "")
     import hashlib
     rule_id = safe(rule.rule_id or hashlib.sha256(
@@ -342,24 +344,81 @@ async def dq_quality_propagation(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# A1 FIX: Blocklist of SQL injection patterns in CUSTOM/RANGE expressions.
+# These are patterns that should NEVER appear in a legitimate DQ expression.
+import re
+_INJECTION_PATTERNS = re.compile(
+    r"(;\s*DROP|;\s*DELETE|;\s*INSERT|;\s*UPDATE|;\s*ALTER|;\s*CREATE|;\s*EXEC|"
+    r"UNION\s+ALL\s+SELECT|UNION\s+SELECT|INTO\s+OUTFILE|LOAD_FILE|"
+    r"xp_cmdshell|information_schema|pg_catalog|sys\.dm_|"
+    r"/\*.*\*/|--\s|;\s*GRANT|;\s*REVOKE)",
+    re.IGNORECASE
+)
+
+# A1 FIX: Maximum expression length to prevent payload smuggling
+_MAX_EXPRESSION_LEN = 500
+
+
+def _validate_expression(expression: str, rule_type: str) -> str:
+    """A1 FIX: Validate DQ expression is safe before execution.
+
+    For CUSTOM rules, this is critical — the expression is interpolated
+    directly into SQL. We reject expressions containing known injection
+    patterns and enforce length limits.
+    """
+    if not expression:
+        return expression
+    if len(expression) > _MAX_EXPRESSION_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expression too long ({len(expression)} chars, max {_MAX_EXPRESSION_LEN})"
+        )
+    if _INJECTION_PATTERNS.search(expression):
+        raise HTTPException(
+            status_code=400,
+            detail="Expression contains disallowed SQL patterns (possible injection)"
+        )
+    # Reject unbalanced parentheses (common injection vector)
+    if expression.count("(") != expression.count(")"):
+        raise HTTPException(
+            status_code=400,
+            detail="Expression has unbalanced parentheses"
+        )
+    return expression
+
+
 def _build_check_sql(table_fqn: str, column: str, rule_type: str, expression: str, sample_size: int) -> str | None:
-    """Build a SQL query to evaluate a DQ rule and return total/passing row counts."""
+    """Build a SQL query to evaluate a DQ rule and return total/passing row counts.
+
+    A1 FIX: Expressions are validated against injection patterns before use.
+    """
     safe_col = f"`{column}`" if column else "*"
-    safe_tbl = table_fqn  # Already validated
+    safe_tbl = table_fqn  # Already validated via _FULL_NAME_RE
 
     if rule_type == "NOT_NULL" and column:
         return f"SELECT COUNT(*) AS total_rows, SUM(CASE WHEN {safe_col} IS NOT NULL THEN 1 ELSE 0 END) AS passing_rows FROM (SELECT * FROM {safe_tbl} LIMIT {sample_size})"
     elif rule_type == "UNIQUE" and column:
         return f"SELECT COUNT(*) AS total_rows, COUNT(DISTINCT {safe_col}) AS passing_rows FROM (SELECT * FROM {safe_tbl} LIMIT {sample_size})"
     elif rule_type == "RANGE" and expression:
-        # expression expected format: "min_val,max_val"
+        # A1 FIX: Validate range expression
+        _validate_expression(expression, "RANGE")
+        # expression expected format: "min_val,max_val" — values must be numeric
         parts = expression.split(",")
         if len(parts) == 2:
-            return f"SELECT COUNT(*) AS total_rows, SUM(CASE WHEN {safe_col} BETWEEN {parts[0].strip()} AND {parts[1].strip()} THEN 1 ELSE 0 END) AS passing_rows FROM (SELECT * FROM {safe_tbl} LIMIT {sample_size})"
+            try:
+                min_val = float(parts[0].strip())
+                max_val = float(parts[1].strip())
+            except ValueError:
+                return None  # Non-numeric range values — skip rather than inject
+            return f"SELECT COUNT(*) AS total_rows, SUM(CASE WHEN {safe_col} BETWEEN {min_val} AND {max_val} THEN 1 ELSE 0 END) AS passing_rows FROM (SELECT * FROM {safe_tbl} LIMIT {sample_size})"
     elif rule_type == "REGEX" and expression and column:
+        # A1 FIX: Validate regex expression
+        _validate_expression(expression, "REGEX")
         safe_expr = expression.replace("'", "''")
         return f"SELECT COUNT(*) AS total_rows, SUM(CASE WHEN {safe_col} RLIKE '{safe_expr}' THEN 1 ELSE 0 END) AS passing_rows FROM (SELECT * FROM {safe_tbl} LIMIT {sample_size})"
     elif rule_type == "CUSTOM" and expression:
+        # A1 FIX: Validate CUSTOM expression (most dangerous — executed directly)
+        _validate_expression(expression, "CUSTOM")
         safe_expr = expression.replace("'", "''")
         return f"SELECT COUNT(*) AS total_rows, SUM(CASE WHEN ({safe_expr}) THEN 1 ELSE 0 END) AS passing_rows FROM (SELECT * FROM {safe_tbl} LIMIT {sample_size})"
     return None

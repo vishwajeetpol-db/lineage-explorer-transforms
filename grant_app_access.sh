@@ -81,4 +81,20 @@ else
   echo "  (Lineage spans catalogs — grant BROWSE on every catalog you want visible.)"
 fi
 
+# A8 FIX: Grant system.query access (needed for BI consumer detection)
+echo "Granting access to system.query schema (BI consumer detection)…"
+run_sql "GRANT USE SCHEMA, SELECT ON SCHEMA system.query TO \`$SPN\`"
+
+# A8 FIX: Create and grant access to app-owned lineage schema
+LINEAGE_CATALOG="${LINEAGE_CATALOG:-lattice_lineage}"
+LINEAGE_SCHEMA="${LINEAGE_SCHEMA:-lineage}"
+echo "Creating app-owned schema $LINEAGE_CATALOG.$LINEAGE_SCHEMA…"
+run_sql "CREATE CATALOG IF NOT EXISTS \`$LINEAGE_CATALOG\`"
+run_sql "CREATE SCHEMA IF NOT EXISTS \`$LINEAGE_CATALOG\`.\`$LINEAGE_SCHEMA\`"
+run_sql "GRANT USE CATALOG ON CATALOG \`$LINEAGE_CATALOG\` TO \`$SPN\`"
+run_sql "GRANT USE SCHEMA ON SCHEMA \`$LINEAGE_CATALOG\`.\`$LINEAGE_SCHEMA\` TO \`$SPN\`"
+run_sql "GRANT CREATE TABLE ON SCHEMA \`$LINEAGE_CATALOG\`.\`$LINEAGE_SCHEMA\` TO \`$SPN\`"
+run_sql "GRANT SELECT, MODIFY ON SCHEMA \`$LINEAGE_CATALOG\`.\`$LINEAGE_SCHEMA\` TO \`$SPN\`"
+
+echo ""
 echo "Done. Verify with: curl -s <app-url>/api/diagnostics | python3 -m json.tool"

@@ -10,7 +10,8 @@ import resource
 import threading
 from collections import deque, OrderedDict
 
-APP_VERSION = "2.4.0"
+# A5 FIX: Single source of truth for version. Sync with package.json, README, CHANGELOG.
+APP_VERSION = "2.5.4"
 
 RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "60"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
@@ -147,12 +148,18 @@ def _get_user_info(request: Request) -> tuple[str | None, bool]:
     """
     user_token = request.headers.get("x-forwarded-access-token")
     if not user_token:
-        # Local-dev override: when LOCAL_DEV_ADMIN_EMAIL is set, return that as an admin user.
-        # The Apps proxy never sets x-forwarded-access-token in local uvicorn runs, so without
-        # this override is_admin would always be false locally. Production deploys never set this.
+        # Local-dev override: when LOCAL_DEV_ADMIN_EMAIL is set AND not running as a
+        # deployed Databricks App, return that as an admin user. The Apps proxy never
+        # sets x-forwarded-access-token in local uvicorn runs, so without this override
+        # is_admin would always be false locally.
+        # A14 FIX: Block this backdoor when DATABRICKS_APP_NAME is set (deployed App).
         local_dev_email = os.environ.get("LOCAL_DEV_ADMIN_EMAIL")
-        if local_dev_email:
+        is_deployed_app = bool(os.environ.get("DATABRICKS_APP_NAME"))
+        if local_dev_email and not is_deployed_app:
+            logger.info(f"LOCAL_DEV_ADMIN_EMAIL active (local dev): {local_dev_email}")
             return local_dev_email, True
+        if local_dev_email and is_deployed_app:
+            logger.critical("SECURITY: LOCAL_DEV_ADMIN_EMAIL is set on a deployed App — ignoring it")
         logger.warning("No x-forwarded-access-token header — cannot identify user")
         return None, False
 
@@ -203,8 +210,10 @@ def _get_user_info(request: Request) -> tuple[str | None, bool]:
 # Strict regex matches the README contract and forecloses SQL-quote escapes
 # even though identifiers are interpolated through backticks/quotes downstream.
 # ---------------------------------------------------------------------------
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_]{1,255}$")
-_FULL_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,255}\.[A-Za-z0-9_]{1,255}\.[A-Za-z0-9_]{1,255}$")
+# C15 FIX: Accept hyphens in identifiers — Unity Catalog allows them (e.g. "my-catalog").
+# Previously this regex rejected hyphens, inconsistent with backend/validators.py.
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
+_FULL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}\.[A-Za-z0-9_-]{1,255}\.[A-Za-z0-9_-]{1,255}$")
 _JOB_ID_RE = re.compile(r"^[0-9]{1,32}$")
 _PIPELINE_ID_RE = re.compile(r"^[a-fA-F0-9-]{8,64}$")
 _NOTEBOOK_ID_RE = re.compile(r"^[A-Za-z0-9_./@ +-]{1,512}$")
@@ -310,10 +319,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._lock = asyncio.Lock()
 
     def _get_user_key(self, request: Request) -> str:
-        """Extract user identity for rate limiting. Falls back to IP."""
+        """Extract user identity for rate limiting.
+
+        A11 FIX: Prefer x-forwarded-email (set by Apps proxy for identified users)
+        before falling back to token hash. Without this, all users behind the proxy
+        share a single rate-limit bucket keyed by the proxy's IP.
+        """
+        # Best: email header (unique per user, set by Apps proxy)
+        email = request.headers.get("x-forwarded-email", "")
+        if email:
+            return hashlib.sha256(email.encode()).hexdigest()[:16]
+        # Good: token hash (unique per session)
         token = request.headers.get("x-forwarded-access-token", "")
         if token:
             return hashlib.sha256(token.encode()).hexdigest()[:16]
+        # Fallback: IP (shared bucket — not ideal but last resort)
         return request.client.host if request.client else "unknown"
 
     async def dispatch(self, request: Request, call_next):
@@ -964,7 +984,15 @@ async def api_transform_invalidate(
 @app.post("/api/transform/build")
 async def api_transform_build(request: Request, body: BuildJobRequest):
     """Submit a serverless job to build transformation lineage for a table.
-    Requires the PIPELINE_NOTEBOOK_PATH to be configured."""
+    Requires the PIPELINE_NOTEBOOK_PATH to be configured.
+
+    A2 FIX: Admin-gated — builds submit serverless Jobs as the App SP,
+    consuming warehouse compute. Non-admins should not trigger builds.
+    """
+    # A2 FIX: Require admin for expensive build operations
+    email, is_admin = await asyncio.to_thread(_get_user_info, request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin required to submit build jobs")
     if not is_build_configured():
         raise HTTPException(
             status_code=503,

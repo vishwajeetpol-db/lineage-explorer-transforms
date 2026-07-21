@@ -7,6 +7,12 @@ Supplementary endpoints closing remaining scorecard gaps:
   #20 Notifications       → Webhook registration + delivery queue
 
 Register this router in main.py: app.include_router(capability_closures.router)
+
+Security fixes applied:
+  - A1:  All user inputs validated via _validate() before SQL interpolation
+  - A2:  Admin gates on auto-capture and record-metrics
+  - A10: bi_consumers returns {available: false} on infra failure instead of silent empty
+  - C8:  Streaming topology edge errors logged, not silently swallowed
 """
 from __future__ import annotations
 
@@ -22,6 +28,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
+from backend.validators import _IDENTIFIER_RE, _FULL_NAME_RE, _validate
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["capability-closures"])
@@ -52,6 +59,18 @@ def _execute_sql(sql: str) -> list[dict]:
     return [dict(zip(columns, row)) for row in resp.result.data_array]
 
 
+def _safe_identifier(value: Optional[str]) -> Optional[str]:
+    """Validate optional identifier input — returns None if empty, raises 400 if invalid."""
+    if not value:
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    if not _IDENTIFIER_RE.match(v):
+        raise HTTPException(status_code=400, detail=f"Invalid identifier: '{v[:50]}'")
+    return v
+
+
 # ===========================================================================
 # #02 — BI Tool Consumer Detection + Streaming Topology
 # ===========================================================================
@@ -64,12 +83,20 @@ async def bi_tool_consumers(
     days: int = Query(30, ge=1, le=365),
 ):
     """Detect BI tool consumers (Tableau, PowerBI, Looker, etc.)
-    via query history user-agent patterns. Returns tool type + frequency."""
+    via query history user-agent patterns. Returns tool type + frequency.
+
+    A1 FIX: catalog/table are validated before SQL interpolation.
+    A10 FIX: Returns {available: false, error: ...} on infra failure.
+    """
+    # A1 FIX: Validate inputs before SQL interpolation
+    safe_catalog = _safe_identifier(catalog)
+    safe_table = _safe_identifier(table)
+
     filters = []
-    if catalog:
-        filters.append(f"lower(statement_text) LIKE '%{catalog.lower()}%'")
-    if table:
-        filters.append(f"lower(statement_text) LIKE '%{table.lower()}%'")
+    if safe_catalog:
+        filters.append(f"lower(statement_text) LIKE '%{safe_catalog.lower()}%'")
+    if safe_table:
+        filters.append(f"lower(statement_text) LIKE '%{safe_table.lower()}%'")
     extra = ("AND " + " AND ".join(filters)) if filters else ""
     try:
         rows = await asyncio.to_thread(_execute_sql, f"""
@@ -83,13 +110,21 @@ async def bi_tool_consumers(
         """)
         return {"bi_consumers": rows, "lookback_days": days}
     except Exception as e:
-        return {"bi_consumers": [], "note": str(e)}
+        # A10 FIX: Signal infrastructure failure instead of silent empty
+        logger.warning(f"BI consumers query failed: {e}")
+        return {"bi_consumers": [], "available": False, "error": str(e)}
 
 
 @router.get("/api/lineage/streaming-topology")
 async def streaming_topology(request: Request, catalog: Optional[str] = Query(None)):
-    """Detect streaming tables + source edges for streaming topology view."""
-    cat_filter = f"AND t.table_catalog = '{catalog}'" if catalog else ""
+    """Detect streaming tables + source edges for streaming topology view.
+
+    A1 FIX: catalog validated before SQL interpolation.
+    C8 FIX: Edge-fetch errors logged instead of silently swallowed.
+    """
+    # A1 FIX: Validate catalog
+    safe_catalog = _safe_identifier(catalog)
+    cat_filter = f"AND t.table_catalog = '{safe_catalog}'" if safe_catalog else ""
     try:
         rows = await asyncio.to_thread(_execute_sql, f"""
             SELECT t.table_catalog, t.table_schema, t.table_name, t.data_source_format, t.last_altered
@@ -98,6 +133,7 @@ async def streaming_topology(request: Request, catalog: Optional[str] = Query(No
             ORDER BY t.table_catalog, t.table_schema, t.table_name LIMIT 500
         """)
         edges = []
+        edge_errors = 0
         for row in rows[:50]:
             fqn = f"{row['table_catalog']}.{row['table_schema']}.{row['table_name']}"
             try:
@@ -108,9 +144,14 @@ async def streaming_topology(request: Request, catalog: Optional[str] = Query(No
                 """)
                 for r in e:
                     edges.append({"target": fqn, "source": r.get("source_table_full_name", ""), "entity_type": r.get("entity_type", "")})
-            except Exception:
-                pass
-        return {"streaming_tables": rows, "streaming_edges": edges, "count": len(rows)}
+            except Exception as edge_err:
+                # C8 FIX: Log edge-fetch failures instead of silently passing
+                edge_errors += 1
+                logger.debug(f"Edge fetch failed for {fqn}: {edge_err}")
+        result = {"streaming_tables": rows, "streaming_edges": edges, "count": len(rows)}
+        if edge_errors:
+            result["edge_errors"] = edge_errors
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -122,7 +163,15 @@ async def streaming_topology(request: Request, catalog: Optional[str] = Query(No
 @router.post("/api/snapshots/auto-capture")
 async def auto_capture_all_scopes(request: Request):
     """Auto-capture snapshots for all catalogs with recent activity.
-    Call on schedule (daily job) to build version history automatically."""
+    Call on schedule (daily job) to build version history automatically.
+
+    A2 FIX: Admin-gated — expensive scan should not be triggerable by any user.
+    """
+    # A2 FIX: Require admin for expensive auto-capture operation
+    from backend.main import _get_user_info
+    _, is_admin = _get_user_info(request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin required for auto-capture")
     try:
         catalogs = await asyncio.to_thread(_execute_sql, """
             SELECT DISTINCT target_table_catalog AS catalog
@@ -160,16 +209,23 @@ async def auto_capture_all_scopes(request: Request):
 
 @router.get("/api/snapshots/timeline")
 async def snapshot_timeline(request: Request, scope: str = Query(...), days: int = Query(30)):
-    """Node/edge count timeline for a scope — visualize graph growth."""
+    """Node/edge count timeline for a scope — visualize graph growth.
+
+    A1 FIX: scope validated via _safe_identifier before SQL interpolation.
+    """
+    # A1 FIX: Validate scope
+    safe_scope = _safe_identifier(scope)
+    if not safe_scope:
+        raise HTTPException(status_code=400, detail="scope is required")
     try:
         rows = await asyncio.to_thread(_execute_sql, f"""
             SELECT snapshot_id, captured_at, node_count, edge_count, label
             FROM {SNAPSHOTS_TABLE}
-            WHERE scope = '{scope.replace(chr(39), chr(39)*2)}'
+            WHERE scope = '{safe_scope}'
               AND captured_at >= current_timestamp() - INTERVAL {days} DAYS
             ORDER BY captured_at ASC LIMIT 100
         """)
-        return {"scope": scope, "timeline": rows}
+        return {"scope": safe_scope, "timeline": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -191,11 +247,22 @@ def _ensure_dq_history():
 
 @router.post("/api/dq-rules/record-metrics")
 async def record_dq_metrics(request: Request, body: dict):
-    """Store a DQ metrics run for trending. Call after /api/dq-rules/metrics."""
+    """Store a DQ metrics run for trending. Call after /api/dq-rules/metrics.
+
+    A2 FIX: Admin-gated — writes to Delta should not be ungated.
+    """
+    # A2 FIX: Require admin for DQ metric recording
+    from backend.main import _get_user_info
+    _, is_admin = _get_user_info(request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin required to record DQ metrics")
     _ensure_dq_history()
     run_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     fqn = (body.get("table_fqn", "") or "").replace("'", "''")
+    # A1 FIX: Validate table_fqn format
+    if fqn and not _FULL_NAME_RE.match(fqn.replace("''", "'")):
+        raise HTTPException(status_code=400, detail="Invalid table_fqn format")
     try:
         await asyncio.to_thread(_execute_sql, f"""
             INSERT INTO {DQ_HISTORY_TABLE} VALUES (
@@ -210,13 +277,20 @@ async def record_dq_metrics(request: Request, body: dict):
 
 @router.get("/api/dq-rules/trends")
 async def dq_trends(request: Request, table_fqn: str = Query(...), days: int = Query(30)):
-    """Quality score trend over time. Returns direction: improving/stable/degrading."""
+    """Quality score trend over time. Returns direction: improving/stable/degrading.
+
+    A1 FIX: table_fqn validated against _FULL_NAME_RE.
+    """
+    # A1 FIX: Validate table_fqn
+    if not _FULL_NAME_RE.match(table_fqn):
+        raise HTTPException(status_code=400, detail="Invalid table_fqn format")
     _ensure_dq_history()
+    safe_fqn = table_fqn.replace(chr(39), chr(39)*2)
     try:
         rows = await asyncio.to_thread(_execute_sql, f"""
             SELECT run_id, quality_score, rules_evaluated, rules_passed, rules_failed, evaluated_at
             FROM {DQ_HISTORY_TABLE}
-            WHERE table_fqn = '{table_fqn.replace(chr(39), chr(39)*2)}'
+            WHERE table_fqn = '{safe_fqn}'
               AND evaluated_at >= current_timestamp() - INTERVAL {days} DAYS
             ORDER BY evaluated_at ASC LIMIT 200
         """)
@@ -232,8 +306,13 @@ async def dq_trends(request: Request, table_fqn: str = Query(...), days: int = Q
 
 @router.get("/api/dq-rules/pipeline-expectations")
 async def pipeline_expectations(request: Request, catalog: Optional[str] = Query(None)):
-    """List SDP pipeline expectations from streaming/materialized tables."""
-    cat_filter = f"AND table_catalog = '{catalog}'" if catalog else ""
+    """List SDP pipeline expectations from streaming/materialized tables.
+
+    A1 FIX: catalog validated before SQL interpolation.
+    """
+    # A1 FIX: Validate catalog
+    safe_catalog = _safe_identifier(catalog)
+    cat_filter = f"AND table_catalog = '{safe_catalog}'" if safe_catalog else ""
     try:
         rows = await asyncio.to_thread(_execute_sql, f"""
             SELECT table_catalog, table_schema, table_name, table_type
