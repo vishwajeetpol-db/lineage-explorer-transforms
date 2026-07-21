@@ -1,4 +1,4 @@
-# BrickRoute — Architecture & Functionality Reference
+# BrickTrace — Architecture & Functionality Reference
 
 > **Version**: 2.4.0
 > **Tech Stack**: FastAPI · React · TypeScript · ReactFlow · ELK.js · Databricks Apps · DABs
@@ -10,7 +10,7 @@
 
 ## 1. Overview
 
-BrickRoute is a unified, self-contained Databricks App that provides:
+BrickTrace is a unified, self-contained Databricks App that provides:
 
 1. **Table-level lineage** — end-to-end DAG visualization across all Unity Catalog catalogs
 2. **Column-level lineage** — traced from `system.access.column_lineage` edges
@@ -28,7 +28,7 @@ All functionality is **self-contained** — zero external code references. The a
 
 ## 1.1 Expression-Level Transformation Lineage: Reconstructing the "How" Behind Every Column
 
-**This is what makes BrickRoute unique.** Unity Catalog records column *dependency* edges — that "column A depends on column B." BrickRoute goes a layer deeper: it reconstructs the **actual transformation expression** that produced each column — the precise SQL/PySpark logic (`cast`, `sum`, `concat`, `CASE`, window functions, CTE chains) — and tags each derivation with a transform category. It does this by *genuinely parsing the producing code*, then serves it as an interactive, per-column upstream drill-down.
+**This is what makes BrickTrace unique.** Unity Catalog records column *dependency* edges — that "column A depends on column B." BrickTrace goes a layer deeper: it reconstructs the **actual transformation expression** that produced each column — the precise SQL/PySpark logic (`cast`, `sum`, `concat`, `CASE`, window functions, CTE chains) — and tags each derivation with a transform category. It does this by *genuinely parsing the producing code*, then serves it as an interactive, per-column upstream drill-down.
 
 What makes that hard — and what the engine does:
 
@@ -324,7 +324,7 @@ The store has **12 Delta tables** (`storage/schema.py`): `lineage_nodes`, `linea
 ```bash
 # Deploy to dev
 databricks bundle deploy -t dev --profile <profile> --var warehouse_id=<id>
-databricks bundle run brickroute -t dev --profile <profile>
+databricks bundle run bricktrace -t dev --profile <profile>
 
 # Deploy to prod
 databricks bundle deploy -t prod --profile <profile> --var warehouse_id=<id>

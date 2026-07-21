@@ -19,7 +19,7 @@
 # =============================================================================
 set -euo pipefail
 
-APP_NAME="${APP_NAME:-brickroute-dev}"
+APP_NAME="${APP_NAME:-bricktrace-dev}"
 PROFILE="${PROFILE:-DEFAULT}"
 WAREHOUSE_ID="${WAREHOUSE_ID:-}"
 CATALOGS="${CATALOGS:-}"

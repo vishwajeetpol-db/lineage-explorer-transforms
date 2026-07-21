@@ -1,6 +1,6 @@
 # Capabilities Catalog
 
-Every capability BrickRoute ships, grouped by whether it's always on or
+Every capability BrickTrace ships, grouped by whether it's always on or
 gated behind the [Control Panel](#control-panel) (added in 2.4.0). "Always on"
 capabilities need no setup beyond the base deploy in [README.md](../README.md).
 Gated capabilities are OFF by default for every new deploy and every existing

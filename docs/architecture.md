@@ -1,4 +1,4 @@
-# Architecture — BrickRoute (Combined App)
+# Architecture — BrickTrace (Combined App)
 
 Version 2.4.0. This document covers the combined app's architecture end to end,
 with focus on the three capabilities added in 2.4.0: **Control Panel**,

@@ -205,7 +205,7 @@ def get_capability_live_billing(flag_id: str) -> dict:
             f"  SUM(usage_quantity * list_price) AS total_usd "
             f"FROM system.billing.usage "
             f"WHERE usage_date >= dateadd(DAY, -30, current_date()) "
-            f"  AND custom_tags.brickroute_target_table IN ({table_names})"
+            f"  AND custom_tags.bricktrace_target_table IN ({table_names})"
         )
         r = rows[0] if rows else {}
         dbu = float(r.get("total_dbu") or 0.0)

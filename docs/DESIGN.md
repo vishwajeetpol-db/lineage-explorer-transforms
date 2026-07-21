@@ -1,8 +1,8 @@
-# BrickRoute — Unified Design Document
+# BrickTrace — Unified Design Document
 
 ## Overview
 
-BrickRoute combines two lineage capabilities into a single app with a **macro → micro** interaction model:
+BrickTrace combines two lineage capabilities into a single app with a **macro → micro** interaction model:
 
 | Zoom Level | Source | What You See |
 | --- | --- | --- |

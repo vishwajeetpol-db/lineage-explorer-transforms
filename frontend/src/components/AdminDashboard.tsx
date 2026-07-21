@@ -275,7 +275,7 @@ function AdminDashboard({ open, onClose }: Props) {
               {/* Matrix rain effect bottom */}
               <div className="px-6 py-3 border-t border-emerald-500/10 flex items-center justify-between">
                 <span className="font-mono text-[9px] text-emerald-500/30">Auto-refresh: 10s</span>
-                <span className="font-mono text-[9px] text-emerald-500/30">BrickRoute v{status?.system?.python_version || "?"}</span>
+                <span className="font-mono text-[9px] text-emerald-500/30">BrickTrace v{status?.system?.python_version || "?"}</span>
               </div>
             </div>
           </motion.div>

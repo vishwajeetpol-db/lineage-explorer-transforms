@@ -513,10 +513,10 @@ databricks bundle deploy -t dev \
   --var warehouse_id=<your-warehouse-id>
 
 # 4. Start
-databricks bundle run brickroute -t dev --profile <your-profile>
+databricks bundle run bricktrace -t dev --profile <your-profile>
 
 # 5. Get URL
-databricks apps get brickroute-dev --profile <your-profile> -o json \
+databricks apps get bricktrace-dev --profile <your-profile> -o json \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['url'])"
 ```
 
@@ -546,7 +546,7 @@ Then deploy with `--profile my-spn-profile`. See [OAuth M2M authentication](http
 **Grant permissions to the app SPN:**
 
 ```bash
-APP_SPN=$(databricks apps get brickroute-dev --profile <your-profile> -o json \
+APP_SPN=$(databricks apps get bricktrace-dev --profile <your-profile> -o json \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['service_principal_client_id'])")
 ```
 

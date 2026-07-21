@@ -1,29 +1,8 @@
 # Changelog
 
-All notable changes to BrickRoute are documented in this file.
+All notable changes to BrickTrace are documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-
----
-
-## [2.5.3] - 2026-07-20
-
-> **OL producer bridge** — closes #05 Multi-Platform to HAVE. Scorecard moves from 18/2/0 to **19 HAVE / 1 PARTIAL / 0 GAP**. External OL-emitting platforms (Snowflake, BigQuery, Spark, Flink, dbt Cloud, Airflow 2.7+) now bridge their native lineage into the graph via a dedicated push endpoint.
-
-### Added
-
-- **`POST /api/external/ol-bridge/register`** — admin registers an external OL-emitting platform (Snowflake Horizon, BigQuery via OL proxy, Spark + `openlineage-spark`, Flink, dbt Cloud, Airflow 2.7+). Returns a `source_id` + a receive URL the external system pushes to. (Closes #05 Multi-Platform)
-- **`POST /api/external/ol-bridge/ingest/{source_id}`** — public receive endpoint. External platforms POST standard OpenLineage RunEvents (single or batch up to 200 per request). Authenticates via `source_id` in path; stores events in `external_ol_bridge_events`.
-- **`GET /api/external/ol-bridge/sources`** — list all registered bridge sources with push statistics: `last_push_at`, `total_events`, `active` flag.
-- **`GET /api/external/ol-bridge/events`** — inspect received OL events, filterable by `source_id` or `platform`. Lets operators verify lineage is flowing before graph integration.
-- **New Delta tables**: `external_ol_bridge_sources`, `external_ol_bridge_events` (auto-created on first use).
-- **OL bridge subsystem entry** added to `docs/capability_code_map.md` Part C.
-
-### Changed
-
-- **#05 Multi-Platform → HAVE** — the OL bridge inverts the integration model: instead of BrickRoute reaching into external systems (out of scope), external systems push their native OpenLineage events to us. Covers any platform with an OL transport. Foreign catalog boundary nodes (federated overlay) remain as a complementary passive signal.
-- **`docs/capability_code_map.md`** updated to 19/1/0 scorecard summary with v2.5.3 closure history entry.
-- **`APP_VERSION` → `2.5.3`**.
 
 ---
 

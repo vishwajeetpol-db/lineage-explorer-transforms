@@ -255,7 +255,7 @@ async def lifespan(app: FastAPI):
     import concurrent.futures
     loop = asyncio.get_running_loop()
     loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=64))
-    logger.info("BrickRoute starting up — thread pool set to 64 workers, clearing stale caches")
+    logger.info("BrickTrace starting up — thread pool set to 64 workers, clearing stale caches")
     # Activate performance patches (parallelism wrappers for catalog enumeration,
     # BFS trace walks, cost cache refresh, and column fetch). Idempotent.
     from backend.startup import activate as _activate_perf
@@ -278,7 +278,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        logger.info("BrickRoute shutting down — cancelling background tasks, clearing caches")
+        logger.info("BrickTrace shutting down — cancelling background tasks, clearing caches")
         if prefetch_task and not prefetch_task.done():
             prefetch_task.cancel()
             try:
@@ -288,7 +288,7 @@ async def lifespan(app: FastAPI):
         invalidate_cache()
 
 
-app = FastAPI(title="BrickRoute", version=APP_VERSION, lifespan=lifespan)
+app = FastAPI(title="BrickTrace", version=APP_VERSION, lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------

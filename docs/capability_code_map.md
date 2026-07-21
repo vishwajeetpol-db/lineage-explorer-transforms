@@ -1,6 +1,6 @@
 # Capability → Code Map
 
-> Debugging index for BrickRoute. Maps the **20 scorecard capabilities** (from capability-matrix PDF)
+> Debugging index for BrickTrace. Maps the **20 scorecard capabilities** (from capability-matrix PDF)
 > AND the **full feature inventory** (48 routes/subsystems) to code anchors.
 > Status: **HAVE** / **PARTIAL** / **GAP** — with closure notes for each.
 

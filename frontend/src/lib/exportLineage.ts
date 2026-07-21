@@ -74,7 +74,7 @@ export function exportLineageToExcel(input: ExportInput): void {
   sheets.push({
     name: "Summary",
     rows: [
-      [{ v: "BrickRoute — export", s: "title" }],
+      [{ v: "BrickTrace — export", s: "title" }],
       [],
       [L("Scope"), scope],
       [L("Target"), { v: scopeLabel, s: "mono" }],

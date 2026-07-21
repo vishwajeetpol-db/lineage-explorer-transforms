@@ -1,12 +1,22 @@
 <p align="center">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="96" height="96">
-<polygon points="50,4 96,27 50,50 4,27" fill="#FF5520"/>
-<polygon points="4,27 50,50 50,96 4,73" fill="#BB2700"/>
-<polygon points="96,27 50,50 50,96 96,73" fill="#DD3700"/>
+<polygon points="50,82 85,65 50,48 15,65" fill="#8B1A00"/>
+<polygon points="15,65 50,82 50,90 15,73" fill="#6B1400"/>
+<polygon points="85,65 50,82 50,90 85,73" fill="#7A1800"/>
+<polygon points="50,68 85,51 50,34 15,51" fill="#BB2700"/>
+<polygon points="15,51 50,68 50,76 15,59" fill="#991F00"/>
+<polygon points="85,51 50,68 50,76 85,59" fill="#AA2300"/>
+<polygon points="50,54 85,37 50,20 15,37" fill="#DD3700"/>
+<polygon points="15,37 50,54 50,62 15,45" fill="#BB2700"/>
+<polygon points="85,37 50,54 50,62 85,45" fill="#CC3000"/>
+<polygon points="50,40 85,23 50,6 15,23" fill="#FF5520"/>
+<polygon points="15,23 50,40 50,48 15,31" fill="#DD3700"/>
+<polygon points="85,23 50,40 50,48 85,31" fill="#EE4410"/>
 </svg>
 </p>
 
-<h1 align="center">BrickRoute</h1>
+<h1 align="center"><span style="color:#1a1a2e">Brick</span><span style="color:#FF3621">Trace</span></h1>
+<p align="center"><em>End-to-End Data Lineage for Databricks</em></p>
 
 <p align="center">
   <strong>Unified lineage visualization with transformation drill-down</strong> — end-to-end table &amp; column lineage, expression-level transformation graphs, pipeline/job visibility, serverless cost, and Delta Sharing, across every catalog in your metastore. One command to deploy; zero access to your row data.
@@ -23,7 +33,7 @@
 
 ---
 
-Unity Catalog captures lineage from every SQL operation — but reading it means querying system tables by hand. BrickRoute turns those system tables into an interactive graph, deployed as a Databricks App and shared across your whole workspace.
+Unity Catalog captures lineage from every SQL operation — but reading it means querying system tables by hand. BrickTrace turns those system tables into an interactive graph, deployed as a Databricks App and shared across your whole workspace.
 
 ## Features
 
@@ -36,7 +46,7 @@ This is the user-visible capability inventory. `docs/capability_code_map.md` is 
 - **In-graph exploration tools.** Cmd/Ctrl+K graph search, drag-to-rearrange, reset/fit-view behavior, hover tooltips, orphan highlighting, and large-graph layout retries are built in.
 - **Column-level lineage** traced from real `system.access.column_lineage` edges — no name-matching heuristics, zero false positives.
 - **Cross-schema / cross-catalog node enrichment.** External-in-scope tables render as distinct nodes with full metadata and remain expandable/clickable for lineage tracing rather than collapsing into anonymous placeholders.
-- **Expression-level transformation lineage — the part that's genuinely unique.** Unity Catalog records that "column A depends on column B." BrickRoute goes a layer deeper and reconstructs the **actual SQL/PySpark expression** that produced each column — `cast`, `sum`, `concat`, `CASE`, window functions, CTE chains — tagged with a transform category, by genuinely **parsing the producing code**. Coverage spans every producer type: notebook/Python/SQL-file jobs, Python- and SQL-defined DLT pipelines, view/materialized-view/streaming-table definitions, and ad-hoc query history. Click any column → see *how* it was derived, traced upstream. *(See [docs/DESIGN.md](docs/DESIGN.md).)*
+- **Expression-level transformation lineage — the part that's genuinely unique.** Unity Catalog records that "column A depends on column B." BrickTrace goes a layer deeper and reconstructs the **actual SQL/PySpark expression** that produced each column — `cast`, `sum`, `concat`, `CASE`, window functions, CTE chains — tagged with a transform category, by genuinely **parsing the producing code**. Coverage spans every producer type: notebook/Python/SQL-file jobs, Python- and SQL-defined DLT pipelines, view/materialized-view/streaming-table definitions, and ad-hoc query history. Click any column → see *how* it was derived, traced upstream. *(See [docs/DESIGN.md](docs/DESIGN.md).)*
 - **Transformation freshness + on-demand Lineage Builder.** The transform panel checks whether a table's transformation lineage exists or is stale, can submit a build/regenerate job, and polls build progress when serverless build execution is configured.
 - **Transformation lineage diagnostics** — when a build materialises nothing, the app explains *why* instead of a generic "not generated yet": no producing pipeline found (source/ingested table), producer last ran outside the discovery window (with the exact age), or producer source couldn't be read (with the missing permission). Each reason includes a suggested fix. (`GET /api/transform/diagnose`)
 - **Delta Sharing, always in the picture.** Shared-in sources and shared-out targets show up as part of lineage (with provider/recipient boundary nodes). The trace stops honestly at the metastore boundary — we can't read the other account.
@@ -70,9 +80,9 @@ Deploying to your own workspace is a short ordered checklist — not every step 
 
     databricks auth login --profile <profile>
     databricks bundle deploy -t dev --profile <profile> --var warehouse_id=<warehouse-id>
-    databricks bundle run brickroute -t dev --profile <profile>
+    databricks bundle run bricktrace -t dev --profile <profile>
 
-> The app name defaults to `brickroute-dev` (dev) / `brickroute` (prod). In a shared workspace, override it to avoid collisions: `--var app_name=<your-name>`.
+> The app name defaults to `bricktrace-dev` (dev) / `bricktrace` (prod). In a shared workspace, override it to avoid collisions: `--var app_name=<your-name>`.
 
 **2. Grant the app's service principal** (as a **metastore admin**). The SP only exists after step 1. Easiest path — the helper resolves the SP and applies the grants:
 

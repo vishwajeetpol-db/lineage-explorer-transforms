@@ -36,24 +36,24 @@ router = APIRouter(prefix="/api/pipeline", tags=["pipeline-installer"])
 
 LINEAGE_CATALOG = os.environ.get("LINEAGE_CATALOG", "lattice_lineage")
 LINEAGE_SCHEMA = os.environ.get("LINEAGE_SCHEMA", "lineage")
-_CAPTURE_SENTINEL = "# [BrickRoute] capture install sentinel"
+_CAPTURE_SENTINEL = "# [BrickTrace] capture install sentinel"
 
 _PIP_CELL_TEMPLATE = textwrap.dedent("""\
     {sentinel}
-    # Auto-injected by BrickRoute pipeline installer (capability 29).
+    # Auto-injected by BrickTrace pipeline installer (capability 29).
     # Remove both this cell and the capture() call cell to opt out.
     %pip install databricks-sdk --quiet
-    # The capture module ships with the BrickRoute app; import it directly.
+    # The capture module ships with the BrickTrace app; import it directly.
     import sys, os
     sys.path.insert(0, '/Workspace/Users')  # adjust if app path differs
     """).format(sentinel=_CAPTURE_SENTINEL)
 
 _CAPTURE_CELL_TEMPLATE = textwrap.dedent("""\
-    # [BrickRoute] capture() call — auto-injected.
+    # [BrickTrace] capture() call — auto-injected.
     # Place this immediately BEFORE your pipeline write call.
     # capture() is non-fatal: it never raises and never performs the write itself.
-    from backend.plan_capture import capture as _brickroute_capture
-    _brickroute_capture(result_df, target="{target_table}")
+    from backend.plan_capture import capture as _bricktrace_capture
+    _bricktrace_capture(result_df, target="{target_table}")
     # Your existing write call follows unchanged.
     """)
 

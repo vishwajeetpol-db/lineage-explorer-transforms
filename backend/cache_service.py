@@ -1,8 +1,8 @@
-"""Distributed cache service for BrickRoute — closes #18 Scalability (v2.5.4).
+"""Distributed cache service for BrickTrace — closes #18 Scalability (v2.5.4).
 
 Architecture
 ------------
-BrickRoute may run as multiple App replicas. Each replica carries its own
+BrickTrace may run as multiple App replicas. Each replica carries its own
 in-process LRU (lineage_service.py). When replica A warms a cache entry,
 replica B is unaware of it and repeats the expensive DBSQL lineage scan on
 its first request for the same scope.

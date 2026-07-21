@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 
-const STORAGE_KEY = "brickroute:recents";
+const STORAGE_KEY = "bricktrace:recents";
 const MAX_RECENTS = 10;
 
 function readFromStorage(): string[] {

@@ -167,7 +167,7 @@ def trigger_peer_sync_job(peer_alias: str, actor: str) -> dict:
 
     The sync job is expected to be a pre-configured Lakeflow Job whose name
     is stored as a `sync_job_id` in the federated_peers table, or whose name
-    follows the convention `brickroute_federated_sync_<peer_alias>`.
+    follows the convention `bricktrace_federated_sync_<peer_alias>`.
 
     Returns {job_id, run_id, run_url} on success, or {error} on failure.
     Non-fatal.
@@ -185,7 +185,7 @@ def trigger_peer_sync_job(peer_alias: str, actor: str) -> dict:
         client = _get_client()
         if not job_id_str:
             # Try to find by naming convention
-            job_name = f"brickroute_federated_sync_{peer_alias}"
+            job_name = f"bricktrace_federated_sync_{peer_alias}"
             jobs = list(client.jobs.list(name=job_name))
             if not jobs:
                 return {"error": f"No sync job found for peer '{peer_alias}'. Create a job named '{job_name}' or add a sync_job_id column to {PEERS_TABLE}."}

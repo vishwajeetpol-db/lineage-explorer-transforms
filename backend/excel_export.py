@@ -282,7 +282,7 @@ def _build_lineage_map_sheet(wb, all_nodes, raw_edges, entity_names=None, sheet_
         tl.value = box_text(node)
         tl.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         tl.font = Font(bold=True, size=10, color=font_hex)
-        c = Comment(box_note(node), "BrickRoute")
+        c = Comment(box_note(node), "BrickTrace")
         c.width, c.height = 320, 90
         tl.comment = c
 
@@ -393,7 +393,7 @@ def build_lineage_workbook(catalog: str, schema: str | None, result, column_edge
     # --- Summary ---
     ws = wb.active
     ws.title = "Summary"
-    ws["A1"] = "BrickRoute — export"
+    ws["A1"] = "BrickTrace — export"
     ws["A1"].font = title_font
     summary = [
         ("Scope", scope),

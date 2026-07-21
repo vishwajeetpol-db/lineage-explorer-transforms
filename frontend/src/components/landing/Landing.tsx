@@ -63,9 +63,15 @@ function Landing({ onSelectTable }: Props) {
         <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(99,102,241,0.06)_0%,transparent_70%)]" />
         <div className="relative z-10 flex flex-col items-center gap-4">
           <svg width="52" height="52" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style={{filter: "drop-shadow(0 0 18px rgba(255,85,32,0.35))"}}>
-            <polygon points="16,3 28,10 16,17 4,10" fill="#FF5520"/>
-            <polygon points="4,10 16,17 16,28 4,21" fill="#BB2700"/>
-            <polygon points="28,10 16,17 16,28 28,21" fill="#DD3700"/>
+            <polygon points="16,24 27,18 16,12 5,18" fill="#8B1A00"/>
+            <polygon points="5,18 16,24 16,27 5,21" fill="#6B1400"/>
+            <polygon points="27,18 16,24 16,27 27,21" fill="#7A1800"/>
+            <polygon points="16,19 27,13 16,7 5,13" fill="#DD3700"/>
+            <polygon points="5,13 16,19 16,22 5,16" fill="#BB2700"/>
+            <polygon points="27,13 16,19 16,22 27,16" fill="#CC3000"/>
+            <polygon points="16,14 27,8 16,2 5,8" fill="#FF5520"/>
+            <polygon points="5,8 16,14 16,17 5,11" fill="#DD3700"/>
+            <polygon points="27,8 16,14 16,17 27,11" fill="#EE4410"/>
           </svg>
           <Loader2 size={24} className="text-accent animate-spin" />
           <p className="text-sm text-slate-500">Loading tables...</p>
@@ -81,9 +87,15 @@ function Landing({ onSelectTable }: Props) {
         <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(99,102,241,0.06)_0%,transparent_70%)]" />
         <div className="relative z-10 flex flex-col items-center gap-4">
           <svg width="52" height="52" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style={{filter: "drop-shadow(0 0 18px rgba(255,85,32,0.35))"}}>
-            <polygon points="16,3 28,10 16,17 4,10" fill="#FF5520"/>
-            <polygon points="4,10 16,17 16,28 4,21" fill="#BB2700"/>
-            <polygon points="28,10 16,17 16,28 28,21" fill="#DD3700"/>
+            <polygon points="16,24 27,18 16,12 5,18" fill="#8B1A00"/>
+            <polygon points="5,18 16,24 16,27 5,21" fill="#6B1400"/>
+            <polygon points="27,18 16,24 16,27 27,21" fill="#7A1800"/>
+            <polygon points="16,19 27,13 16,7 5,13" fill="#DD3700"/>
+            <polygon points="5,13 16,19 16,22 5,16" fill="#BB2700"/>
+            <polygon points="27,13 16,19 16,22 27,16" fill="#CC3000"/>
+            <polygon points="16,14 27,8 16,2 5,8" fill="#FF5520"/>
+            <polygon points="5,8 16,14 16,17 5,11" fill="#DD3700"/>
+            <polygon points="27,8 16,14 16,17 27,11" fill="#EE4410"/>
           </svg>
           <p className="text-sm text-slate-500">Unable to load table index</p>
           <button
@@ -120,12 +132,18 @@ function Landing({ onSelectTable }: Props) {
           className="flex items-center gap-4"
         >
           <svg width="44" height="44" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style={{filter: "drop-shadow(0 0 18px rgba(255,85,32,0.45))"}}>
-            <polygon points="16,3 28,10 16,17 4,10" fill="#FF5520"/>
-            <polygon points="4,10 16,17 16,28 4,21" fill="#BB2700"/>
-            <polygon points="28,10 16,17 16,28 28,21" fill="#DD3700"/>
+            <polygon points="16,24 27,18 16,12 5,18" fill="#8B1A00"/>
+            <polygon points="5,18 16,24 16,27 5,21" fill="#6B1400"/>
+            <polygon points="27,18 16,24 16,27 27,21" fill="#7A1800"/>
+            <polygon points="16,19 27,13 16,7 5,13" fill="#DD3700"/>
+            <polygon points="5,13 16,19 16,22 5,16" fill="#BB2700"/>
+            <polygon points="27,13 16,19 16,22 27,16" fill="#CC3000"/>
+            <polygon points="16,14 27,8 16,2 5,8" fill="#FF5520"/>
+            <polygon points="5,8 16,14 16,17 5,11" fill="#DD3700"/>
+            <polygon points="27,8 16,14 16,17 27,11" fill="#EE4410"/>
           </svg>
           <div>
-            <h1 className="text-[22px] font-semibold text-white tracking-tight">BrickRoute</h1>
+            <h1 className="text-[22px] font-semibold text-white tracking-tight">BrickTrace</h1>
             <p className="text-[12px] text-slate-500">Click any table to explore its data lineage</p>
           </div>
         </motion.div>
