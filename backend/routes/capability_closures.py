@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
 from backend.validators import _IDENTIFIER_RE, _FULL_NAME_RE, _validate
+from backend.circuit_breaker import sql_circuit_breaker
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["capability-closures"])
@@ -44,19 +45,30 @@ SNAPSHOTS_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.graph_snapshots"
 
 
 def _execute_sql(sql: str) -> list[dict]:
+    """Execute SQL with circuit breaker protection (C8 fix)."""
     if not WAREHOUSE_ID:
         raise RuntimeError("No SQL warehouse available.")
+    # C8 FIX: Fast-fail if warehouse has been consistently failing
+    sql_circuit_breaker.check()
     client = _get_client()
-    resp = client.statement_execution.execute_statement(
-        statement=sql, warehouse_id=WAREHOUSE_ID, wait_timeout=SQL_WAIT_TIMEOUT,
-    )
-    if resp.status.state != StatementState.SUCCEEDED:
-        err = resp.status.error.message if resp.status.error else resp.status.state
-        raise RuntimeError(f"SQL failed: {err}")
-    if not resp.result or not resp.result.data_array:
-        return []
-    columns = [c.name for c in resp.manifest.schema.columns]
-    return [dict(zip(columns, row)) for row in resp.result.data_array]
+    try:
+        resp = client.statement_execution.execute_statement(
+            statement=sql, warehouse_id=WAREHOUSE_ID, wait_timeout=SQL_WAIT_TIMEOUT,
+        )
+        if resp.status.state != StatementState.SUCCEEDED:
+            err = resp.status.error.message if resp.status.error else resp.status.state
+            sql_circuit_breaker.record_failure()
+            raise RuntimeError(f"SQL failed: {err}")
+        sql_circuit_breaker.record_success()
+        if not resp.result or not resp.result.data_array:
+            return []
+        columns = [c.name for c in resp.manifest.schema.columns]
+        return [dict(zip(columns, row)) for row in resp.result.data_array]
+    except RuntimeError:
+        raise
+    except Exception as e:
+        sql_circuit_breaker.record_failure()
+        raise RuntimeError(f"SQL failed: {e}")
 
 
 def _safe_identifier(value: Optional[str]) -> Optional[str]:

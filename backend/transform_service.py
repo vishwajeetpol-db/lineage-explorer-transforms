@@ -688,6 +688,8 @@ def backtrack_transform_lineage(
 
         # BFS backtracking — optimized with pre-allocated structures
         levels: list[TransformLevel] = []
+        # A3 FIX: Check captured plan for target column too
+        target_captured = _get_captured_expression_for_node(fqn, column)
         levels.append(TransformLevel(
             depth=0,
             label="Target Column",
@@ -696,6 +698,7 @@ def backtrack_transform_lineage(
                 node_id=target_node_id,
                 table_fqn=fqn,
                 column=column,
+                captured_expression=target_captured.get("expression") if target_captured else None,
             )],
             transforms=[],
         ))
@@ -747,10 +750,15 @@ def backtrack_transform_lineage(
 
                         src_tbl = edge.get("src_fqn") or "?"
                         src_col = edge.get("src_col") or "?"
+                        # A3 FIX: Check for captured-plan override expression
+                        # If Runtime Plan Capture has a more accurate expression for
+                        # this column, attach it to the node for the UI to prefer.
+                        captured_expr = _get_captured_expression_for_node(src_tbl, src_col)
                         level_nodes.append(TransformNode(
                             node_id=src_id,
                             table_fqn=src_tbl,
                             column=src_col,
+                            captured_expression=captured_expr.get("expression") if captured_expr else None,
                         ))
 
             if level_nodes or level_transforms:

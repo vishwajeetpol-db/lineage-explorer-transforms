@@ -143,6 +143,8 @@ class TransformNode(BaseModel):
     node_id: str                          # e.g. "col:catalog.schema.table::column_name"
     table_fqn: str                        # fully qualified table name
     column: str                           # column name
+    # A3 FIX: Runtime Plan Capture expression override (if available)
+    captured_expression: str | None = None  # from plan_capture when flag is on
 
 
 class TransformEdge(BaseModel):

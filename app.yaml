@@ -1,3 +1,8 @@
+# A13 FIX: This file only specifies the uvicorn command.
+# All environment variables (DATABRICKS_WAREHOUSE_ID, LINEAGE_CATALOG, etc.)
+# are configured in databricks.yml under resources.apps.bricktrace.config.env.
+# Editing this file alone does NOT configure the App's runtime environment.
+# Source of truth: databricks.yml (Declarative Automation Bundle config)
 command:
   - uvicorn
   - backend.main:app

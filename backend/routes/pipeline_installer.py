@@ -43,9 +43,11 @@ _PIP_CELL_TEMPLATE = textwrap.dedent("""\
     # Auto-injected by BrickTrace pipeline installer (capability 29).
     # Remove both this cell and the capture() call cell to opt out.
     %pip install databricks-sdk --quiet
-    # The capture module ships with the BrickTrace app; import it directly.
+    # A6 FIX: The capture module path is resolved from BRICKTRACE_APP_PATH env.
     import sys, os
-    sys.path.insert(0, '/Workspace/Users')  # adjust if app path differs
+    _bricktrace_path = os.environ.get("BRICKTRACE_APP_PATH", "/Workspace/Users/shared/bricktrace")
+    if _bricktrace_path not in sys.path:
+        sys.path.insert(0, _bricktrace_path)  # A6 FIX: uses env-configured app path
     """).format(sentinel=_CAPTURE_SENTINEL)
 
 _CAPTURE_CELL_TEMPLATE = textwrap.dedent("""\
@@ -63,9 +65,15 @@ def _notebook_has_capture(source: str) -> bool:
 
 
 def _prepend_capture_cells(source: str, target_table: str, language: str) -> str:
-    """Prepend pip-install and capture cells to Python notebook source."""
+    """Prepend pip-install and capture cells to Python notebook source.
+
+    A6/C12 FIX: Provides actionable error for non-Python notebooks.
+    """
     if language.upper() != "PYTHON":
-        raise ValueError("Only Python notebooks are supported for automatic injection.")
+        raise ValueError(
+            f"Only Python notebooks support capture injection (got: {language}). "
+            "For SQL/Scala/R pipelines, use manual integration — see docs/architecture.md §5."
+        )
     pip_cell = _PIP_CELL_TEMPLATE
     capture_cell = _CAPTURE_CELL_TEMPLATE.format(target_table=target_table)
     # For .py source notebooks, cells are delimited by # COMMAND ----------
