@@ -35,6 +35,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
+from backend.circuit_breaker import sql_circuit_breaker
 
 logger = logging.getLogger(__name__)
 
@@ -58,19 +59,29 @@ def _validate(value: str, name: str) -> str:
 
 
 def _execute_sql(sql: str) -> list[dict]:
+    """C8 FIX: Circuit breaker protects against warehouse timeout cascades."""
     if not WAREHOUSE_ID:
         raise RuntimeError("No SQL warehouse available.")
+    sql_circuit_breaker.check()
     client = _get_client()
-    resp = client.statement_execution.execute_statement(
-        statement=sql, warehouse_id=WAREHOUSE_ID, wait_timeout=SQL_WAIT_TIMEOUT,
-    )
-    if resp.status.state != StatementState.SUCCEEDED:
-        err = resp.status.error.message if resp.status.error else resp.status.state
-        raise RuntimeError(f"SQL failed: {err}")
-    if not resp.result or not resp.result.data_array:
-        return []
-    columns = [c.name for c in resp.manifest.schema.columns]
-    return [dict(zip(columns, row)) for row in resp.result.data_array]
+    try:
+        resp = client.statement_execution.execute_statement(
+            statement=sql, warehouse_id=WAREHOUSE_ID, wait_timeout=SQL_WAIT_TIMEOUT,
+        )
+        if resp.status.state != StatementState.SUCCEEDED:
+            err = resp.status.error.message if resp.status.error else resp.status.state
+            sql_circuit_breaker.record_failure()
+            raise RuntimeError(f"SQL failed: {err}")
+        sql_circuit_breaker.record_success()
+        if not resp.result or not resp.result.data_array:
+            return []
+        columns = [c.name for c in resp.manifest.schema.columns]
+        return [dict(zip(columns, row)) for row in resp.result.data_array]
+    except RuntimeError:
+        raise
+    except Exception as e:
+        sql_circuit_breaker.record_failure()
+        raise RuntimeError(f"SQL failed: {e}")
 
 
 def _ensure_dq_table() -> None:
@@ -217,6 +228,21 @@ async def dq_live_metrics(
     """
     if not _FULL_NAME_RE.match(table_fqn):
         raise HTTPException(status_code=400, detail="Invalid table_fqn")
+    # C10 FIX: Preflight privilege check — verify SELECT access before running metrics.
+    # Without this, CUSTOM expressions silently fail when App SP lacks SELECT on the table.
+    try:
+        _execute_sql(f"SELECT 1 FROM {table_fqn} LIMIT 0")
+    except Exception as priv_err:
+        err_msg = str(priv_err)
+        if "INSUFFICIENT_PERMISSIONS" in err_msg or "does not have" in err_msg or "ACCESS_DENIED" in err_msg:
+            raise HTTPException(
+                status_code=403,
+                detail=f"App service principal lacks SELECT on {table_fqn}. "
+                       "DQ metrics require row-level access. Grant SELECT or skip profiling."
+            )
+        # Other errors (warehouse, table not found) — let them fall through
+        if "TABLE_OR_VIEW_NOT_FOUND" in err_msg or "does not exist" in err_msg:
+            raise HTTPException(status_code=404, detail=f"Table not found: {table_fqn}")
     try:
         _ensure_dq_table()
         # Get rules for this table
