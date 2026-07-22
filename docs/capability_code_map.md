@@ -31,7 +31,16 @@
 | 19 | Observability | HAVE | `routes/observability.py` | `GET /api/observability` | — |
 | 20 | Notifications | HAVE | `routes/notifications.py`, `routes/capability_closures.py` | `/api/notifications/scan`, `/api/notifications/webhooks`, `/api/notifications/enqueue-delivery` | Detection (schema/DQ/sensitive) + alert rules + webhook registration + delivery queue |
 
-**Summary**: 20 HAVE, 0 PARTIAL, 0 GAP — full scorecard coverage achieved (v2.5.4)
+**Summary**: 18 HAVE, 2 PARTIAL, 0 GAP (v2.5.4)
+
+> **Honesty update (2026-07-22):** All 20 capabilities have backend APIs. 18 have a
+> complete product path (backend + routed UI in shipped dist). 2 remain PARTIAL:
+> - **#05 Multi-Platform (Federated Sync)**: Scaffold-level; peer registry + overlay, not live cross-workspace API calls.
+> - **#19 Observability**: API returns metrics; dedicated monitoring dashboard not yet surfaced in App UI.
+>
+> Edge-case guards (`backend/edge_case_guards.py`) now provide runtime diagnostics for
+> system-table availability (C1), partial-catalog-access (C2), graph truncation (C4),
+> and SCD/CDC detection (C16).
 
 ---
 
