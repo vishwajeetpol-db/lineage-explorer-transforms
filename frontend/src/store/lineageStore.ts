@@ -41,6 +41,8 @@ interface LineageState {
   fetchDurationMs: number | null;
   lineageWindowDays: number;
   truncated: boolean;
+  graphWarnings: Record<string, unknown> | null; // C2–C5 diagnostics from backend
+  healthWarning: string | null; // C1: system-table / SP-grant failures
 
   // UI state
   loading: boolean;
@@ -74,6 +76,8 @@ interface LineageState {
   setSharingOverlay: (overlay: SharingOverlay | null) => void;
   setCatalogs: (catalogs: string[]) => void;
   setSchemas: (schemas: string[]) => void;
+  setGraphWarnings: (warnings: Record<string, unknown> | null) => void;
+  setHealthWarning: (warning: string | null) => void;
   setLineageData: (data: {
     nodes: GraphNode[];
     edges: LineageEdge[];
@@ -83,6 +87,7 @@ interface LineageState {
     fetchDurationMs?: number | null;
     lineageWindowDays?: number | null;
     truncated?: boolean;
+    graphWarnings?: Record<string, unknown> | null;
   }) => void;
   setColumnEdges: (edges: ColumnLineageEdge[]) => void;
   setLoading: (loading: boolean) => void;
@@ -128,6 +133,8 @@ export const useLineageStore = create<LineageState>((set) => ({
   fetchDurationMs: null,
   lineageWindowDays: 90,
   truncated: false,
+  graphWarnings: null,
+  healthWarning: null,
   loading: false,
   error: null,
   expandedNodes: new Set(),
@@ -180,7 +187,9 @@ export const useLineageStore = create<LineageState>((set) => ({
   setSharingOverlay: (sharingOverlay) => set({ sharingOverlay }),
   setCatalogs: (catalogs) => set({ catalogs }),
   setSchemas: (schemas) => set({ schemas }),
-  setLineageData: ({ nodes, edges, cached, cachedAt, cacheExpiresAt, fetchDurationMs, lineageWindowDays, truncated }) =>
+  setGraphWarnings: (graphWarnings) => set({ graphWarnings }),
+  setHealthWarning: (healthWarning) => set({ healthWarning }),
+  setLineageData: ({ nodes, edges, cached, cachedAt, cacheExpiresAt, fetchDurationMs, lineageWindowDays, truncated, graphWarnings }) =>
     set({
       nodes,
       edges,
@@ -192,6 +201,7 @@ export const useLineageStore = create<LineageState>((set) => ({
       fetchDurationMs: fetchDurationMs ?? null,
       lineageWindowDays: lineageWindowDays ?? 90,
       truncated: truncated ?? false,
+      graphWarnings: graphWarnings ?? null,
     }),
   setColumnEdges: (columnEdges) => set({ columnEdges }),
   setLoading: (loading) => set({ loading }),

@@ -22,7 +22,10 @@ function Toolbar({ onGenerate }: Props) {
 
   const nodes = useLineageStore((s) => s.nodes);
   const truncated = useLineageStore((s) => s.truncated);
+  const graphWarnings = useLineageStore((s) => s.graphWarnings);
+  const healthWarning = useLineageStore((s) => s.healthWarning);
   const [toast, setToast] = useState<string | null>(null);
+  const [warningsDismissed, setWarningsDismissed] = useState(false);
   const orphanCount = useMemo(() => nodes.filter((n) => n.node_type === "table" && n.lineage_status === "orphan").length, [nodes]);
 
   // Whole-schema / whole-catalog lineage: no focused table, but a scope is active.
@@ -83,6 +86,9 @@ function Toolbar({ onGenerate }: Props) {
     const t = setTimeout(() => setToast(null), 4000);
     return () => clearTimeout(t);
   }, [toast]);
+
+  // Reset banner dismiss whenever a new graph with fresh warnings loads
+  useEffect(() => { setWarningsDismissed(false); }, [graphWarnings]);
 
   useEffect(() => {
     api.getCatalogs().then((r) => setCatalogs(r.catalogs)).catch(console.error);
@@ -478,11 +484,32 @@ function Toolbar({ onGenerate }: Props) {
       </div>
     )}
 
+    {/* R5: System-table / SP-grant health banner */}
+    {healthWarning && (
+      <div className="flex items-center justify-center gap-2 px-4 py-1 text-[10px] font-medium tracking-wide bg-red-500/10 text-red-400 border-b border-red-500/20">
+        <AlertTriangle size={10} className="flex-shrink-0" />
+        <span>{healthWarning}</span>
+      </div>
+    )}
+
     {/* Truncation banner — the trace hit the node cap, so the graph is partial */}
     {truncated && nodes.length > 0 && (
       <div className="flex items-center justify-center gap-2 px-4 py-1 text-[10px] font-medium tracking-wide bg-orange-500/10 text-orange-300 border-b border-orange-500/20">
         <AlertTriangle size={10} className="flex-shrink-0" />
         This lineage is very large and was capped — the graph shown is partial. Narrow your starting point to see a complete trace.
+      </div>
+    )}
+
+    {/* R3: Graph-warnings banner (C2–C5 diagnostics) */}
+    {graphWarnings && !warningsDismissed && Object.keys(graphWarnings).length > 0 && (
+      <div className="flex items-center gap-2 px-4 py-1 text-[10px] font-medium tracking-wide bg-yellow-500/10 text-yellow-300 border-b border-yellow-500/20">
+        <AlertTriangle size={10} className="flex-shrink-0" />
+        <span className="flex-1">Graph may be incomplete:{" "}
+          {Object.entries(graphWarnings).map(([code, msg]) => (
+            <span key={code} className="mr-3"><span className="opacity-60">{code}:</span> {String(msg)}</span>
+          ))}
+        </span>
+        <button onClick={() => setWarningsDismissed(true)} className="text-yellow-400/60 hover:text-yellow-300 ml-2 text-[12px] transition-colors">&times;</button>
       </div>
     )}
 

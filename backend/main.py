@@ -9,6 +9,7 @@ import logging
 import resource
 import threading
 from collections import deque, OrderedDict
+from dataclasses import asdict
 
 # A5 FIX: Single source of truth for version. Sync with package.json, README, CHANGELOG.
 APP_VERSION = "2.5.4"
@@ -74,6 +75,11 @@ from backend.models import BuildJobRequest
 from backend.feature_flags import list_flags, set_flag_state, check_access_requirements
 from backend.plan_capture_service import get_plan_capture_status, get_captured_expression
 from backend.federated_sync import get_federated_sync_status, list_federated_peers, register_federated_peer
+from backend.edge_case_guards import (
+    build_graph_warnings,
+    apply_graph_truncation,
+    MAX_GRAPH_NODES,
+)
 
 # --- Routers for capabilities 17-36 ---
 from backend.routes.governance import router as governance_router
@@ -680,9 +686,17 @@ async def api_get_lineage(request: Request, catalog: str = Query(...), schema: s
             scope = f"{catalog}.{schema}" if schema else f"{catalog} (catalog-wide)"
             logger.info(f"LIVE MODE: Serving lineage for {scope} direct from system tables")
         result = await asyncio.to_thread(get_table_lineage, catalog, schema, live)
-        # C2/C3/C4/C5: Enrich response with graph warnings
+        # C4: Truncate large graphs BEFORE serializing — bounds memory and response size.
+        # apply_graph_truncation works on dicts; convert, truncate, then trim the model.
         nodes_raw = [n.model_dump() if hasattr(n, 'model_dump') else n for n in result.nodes]
         edges_raw = [e.model_dump() if hasattr(e, 'model_dump') else e for e in result.edges]
+        nodes_raw, edges_raw, was_truncated, _ = apply_graph_truncation(nodes_raw, edges_raw)
+        if was_truncated:
+            result.nodes = result.nodes[:len(nodes_raw)]
+            retained_ids = {n.get("id") or n.get("name") for n in nodes_raw}
+            result.edges = [e for e in result.edges if e.source in retained_ids and e.target in retained_ids]
+            result.truncated = True
+        # C2/C3/C5: Enrich response with graph warnings (C4 truncation already applied above)
         requested_cats = [catalog]
         accessible_cats = list(_CATALOG_ALLOWLIST) if _CATALOG_ALLOWLIST else [catalog]
         warnings = build_graph_warnings(
@@ -714,10 +728,16 @@ async def api_lineage_trace(request: Request, table: str = Query(...), live: boo
             live = False
     try:
         result = await asyncio.to_thread(get_lineage_trace, table, live)
-        # C2/C3/C4/C5: Enrich response with graph warnings
+        # C4: Truncate large graphs BEFORE serializing
         nodes_raw = [n.model_dump() if hasattr(n, 'model_dump') else n for n in result.nodes]
         edges_raw = [e.model_dump() if hasattr(e, 'model_dump') else e for e in result.edges]
-        # Trace crosses catalogs — extract all referenced catalogs from nodes
+        nodes_raw, edges_raw, was_truncated, _ = apply_graph_truncation(nodes_raw, edges_raw)
+        if was_truncated:
+            result.nodes = result.nodes[:len(nodes_raw)]
+            retained_ids = {n.get("id") or n.get("name") for n in nodes_raw}
+            result.edges = [e for e in result.edges if e.source in retained_ids and e.target in retained_ids]
+            result.truncated = True
+        # C2/C3/C5: Trace crosses catalogs — extract all referenced catalogs from nodes
         requested_cats = list({n.get("catalog", "") for n in nodes_raw if n.get("catalog")})
         accessible_cats = list(_CATALOG_ALLOWLIST) if _CATALOG_ALLOWLIST else requested_cats
         warnings = build_graph_warnings(

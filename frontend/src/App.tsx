@@ -45,6 +45,28 @@ export default function App() {
       .catch(() => useLineageStore.getState().setIsAdmin(false));
   }, []);
 
+  // R5: Check system-table / SP-grant health on mount and surface as a banner
+  useEffect(() => {
+    api.getHealth()
+      .then((h) => {
+        const sh = h.system_health;
+        if (!sh.system_tables_available) {
+          useLineageStore.getState().setHealthWarning(
+            "System tables unavailable — lineage data cannot be fetched. " +
+            "Ensure the service principal has SELECT on system.access.table_lineage."
+          );
+        } else if (!sh.sp_grants_valid) {
+          const missing = sh.missing_grants.join(", ");
+          useLineageStore.getState().setHealthWarning(
+            `Service-principal grants incomplete. Missing: ${missing}`
+          );
+        } else {
+          useLineageStore.getState().setHealthWarning(null);
+        }
+      })
+      .catch(() => { /* health check failure is non-blocking */ });
+  }, []);
+
   // Load all tables on mount with retry (transient failures only — 4xx aren't retried)
   const loadTables = useCallback(() => {
     useLineageStore.getState().setAllTablesLoading(true);
@@ -99,6 +121,7 @@ export default function App() {
         fetchDurationMs: data.fetch_duration_ms,
         lineageWindowDays: data.lineage_window_days,
         truncated: data.truncated,
+        graphWarnings: data.graph_warnings ?? null,
       });
     } catch (err: any) {
       if (err?.name === "AbortError") return;
@@ -127,6 +150,7 @@ export default function App() {
         fetchDurationMs: data.fetch_duration_ms,
         lineageWindowDays: data.lineage_window_days,
         truncated: data.truncated,
+        graphWarnings: data.graph_warnings ?? null,
       });
     } catch (err: any) {
       if (err?.name === "AbortError") return;
@@ -242,6 +266,22 @@ export default function App() {
     return (
       <div className="h-screen w-screen bg-surface overflow-auto">
         <RootCauseWizard />
+      </div>
+    );
+  }
+
+  if (route.view === "biConsumers") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        <BiConsumersPanel />
+      </div>
+    );
+  }
+
+  if (route.view === "streaming") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        <StreamingTopologyPanel />
       </div>
     );
   }

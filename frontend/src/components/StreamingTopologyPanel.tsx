@@ -1,11 +1,15 @@
 import { useState } from 'react';
 import { Radio, RefreshCw, Zap, ArrowRight } from 'lucide-react';
 
+// Matches /api/lineage/streaming-topology response rows:
+// SELECT t.table_catalog, t.table_schema, t.table_name, t.data_source_format, t.last_altered
+// WHERE t.table_type = 'STREAMING_TABLE'
 interface StreamNode {
-  table_fqn: string;
-  table_type: string;
-  source_format?: string;
-  is_streaming: boolean;
+  table_catalog: string;
+  table_schema: string;
+  table_name: string;
+  data_source_format?: string;
+  last_altered?: string;
 }
 
 interface StreamEdge {
@@ -40,7 +44,7 @@ export function StreamingTopologyPanel({ catalog = '' }: Props) {
         setEdges([]);
       } else {
         setNodes(data.streaming_tables || []);
-        setEdges(data.edges || []);
+        setEdges(data.streaming_edges || []);
       }
     } catch (e: any) {
       setError(e.message || 'Failed to fetch streaming topology');
@@ -49,8 +53,12 @@ export function StreamingTopologyPanel({ catalog = '' }: Props) {
     }
   };
 
-  const streamingNodes = nodes.filter(n => n.is_streaming);
-  const sourceNodes = nodes.filter(n => !n.is_streaming);
+  // All rows returned by this endpoint are streaming tables
+  const streamingNodes = nodes;
+  // Source tables come from edge sources (not in the streaming_tables list itself)
+  const edgeSourceFqns = new Set(edges.map(e => e.source).filter(Boolean));
+  const streamingFqns = new Set(nodes.map(n => `${n.table_catalog}.${n.table_schema}.${n.table_name}`));
+  const sourceOnlyFqns = [...edgeSourceFqns].filter(fqn => !streamingFqns.has(fqn));
 
   return (
     <div className="min-h-screen bg-surface text-slate-200 p-6">
@@ -95,7 +103,7 @@ export function StreamingTopologyPanel({ catalog = '' }: Props) {
                 <div className="text-xs text-slate-400 mt-1">Streaming Tables</div>
               </div>
               <div className="p-4 bg-blue-500/5 border border-blue-500/15 rounded-xl">
-                <div className="text-2xl font-bold text-blue-300">{sourceNodes.length}</div>
+                <div className="text-2xl font-bold text-blue-300">{sourceOnlyFqns.length}</div>
                 <div className="text-xs text-slate-400 mt-1">Source Tables</div>
               </div>
             </div>
@@ -138,10 +146,12 @@ export function StreamingTopologyPanel({ catalog = '' }: Props) {
                       <tr key={i} className="border-b border-white/[0.03] hover:bg-white/[0.02]">
                         <td className="px-4 py-2.5 flex items-center gap-1.5">
                           <Zap size={11} className="text-emerald-400" />
-                          <span className="font-mono text-slate-300">{n.table_fqn}</span>
-                        </td>
-                        <td className="px-4 py-2.5 text-slate-400">{n.table_type}</td>
-                        <td className="px-4 py-2.5 text-slate-500">{n.source_format || '—'}</td>
+                          <span className="font-mono text-slate-300">
+                             {`${n.table_catalog}.${n.table_schema}.${n.table_name}`}
+                           </span>
+                         </td>
+                         <td className="px-4 py-2.5 text-slate-400">STREAMING_TABLE</td>
+                         <td className="px-4 py-2.5 text-slate-500">{n.data_source_format || '—'}</td>
                       </tr>
                     ))}
                   </tbody>

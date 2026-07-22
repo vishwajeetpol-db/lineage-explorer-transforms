@@ -1,13 +1,14 @@
 import { useState } from 'react';
-import { BarChart3, RefreshCw, Monitor, ExternalLink } from 'lucide-react';
+import { BarChart3, RefreshCw, Monitor } from 'lucide-react';
 
+// Matches /api/lineage/bi-consumers response rows:
+// SELECT client_application AS bi_tool, COUNT(*) AS query_count,
+//        COUNT(DISTINCT executed_by) AS distinct_users, MAX(start_time) AS last_accessed
 interface BiConsumer {
-  source_table: string;
-  entity_type: string;
-  entity_id: string;
-  entity_name: string;
-  last_query_time: string;
+  bi_tool: string;
   query_count: number;
+  distinct_users: number;
+  last_accessed: string;
 }
 
 interface Props {
@@ -41,13 +42,6 @@ export function BiConsumersPanel({ catalog = '' }: Props) {
       setError(e.message || 'Failed to fetch BI consumers');
     } finally {
       setLoading(false);
-    }
-  };
-
-  const entityIcon = (type: string) => {
-    switch (type.toUpperCase()) {
-      case 'DASHBOARD': return <Monitor size={12} className="text-blue-400" />;
-      default: return <ExternalLink size={12} className="text-slate-400" />;
     }
   };
 
@@ -98,10 +92,9 @@ export function BiConsumersPanel({ catalog = '' }: Props) {
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-white/[0.04] text-slate-500">
-                  <th className="text-left px-4 py-2 font-medium">Consumer</th>
-                  <th className="text-left px-4 py-2 font-medium">Type</th>
-                  <th className="text-left px-4 py-2 font-medium">Source Table</th>
+                  <th className="text-left px-4 py-2 font-medium">BI Tool</th>
                   <th className="text-right px-4 py-2 font-medium">Queries</th>
+                  <th className="text-right px-4 py-2 font-medium">Distinct Users</th>
                   <th className="text-right px-4 py-2 font-medium">Last Access</th>
                 </tr>
               </thead>
@@ -109,13 +102,12 @@ export function BiConsumersPanel({ catalog = '' }: Props) {
                 {consumers.map((c, i) => (
                   <tr key={i} className="border-b border-white/[0.03] hover:bg-white/[0.02]">
                     <td className="px-4 py-2.5 flex items-center gap-1.5">
-                      {entityIcon(c.entity_type)}
-                      <span className="text-slate-300">{c.entity_name || c.entity_id}</span>
-                    </td>
-                    <td className="px-4 py-2.5 text-slate-400">{c.entity_type}</td>
-                    <td className="px-4 py-2.5 text-slate-400 font-mono">{c.source_table}</td>
-                    <td className="px-4 py-2.5 text-right text-slate-300">{c.query_count}</td>
-                    <td className="px-4 py-2.5 text-right text-slate-500">{c.last_query_time?.split('T')[0] || '—'}</td>
+                      <Monitor size={12} className="text-blue-400 flex-shrink-0" />
+                       <span className="text-slate-300">{c.bi_tool}</span>
+                     </td>
+                     <td className="px-4 py-2.5 text-right text-slate-300">{c.query_count.toLocaleString()}</td>
+                     <td className="px-4 py-2.5 text-right text-slate-400">{c.distinct_users}</td>
+                     <td className="px-4 py-2.5 text-right text-slate-500">{c.last_accessed?.split('T')[0] || '—'}</td>
                   </tr>
                 ))}
               </tbody>

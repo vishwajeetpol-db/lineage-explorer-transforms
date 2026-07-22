@@ -68,6 +68,19 @@ export interface LineageResponse {
   fetch_duration_ms?: number | null;
   lineage_window_days?: number | null;
   truncated?: boolean;
+  graph_warnings?: Record<string, unknown> | null;
+}
+
+export interface SystemHealth {
+  system_tables_available: boolean;
+  sp_grants_valid: boolean;
+  missing_grants: string[];
+}
+
+export interface HealthResponse {
+  status: string;
+  version: string;
+  system_health: SystemHealth;
 }
 
 export interface ColumnLineageResponse {
@@ -188,6 +201,8 @@ export const api = {
     fetchJson<{ name: string; owner?: string }>(
       `${BASE}/entity-name?entity_type=${encodeURIComponent(entityType)}&entity_id=${encodeURIComponent(entityId)}`
     ),
+
+  getHealth: () => fetchJson<HealthResponse>(`/health`),
 
   getAdminStatus: () => fetchJson<AdminStatus>(`${BASE}/admin/status`),
 
