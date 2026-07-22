@@ -50,6 +50,13 @@ function parseRoute(): Route {
     if (catalog) return { view: "catalogLineage", catalog };
   }
 
+  const viewParam = params.get("view");
+  if (viewParam === "dq") return { view: "dq", table: params.get("table") || undefined };
+  if (viewParam === "glossary") return { view: "glossary" };
+  if (viewParam === "notifications") return { view: "notifications" };
+  if (viewParam === "export") return { view: "export" };
+  if (viewParam === "rootCause") return { view: "rootCause" };
+
   return { view: "landing" };
 }
 

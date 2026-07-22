@@ -251,6 +251,38 @@ class DeltaCacheService:
             logger.debug("DeltaCacheService.vacuum error: %s", e)
             return 0
 
+    def get_recent_entries(self, limit: int = 10) -> list[dict]:
+        """Return the most recently created live cache entries (C14 soft-warm).
+
+        Used on startup to pre-populate the in-process LRU from the shared
+        Delta cache so the first user requests avoid cold warehouse queries.
+        """
+        try:
+            self._ensure_table()
+            rows = self._sql(f"""
+                SELECT cache_key, cache_ns, value_json
+                FROM {CACHE_TABLE}
+                WHERE expires_at > current_timestamp()
+                  AND value_json IS NOT NULL
+                ORDER BY created_at DESC
+                LIMIT {int(limit)}
+            """)
+            results = []
+            for row in rows:
+                try:
+                    data = json.loads(row["value_json"]) if row.get("value_json") else None
+                    results.append({
+                        "cache_key": row.get("cache_key"),
+                        "cache_ns": row.get("cache_ns"),
+                        "data": data,
+                    })
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return results
+        except Exception as e:
+            logger.debug("DeltaCacheService.get_recent_entries error (non-fatal): %s", e)
+            return []
+
     def stats(self) -> dict:
         """Return cache statistics."""
         try:

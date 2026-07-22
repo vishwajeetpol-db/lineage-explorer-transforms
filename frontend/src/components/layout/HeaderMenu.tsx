@@ -1,8 +1,8 @@
 import { memo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Menu, Activity, FolderOpen, Home, SlidersHorizontal } from "lucide-react";
+import { Menu, Activity, FolderOpen, Home, SlidersHorizontal, BarChart3, BookOpen, Bell, Download, Search } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
-import { goLanding, goCatalogs, goControlPanel } from "../../hooks/useRouter";
+import { goLanding, goCatalogs, goControlPanel, goDQ, goGlossary, goNotifications, goExport, goRootCause } from "../../hooks/useRouter";
 
 interface Props {
   variant?: "default" | "floating";

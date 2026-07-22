@@ -456,7 +456,45 @@ def _safe_error(e: Exception) -> str:
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "version": APP_VERSION}
+    """Health endpoint enriched with edge-case guard diagnostics (C1, C7)."""
+    try:
+        from backend.edge_case_guards import get_health_status_dict
+        from backend.lineage_service import _execute_sql
+        guards = await asyncio.to_thread(get_health_status_dict, _execute_sql)
+    except Exception:
+        guards = {"error": "guards unavailable"}
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "system_health": guards,
+    }
+
+
+@app.get("/api/capture/prerequisites")
+async def api_capture_prerequisites():
+    """C11: Check plan-capture prerequisites (flags, schema, table)."""
+    try:
+        from backend.edge_case_guards import check_capture_prerequisites
+        from backend.lineage_service import _execute_sql
+        result = await asyncio.to_thread(check_capture_prerequisites, _execute_sql)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"capture_ready": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/scd-detection")
+async def api_scd_detection(table: str = Query(...)):
+    """C16: Detect SCD/CDC patterns in a table."""
+    table = table.strip()
+    if not _FULL_NAME_RE.match(table):
+        raise HTTPException(status_code=400, detail="table must be catalog.schema.table")
+    try:
+        from backend.edge_case_guards import detect_scd_cdc_patterns
+        from backend.lineage_service import _execute_sql
+        result = await asyncio.to_thread(detect_scd_cdc_patterns, table, _execute_sql)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"table_fqn": table, "error": str(e)}, status_code=500)
 
 
 @app.get("/api/diagnostics")

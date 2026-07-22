@@ -204,6 +204,46 @@ export default function App() {
     return <ControlPanel open={true} onClose={goLanding} />;
   }
 
+  if (route.view === "dq") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        <DQMetricsPanel tableFqn={route.table} />
+      </div>
+    );
+  }
+
+  if (route.view === "glossary") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        <GlossaryPanel />
+      </div>
+    );
+  }
+
+  if (route.view === "notifications") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        <NotificationsPanel />
+      </div>
+    );
+  }
+
+  if (route.view === "export") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        <ExportPanel />
+      </div>
+    );
+  }
+
+  if (route.view === "rootCause") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        <RootCauseWizard />
+      </div>
+    );
+  }
+
   if (route.view === "lineage" || route.view === "schemaLineage" || route.view === "catalogLineage") {
     return (
       <>
