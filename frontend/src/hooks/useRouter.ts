@@ -9,7 +9,12 @@ export type Route =
   | { view: "schemaLineage"; catalog: string; schema: string }
   | { view: "catalogLineage"; catalog: string }
   | { view: "admin" }
-  | { view: "controlPanel" };
+  | { view: "controlPanel" }
+  | { view: "dq"; table?: string }
+  | { view: "glossary" }
+  | { view: "notifications" }
+  | { view: "export" }
+  | { view: "rootCause" };
 
 const ROUTE_CHANGE_EVENT = "lineage-route-change";
 
