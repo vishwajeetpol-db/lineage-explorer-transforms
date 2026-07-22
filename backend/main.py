@@ -679,7 +679,20 @@ async def api_get_lineage(request: Request, catalog: str = Query(...), schema: s
         if live:
             scope = f"{catalog}.{schema}" if schema else f"{catalog} (catalog-wide)"
             logger.info(f"LIVE MODE: Serving lineage for {scope} direct from system tables")
-        return await asyncio.to_thread(get_table_lineage, catalog, schema, live)
+        result = await asyncio.to_thread(get_table_lineage, catalog, schema, live)
+        # C2/C3/C4/C5: Enrich response with graph warnings
+        nodes_raw = [n.model_dump() if hasattr(n, 'model_dump') else n for n in result.nodes]
+        edges_raw = [e.model_dump() if hasattr(e, 'model_dump') else e for e in result.edges]
+        requested_cats = [catalog]
+        accessible_cats = list(_CATALOG_ALLOWLIST) if _CATALOG_ALLOWLIST else [catalog]
+        warnings = build_graph_warnings(
+            nodes=nodes_raw,
+            edges=edges_raw,
+            accessible_catalogs=accessible_cats,
+            requested_catalogs=requested_cats,
+        )
+        result.graph_warnings = asdict(warnings)
+        return result
     except Exception as e:
         # Catalog-wide size cap is a client-actionable condition, not a server fault.
         if "exceeding the" in str(e) and "catalog-wide lineage" in str(e):
@@ -700,7 +713,21 @@ async def api_lineage_trace(request: Request, table: str = Query(...), live: boo
         if not is_admin:
             live = False
     try:
-        return await asyncio.to_thread(get_lineage_trace, table, live)
+        result = await asyncio.to_thread(get_lineage_trace, table, live)
+        # C2/C3/C4/C5: Enrich response with graph warnings
+        nodes_raw = [n.model_dump() if hasattr(n, 'model_dump') else n for n in result.nodes]
+        edges_raw = [e.model_dump() if hasattr(e, 'model_dump') else e for e in result.edges]
+        # Trace crosses catalogs — extract all referenced catalogs from nodes
+        requested_cats = list({n.get("catalog", "") for n in nodes_raw if n.get("catalog")})
+        accessible_cats = list(_CATALOG_ALLOWLIST) if _CATALOG_ALLOWLIST else requested_cats
+        warnings = build_graph_warnings(
+            nodes=nodes_raw,
+            edges=edges_raw,
+            accessible_catalogs=accessible_cats,
+            requested_catalogs=requested_cats,
+        )
+        result.graph_warnings = asdict(warnings)
+        return result
     except Exception as e:
         logger.error(f"Error tracing lineage for {table}: {e}")
         raise HTTPException(status_code=500, detail=_safe_error(e))

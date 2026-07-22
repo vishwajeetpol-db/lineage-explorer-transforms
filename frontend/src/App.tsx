@@ -13,6 +13,8 @@ import { GlossaryPanel } from "./components/GlossaryPanel";
 import { NotificationsPanel } from "./components/NotificationsPanel";
 import { ExportPanel } from "./components/ExportPanel";
 import { RootCauseWizard } from "./components/RootCauseWizard";
+import { BiConsumersPanel } from "./components/BiConsumersPanel";
+import { StreamingTopologyPanel } from "./components/StreamingTopologyPanel";
 import CatalogListView from "./components/browse/CatalogListView";
 import SchemaListView from "./components/browse/SchemaListView";
 import TableListView from "./components/browse/TableListView";

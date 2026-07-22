@@ -14,7 +14,9 @@ export type Route =
   | { view: "glossary" }
   | { view: "notifications" }
   | { view: "export" }
-  | { view: "rootCause" };
+  | { view: "rootCause" }
+  | { view: "biConsumers" }
+  | { view: "streaming" };
 
 const ROUTE_CHANGE_EVENT = "lineage-route-change";
 
@@ -56,6 +58,8 @@ function parseRoute(): Route {
   if (viewParam === "notifications") return { view: "notifications" };
   if (viewParam === "export") return { view: "export" };
   if (viewParam === "rootCause") return { view: "rootCause" };
+  if (viewParam === "biConsumers") return { view: "biConsumers" };
+  if (viewParam === "streaming") return { view: "streaming" };
 
   return { view: "landing" };
 }
@@ -80,6 +84,22 @@ function routeToSearch(route: Route): string {
       return "?admin=true";
     case "controlPanel":
       return "?controlPanel=true";
+    case "dq":
+      return route.table
+        ? `?view=dq&table=${encodeURIComponent(route.table)}`
+        : "?view=dq";
+    case "glossary":
+      return "?view=glossary";
+    case "notifications":
+      return "?view=notifications";
+    case "export":
+      return "?view=export";
+    case "rootCause":
+      return "?view=rootCause";
+    case "biConsumers":
+      return "?view=biConsumers";
+    case "streaming":
+      return "?view=streaming";
   }
 }
 
@@ -121,3 +141,10 @@ export const goSchemaLineage = (catalog: string, schema: string) =>
 export const goCatalogLineage = (catalog: string) =>
   navigate({ view: "catalogLineage", catalog });
 export const goControlPanel = () => navigate({ view: "controlPanel" });
+export const goDQ = (table?: string) => navigate({ view: "dq", table });
+export const goGlossary = () => navigate({ view: "glossary" });
+export const goNotifications = () => navigate({ view: "notifications" });
+export const goExport = () => navigate({ view: "export" });
+export const goRootCause = () => navigate({ view: "rootCause" });
+export const goBiConsumers = () => navigate({ view: "biConsumers" });
+export const goStreaming = () => navigate({ view: "streaming" });

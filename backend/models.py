@@ -50,6 +50,7 @@ class LineageResponse(BaseModel):
     fetch_duration_ms: Optional[int] = None
     lineage_window_days: Optional[int] = None  # lookback window used for this graph
     truncated: bool = False  # True when a trace hit the node cap — graph is incomplete
+    graph_warnings: Optional[dict] = None  # C2/C3/C4/C5 edge-case diagnostics for FE banners
 
 
 class ColumnLineageResponse(BaseModel):
