@@ -28,7 +28,7 @@
   <img src="https://img.shields.io/badge/TypeScript-3178C6?style=flat&logo=typescript&logoColor=white" alt="TypeScript"/>
   <img src="https://img.shields.io/badge/Databricks_Apps-FF3621?style=flat&logo=databricks&logoColor=white" alt="Databricks"/>
   <img src="https://img.shields.io/badge/ELK.js-layout-orange" alt="ELK.js"/>
-  <img src="https://img.shields.io/badge/version-2.5.1-6366F1" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-2.5.5-6366F1" alt="Version"/>
 </p>
 
 ---
@@ -67,6 +67,9 @@ This is the user-visible capability inventory. `docs/capability_code_map.md` is 
 - **LLM producer source analysis (v2.5.0)** — fetches producer source code and calls the workspace LLM to infer per-column transformations; results versioned in an app-owned `producer_analysis` store. (`POST /api/analyze-producer`)
 - **Automated pipeline capture installer (v2.5.0)** — admin action that injects the `%pip install` + `capture()` cells into a pipeline notebook via the Workspace API (idempotent). (`POST /api/pipeline/install-capture`)
 - **BFS captured-plan precedence override (v2.5.0)** — when both plan-capture flags are enabled, runtime-captured expressions now *override* (not just augment) the BFS walk in `backtrack_transform_lineage`. (no new route — `transform_service._get_captured_expression_for_node`)
+- **Table Lineage workspace (v2.5.5)** — a dedicated per-table analysis workspace opened from the **Table Lineage** home tile (or `?view=tableLineage`): a left catalog tree, the cross-catalog lineage graph, a summary bar, and six **draggable** capability panels — Impact (with clickable consumer deep-links), Root Cause (health-based upstream trace), Governance (classification-rule management), Access & security, ML Models, and LLM Transform (model dropdown + versioning + version compare). See [docs/capability_code_map.md](docs/capability_code_map.md) Part F.
+- **Light / dark theme (v2.5.5)** — theme toggle (top-right) backed by CSS-variable color tokens; the whole UI flips from one class on `<html>`. Preference persists across sessions.
+- **Redesigned home + new logo (v2.5.5)** — sidebar-shell landing (nav, workspace selector, user profile, notifications, Recent Activity) and a new BrickTrace logo across the app.
 
 ## Quick start
 
@@ -133,6 +136,14 @@ The full reference lives in **[docs/REFERENCE.md](docs/REFERENCE.md)**:
 | `/api/pipeline/install-capture` | Cap 29 via `backend/routes/pipeline_installer.py` |
 
 `docs/ARCHITECTURE.md` (the pre-existing, all-caps reference covering the core lineage/transformation engine) has been updated for v2.4.0 as well — its new §1.2 links out to the docs above rather than duplicating them.
+
+**New in v2.5.5** — Table Lineage workspace, light/dark theme, redesigned home:
+
+| Topic | |
+|---|---|
+| [Capability → code map — Part F](docs/capability_code_map.md) | The `table-lineage/` workspace, per-panel file map, theme/logo shell, and the backend deltas (Impact consumers, Root Cause trace, SP-friendly Access, live ML derivation, LLM versioning). |
+| [CHANGELOG — 2.5.5](CHANGELOG.md) | Full added/changed list + known gaps. |
+| `?view=tableLineage` | The workspace route (`hooks/useRouter.ts` `goTableLineage`), opened from the Table Lineage home tile. |
 
 ## Tech stack
 

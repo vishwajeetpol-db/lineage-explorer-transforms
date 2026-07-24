@@ -141,7 +141,7 @@ function EntityNodeComponent({ data }: NodeProps<EntityNodeData>) {
           animate={{ opacity: 1, y: 0 }}
           className="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 z-[1000]"
         >
-          <div className="bg-[#161625]/95 backdrop-blur-xl border border-white/[0.08] rounded-xl px-4 py-3 shadow-[0_8px_32px_rgba(0,0,0,0.5)] min-w-[240px]">
+          <div className="bg-surface-100/95 backdrop-blur-xl border border-white/[0.08] rounded-xl px-4 py-3 shadow-[0_8px_32px_rgba(0,0,0,0.5)] min-w-[240px]">
             <div className="font-mono text-[12px] text-slate-200 font-medium mb-2 truncate">{label}</div>
             <div className="space-y-1.5 text-[11px]">
               {owner && (

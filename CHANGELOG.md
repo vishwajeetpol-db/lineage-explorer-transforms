@@ -6,6 +6,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [2.5.5] - 2026-07-24
+
+> **Table Lineage workspace + UI shell.** Adds a dedicated per-table analysis workspace (catalog tree · lineage graph · draggable capability panels) reached from a new Landing tile, a light/dark theme toggle, a redesigned sidebar-shell home, and a new logo across the app. Several backend capabilities were reworked to be service-principal-friendly and to match the reference tool (Data Lineage POC). No new scorecard capabilities — this session productizes the per-table UX over existing caps 08/09/12/13/14/39.
+
+### Added
+
+- **Table Lineage workspace** (`frontend/src/components/table-lineage/`) — 3-pane shell (catalog tree, cross-catalog lineage graph, top summary bar) with six capability panels opened as **draggable floating popups**: Impact, Root Cause, Governance, Access, ML Models, LLM Transform. Opened from the 4th Landing tile / `?view=tableLineage`. Double-click a graph table node to re-focus the workspace.
+- **`GET /api/root-cause/trace`** — health-based table-level root-cause trace (upstream table walk → producer run-health classification failed/stale/healthy/no-history → prime suspect + failure path). Auto-runs on table select. (`trace_root_cause_table()`)
+- **`DELETE /api/governance/config`** — delete a classification rule (`delete_governance_rule()`); Governance panel now adds/removes column-pattern and UC-tag → sensitivity rules.
+- **`GET /api/analyze-producer/models`**, **`/versions`**, **`/version`**, **`/compare`** — LLM model list (for the dropdown), per-target version history, single-version fetch, and version-to-version diff (source + per-column). Analyses are versioned per (entity_type, entity_id, target_table) with a stored source snapshot.
+- **Light/dark theme** — CSS-variable color tokens (`tailwind.config.ts`, `styles/globals.css`) + `themeStore` + `ThemeToggle`; persisted, applied before first paint, toggle top-right everywhere.
+- **New logo** across Landing/Toolbar/workspace/favicon, served via `GET /bricktrace-logo.png` (stored as `.logo` to survive the bundle sync's `*.png` exclusion).
+- **Impact consumers** — `/api/impact` now returns the reader entities (dashboards/jobs/pipelines) of the focus + downstream tables, grouped by type with resolved names + deep links; panel renders clickable consumer chips.
+
+### Changed
+
+- **#13 Security & Access** — grants read from `information_schema.table_privileges` (SP-readable) instead of `SHOW GRANTS`; audit query uses `service_name='unityCatalog'` + `event_date` partition pruning + `request_params['full_name_arg']`; a single audit scan feeds both the accessor rollup and the recent-events feed; identities (owner/created_by/last_altered) + reads/writes counts added.
+- **#14 AI/ML Lineage** — `get_models_for_table()` derives models live from the UC Model Registry → versions → MLflow run `dataset_inputs` (app-owned `model_lineage` table as fallback).
+- **#39 LLM Producer Analysis** — calls the serving endpoint via the SDK's OAuth client (no static token); default model `databricks-claude-sonnet-4-6`; prompt now requires an entry for every target column; `max_tokens` 1024 → 4000; notebook export uses `ExportFormat.SOURCE`.
+- **Observability** — fixed `system.lakeflow.pipeline_update_timeline` column names (`result_state`/`period_start_time`/`period_end_time`), which also unblocks pipeline run-health in the root-cause trace.
+- **`_execute_sql` polling** — `lineage_service.py` and `server/access.py` now poll past the 50s API wait cap instead of raising `SQL did not complete: PENDING` (fixed schema-lineage 500s and empty audit results).
+- **Home page redesigned** into a sidebar-shell layout (nav + workspace selector + user profile + top-right bell/help/theme, hero, tiles, global search, Recent Activity from `/api/notifications`); Admin Dashboard is an admin-gated sidebar item.
+- **`APP_VERSION` / package version → `2.5.5`**.
+
+### Known gaps
+
+- ML models resolve empty when a training run's notebook-scoped experiment notebook was deleted (SP can't read run inputs).
+- Access grants list is scoped to what the app SP can enumerate (needs catalog/schema `MANAGE`); audit-backed sections need account-admin `SELECT` on `system.access`.
+- ~20 service files still have a non-polling `_execute_sql` (only `access.py` + `lineage_service.py` fixed); latent, only affects >50s queries.
+- App deploy relies on runtime `--var lineage_catalog/lineage_schema` overrides (the default `lattice_lineage` catalog can't be created in the FEVM workspace); not persisted in `databricks.yml`.
+
+---
+
 ## [2.5.2] - 2026-07-19
 
 > **Capability bulk closure** — closes 8 scorecard items to HAVE status. Scorecard moves from 10/7/1 to **18 HAVE / 2 PARTIAL / 0 GAP**. Adds BI tool consumer detection, streaming topology view, auto-capture scheduling, DQ trend tracking, pipeline expectation sync, and webhook-based notification delivery.

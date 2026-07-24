@@ -934,8 +934,8 @@ function LineageCanvas() {
         className="
           absolute bottom-[140px] left-3 z-10
           flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg
-          bg-[#161625]/90 backdrop-blur-md border border-white/[0.06]
-          hover:border-white/[0.15] hover:bg-[#1E1E2E]
+          bg-surface-100/90 backdrop-blur-md border border-white/[0.06]
+          hover:border-white/[0.15] hover:bg-surface-200
           text-slate-500 hover:text-slate-300
           transition-all duration-200 group
           shadow-[0_2px_12px_rgba(0,0,0,0.3)]

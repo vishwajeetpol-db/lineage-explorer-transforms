@@ -57,7 +57,7 @@ export default function DraggablePanel({
 
   return (
     <div
-      className="fixed rounded-2xl border border-white/[0.1] bg-[#12121E]/95 backdrop-blur-md shadow-[0_16px_50px_rgba(0,0,0,0.6)] flex flex-col max-h-[80vh]"
+      className="fixed rounded-2xl border border-white/[0.1] bg-surface-50/95 backdrop-blur-md shadow-[0_16px_50px_rgba(0,0,0,0.35)] flex flex-col max-h-[80vh]"
       style={{ left: pos.x, top: pos.y, width, zIndex: z }}
       onMouseDown={onFocus}
     >

@@ -5,6 +5,7 @@ import { useLineageStore } from "../../store/lineageStore";
 import { api, setLiveMode } from "../../api/client";
 import { goLanding, goSchemas, goCatalogs } from "../../hooks/useRouter";
 import HeaderMenu from "./HeaderMenu";
+import ThemeToggle from "../ui/ThemeToggle";
 
 const VIEW_LABELS = { pipeline: "Pipelines", table: "Tables", full: "Full" } as const;
 
@@ -137,17 +138,9 @@ function Toolbar({ onGenerate }: Props) {
         title="Back to home"
         aria-label="Back to home"
       >
-        <svg width="30" height="30" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style={{filter: "drop-shadow(0 0 8px rgba(255,85,32,0.45))"}}>
-          <polygon points="16,24 27,18 16,12 5,18" fill="#8B1A00"/>
-          <polygon points="5,18 16,24 16,27 5,21" fill="#6B1400"/>
-          <polygon points="27,18 16,24 16,27 27,21" fill="#7A1800"/>
-          <polygon points="16,19 27,13 16,7 5,13" fill="#DD3700"/>
-          <polygon points="5,13 16,19 16,22 5,16" fill="#BB2700"/>
-          <polygon points="27,13 16,19 16,22 27,16" fill="#CC3000"/>
-          <polygon points="16,14 27,8 16,2 5,8" fill="#FF5520"/>
-          <polygon points="5,8 16,14 16,17 5,11" fill="#DD3700"/>
-          <polygon points="27,8 16,14 16,17 27,11" fill="#EE4410"/>
-        </svg>
+        <span className="w-9 h-9 rounded-lg overflow-hidden inline-flex items-center justify-center shrink-0 shadow-[0_0_8px_rgba(255,85,32,0.45)]">
+          <img src="/bricktrace-logo.png" alt="" className="w-full h-full object-contain" />
+        </span>
         <div className="text-left">
           <div className="font-semibold text-[14px] text-white tracking-tight leading-none">
             BrickTrace
@@ -431,7 +424,8 @@ function Toolbar({ onGenerate }: Props) {
         <Search size={14} className="text-slate-500" />
       </button>
 
-      {/* Shared menu */}
+      {/* Theme toggle + shared menu */}
+      <ThemeToggle />
       <HeaderMenu />
       </div>{/* end pinned right actions */}
     </motion.header>

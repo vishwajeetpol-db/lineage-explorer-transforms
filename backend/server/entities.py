@@ -108,7 +108,7 @@ def _resolve_query(query_id: str) -> dict:
 
 @lru_cache(maxsize=2048)
 def _resolve_dashboard(dashboard_id: str) -> dict:
-    """Resolve a Dashboard entity to display name + deep link."""
+    """Resolve a legacy DBSQL Dashboard entity to display name + deep link."""
     base = {"entity_type": "DASHBOARD", "entity_id": dashboard_id,
             "display_name": f"Dashboard {dashboard_id[:8]}", "deep_link": None}
     try:
@@ -118,6 +118,23 @@ def _resolve_dashboard(dashboard_id: str) -> dict:
         base["deep_link"] = f"{_workspace_url()}/sql/dashboards/{dashboard_id}"
     except Exception as e:
         logger.debug(f"entities: could not resolve dashboard {dashboard_id}: {e}")
+    return base
+
+
+@lru_cache(maxsize=2048)
+def _resolve_dashboard_v3(dashboard_id: str) -> dict:
+    """Resolve a Lakeview (AI/BI) dashboard — DASHBOARD_V3 in lineage — to a
+    display name + deep link (/dashboardsv3/{id})."""
+    base = {"entity_type": "DASHBOARD_V3", "entity_id": dashboard_id,
+            "display_name": f"Dashboard {dashboard_id[:8]}", "deep_link": None}
+    try:
+        client = _get_client()
+        d = client.lakeview.get(dashboard_id=dashboard_id)
+        base["display_name"] = getattr(d, "display_name", None) or f"Dashboard {dashboard_id[:8]}"
+    except Exception as e:
+        logger.debug(f"entities: could not resolve lakeview dashboard {dashboard_id}: {e}")
+    # Deep link works even if the name lookup failed.
+    base["deep_link"] = f"{_workspace_url()}/dashboardsv3/{dashboard_id}"
     return base
 
 
@@ -137,9 +154,12 @@ def resolve_entity(entity_type: str, entity_id: str) -> dict:
         return _resolve_pipeline(entity_id)
     if et == "NOTEBOOK":
         return _resolve_notebook(entity_id)
-    if et == "QUERY":
+    if et in ("QUERY", "DBSQL_QUERY"):
         return _resolve_query(entity_id)
-    if et == "DASHBOARD":
+    if et in ("DASHBOARD_V3", "DASHBOARD"):
+        # Lakeview (AI/BI) dashboards report as DASHBOARD_V3 in lineage.
+        return _resolve_dashboard_v3(entity_id) if et == "DASHBOARD_V3" else _resolve_dashboard(entity_id)
+    if et == "DBSQL_DASHBOARD":
         return _resolve_dashboard(entity_id)
     return {
         "entity_type": entity_type,
@@ -161,3 +181,4 @@ def clear_entity_cache() -> None:
     _resolve_notebook.cache_clear()
     _resolve_query.cache_clear()
     _resolve_dashboard.cache_clear()
+    _resolve_dashboard_v3.cache_clear()

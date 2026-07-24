@@ -147,12 +147,24 @@ export interface SharingOverview {
 
 // --- Table Lineage workspace capabilities ---
 
+export interface ConsumerEntity {
+  entity_type: string;
+  entity_id: string;
+  display_name?: string;
+  deep_link?: string | null;
+}
+
 export interface ImpactResponse {
   table_full_name: string;
   max_hops: number;
   lookback_days: number;
   downstream_count: number;
   consumer_owners: string[];
+  consumers?: {
+    by_type: Record<string, number>;
+    total: number;
+    entities: ConsumerEntity[];
+  };
   sensitive_affected_count: number;
   sensitive_affected: string[];
   downstream_tables: {

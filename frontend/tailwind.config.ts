@@ -6,13 +6,32 @@ export default {
   theme: {
     extend: {
       colors: {
+        // Theme-aware tokens — backed by CSS variables (RGB channels, so
+        // Tailwind opacity modifiers like bg-surface-100/60 still work). Values
+        // are defined per-theme in styles/globals.css (:root/.dark = dark,
+        // .light = inverted). This is what lets the whole UI flip with one class
+        // on <html> instead of editing every component.
         surface: {
-          DEFAULT: "#0A0A0F",
-          50: "#14141F",
-          100: "#1A1A2E",
-          200: "#1E1E2E",
-          300: "#2A2A3E",
-          400: "#363650",
+          DEFAULT: "rgb(var(--surface) / <alpha-value>)",
+          50: "rgb(var(--surface-50) / <alpha-value>)",
+          100: "rgb(var(--surface-100) / <alpha-value>)",
+          200: "rgb(var(--surface-200) / <alpha-value>)",
+          300: "rgb(var(--surface-300) / <alpha-value>)",
+          400: "rgb(var(--surface-400) / <alpha-value>)",
+        },
+        // Override Tailwind's built-in slate + white so existing text-slate-*/
+        // text-white/border-white classes become theme-aware automatically.
+        white: "rgb(var(--white) / <alpha-value>)",
+        slate: {
+          100: "rgb(var(--slate-100) / <alpha-value>)",
+          200: "rgb(var(--slate-200) / <alpha-value>)",
+          300: "rgb(var(--slate-300) / <alpha-value>)",
+          400: "rgb(var(--slate-400) / <alpha-value>)",
+          500: "rgb(var(--slate-500) / <alpha-value>)",
+          600: "rgb(var(--slate-600) / <alpha-value>)",
+          700: "rgb(var(--slate-700) / <alpha-value>)",
+          800: "rgb(var(--slate-800) / <alpha-value>)",
+          900: "rgb(var(--slate-900) / <alpha-value>)",
         },
         accent: {
           DEFAULT: "#6366F1",

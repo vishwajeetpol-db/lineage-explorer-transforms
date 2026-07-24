@@ -99,7 +99,7 @@ function TableNodeComponent({ data, id }: NodeProps<TableNodeType & { isExpanded
               : "border-white/[0.06] hover:border-white/[0.12] shadow-[0_4px_24px_rgba(0,0,0,0.4)] hover:shadow-[0_8px_40px_rgba(0,0,0,0.5)]"
         }
         ${isDimmed ? "pointer-events-none" : "cursor-pointer"}
-        bg-gradient-to-b from-[#161625] to-[#12121E]
+        bg-surface-100
       `}
       onClick={handleNodeClick}
       onMouseEnter={() => { clearTimeout(hoverTimer.current); hoverTimer.current = setTimeout(() => setHoveredNode(id), 80); }}
@@ -110,7 +110,7 @@ function TableNodeComponent({ data, id }: NodeProps<TableNodeType & { isExpanded
         type="target"
         position={Position.Left}
         id={`${id}__table__target`}
-        className="!w-3 !h-3 !rounded-full !bg-[#1E1E2E] !border-2 !border-white/10 hover:!border-accent/60 !-left-[7px] !transition-colors !duration-200"
+        className="!w-3 !h-3 !rounded-full !bg-surface-200 !border-2 !border-white/10 hover:!border-accent/60 !-left-[7px] !transition-colors !duration-200"
       />
 
       {/* Header */}
@@ -249,7 +249,7 @@ function TableNodeComponent({ data, id }: NodeProps<TableNodeType & { isExpanded
         type="source"
         position={Position.Right}
         id={`${id}__table__source`}
-        className="!w-3 !h-3 !rounded-full !bg-[#1E1E2E] !border-2 !border-white/10 hover:!border-accent/60 !-right-[7px] !transition-colors !duration-200"
+        className="!w-3 !h-3 !rounded-full !bg-surface-200 !border-2 !border-white/10 hover:!border-accent/60 !-right-[7px] !transition-colors !duration-200"
       />
     </motion.div>
   );

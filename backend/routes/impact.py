@@ -13,6 +13,9 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
 from backend.server.governance import get_table_governance
+from backend.server.entities import resolve_entities
+
+CONSUMER_CAP = 200
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +84,46 @@ def _bfs_downstream(
                 next_frontier.append(t)
         frontier = next_frontier
     return visited
+
+
+def _consumers(scope_tables: list[str], resolve: bool = True) -> dict:
+    """Entities (dashboards/jobs/pipelines/notebooks/queries) that READ any table
+    in `scope_tables` — the blast-radius consumers. Grouped by type, with each
+    entity resolved to a display name + deep link so the UI can render clickable
+    consumer chips (like the reference tool)."""
+    if not scope_tables:
+        return {"by_type": {}, "total": 0, "entities": []}
+    quoted = ", ".join(f"'{t}'" for t in scope_tables[:200])
+    try:
+        rows = _execute_sql(
+            f"SELECT DISTINCT entity_type, entity_id "
+            f"FROM system.access.table_lineage "
+            f"WHERE source_table_full_name IN ({quoted}) "
+            f"  AND entity_type IS NOT NULL AND entity_id IS NOT NULL "
+            f"  AND event_time >= dateadd(DAY, -{IMPACT_LOOKBACK_DAYS}, current_timestamp()) "
+            f"LIMIT {CONSUMER_CAP}"
+        )
+    except Exception as e:
+        logger.info(f"impact: consumer query failed: {e}")
+        return {"by_type": {}, "total": 0, "entities": []}
+
+    by_type: dict[str, int] = {}
+    raw = []
+    for r in rows:
+        et = r.get("entity_type")
+        eid = r.get("entity_id")
+        if not et or not eid:
+            continue
+        by_type[et] = by_type.get(et, 0) + 1
+        raw.append({"entity_type": et, "entity_id": str(eid)})
+
+    entities = raw
+    if resolve and raw:
+        try:
+            entities = resolve_entities(raw[:80])  # bounded name/link resolution
+        except Exception:
+            pass
+    return {"by_type": by_type, "total": len(raw), "entities": entities}
 
 
 @router.get("")
@@ -154,12 +197,16 @@ async def get_impact(
             "has_sensitive_columns": is_sensitive,
         })
 
+    # Consumers = entities that read the focus table OR any downstream table.
+    consumers = _consumers([full_name] + all_tables)
+
     return {
         "table_full_name": full_name,
         "max_hops": hops,
         "lookback_days": IMPACT_LOOKBACK_DAYS,
         "downstream_count": len(downstream),
         "consumer_owners": sorted(consumer_owners),
+        "consumers": consumers,
         "sensitive_affected_count": len(sensitive_affected),
         "sensitive_affected": sensitive_affected,
         "downstream_tables": downstream_list,

@@ -12,7 +12,7 @@ from collections import deque, OrderedDict
 from dataclasses import asdict
 
 # A5 FIX: Single source of truth for version. Sync with package.json, README, CHANGELOG.
-APP_VERSION = "2.5.4"
+APP_VERSION = "2.5.5"
 
 RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "60"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
@@ -1318,6 +1318,18 @@ if os.path.exists(static_dir):
         # so a stale copy would keep loading the previous deploy's bundle.
         # (The hashed /assets files are safe to cache — their names change.)
         return FileResponse(_index_path, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+    # App logo. Stored as .logo (not .png) because the deploy sync drops *.png
+    # via .gitignore; served here with an explicit PNG media type so the browser
+    # renders it in <img src="/bricktrace-logo.png">.
+    _logo_path = os.path.join(static_dir, "bricktrace-logo.logo")
+
+    @app.get("/bricktrace-logo.png")
+    async def serve_logo():
+        if os.path.isfile(_logo_path):
+            return FileResponse(_logo_path, media_type="image/png",
+                                headers={"Cache-Control": "public, max-age=86400"})
+        return _index_response()
 
     @app.get("/{full_path:path}")
     async def serve_frontend(full_path: str):

@@ -154,6 +154,7 @@ export const goSchemaLineage = (catalog: string, schema: string) =>
 export const goCatalogLineage = (catalog: string) =>
   navigate({ view: "catalogLineage", catalog });
 export const goControlPanel = () => navigate({ view: "controlPanel" });
+export const goAdmin = () => navigate({ view: "admin" });
 export const goDQ = (table?: string) => navigate({ view: "dq", table });
 export const goGlossary = () => navigate({ view: "glossary" });
 export const goNotifications = () => navigate({ view: "notifications" });
