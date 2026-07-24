@@ -128,16 +128,18 @@ def get_pipeline_update_health(pipeline_id: str) -> dict:
         "lookback_days": OBS_LOOKBACK_DAYS,
     }
     try:
+        # NOTE: pipeline_update_timeline uses period_start_time/period_end_time and
+        # result_state (NOT update_start_time/state — those columns don't exist).
         rows = _execute_sql(
             f"SELECT "
             f"  COUNT(*) AS total_updates, "
-            f"  SUM(CASE WHEN state = 'COMPLETED' THEN 1 ELSE 0 END) AS successful_updates, "
-            f"  SUM(CASE WHEN state IN ('FAILED','CANCELED') THEN 1 ELSE 0 END) AS failed_updates, "
-            f"  MAX(update_start_time) AS last_update_at, "
-            f"  AVG(DATEDIFF(SECOND, update_start_time, update_end_time)) AS avg_duration_seconds "
+            f"  SUM(CASE WHEN result_state = 'COMPLETED' THEN 1 ELSE 0 END) AS successful_updates, "
+            f"  SUM(CASE WHEN result_state IN ('FAILED','CANCELED') THEN 1 ELSE 0 END) AS failed_updates, "
+            f"  MAX(period_start_time) AS last_update_at, "
+            f"  AVG(DATEDIFF(SECOND, period_start_time, period_end_time)) AS avg_duration_seconds "
             f"FROM system.lakeflow.pipeline_update_timeline "
             f"WHERE pipeline_id = '{pipeline_id}' "
-            f"  AND update_start_time >= dateadd(DAY, -{OBS_LOOKBACK_DAYS}, current_timestamp())"
+            f"  AND period_start_time >= dateadd(DAY, -{OBS_LOOKBACK_DAYS}, current_timestamp())"
         )
         if rows:
             r = rows[0]
@@ -155,11 +157,11 @@ def get_pipeline_update_health(pipeline_id: str) -> dict:
                 "health_badge": _health_badge(rate or 0.0, total),
             })
         last_rows = _execute_sql(
-            f"SELECT state FROM system.lakeflow.pipeline_update_timeline "
-            f"WHERE pipeline_id = '{pipeline_id}' ORDER BY update_start_time DESC LIMIT 1"
+            f"SELECT result_state FROM system.lakeflow.pipeline_update_timeline "
+            f"WHERE pipeline_id = '{pipeline_id}' ORDER BY period_start_time DESC LIMIT 1"
         )
         if last_rows:
-            base["last_update_state"] = last_rows[0].get("state")
+            base["last_update_state"] = last_rows[0].get("result_state")
     except Exception as e:
         logger.info(f"observability: pipeline update health unavailable for {pipeline_id}: {e}")
     return base

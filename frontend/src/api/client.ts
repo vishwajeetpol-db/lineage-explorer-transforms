@@ -145,8 +145,285 @@ export interface SharingOverview {
   totals: { shares: number; recipients: number; providers: number; foreign_catalogs: number; shared_tables: number };
 }
 
+// --- Table Lineage workspace capabilities ---
+
+export interface ImpactResponse {
+  table_full_name: string;
+  max_hops: number;
+  lookback_days: number;
+  downstream_count: number;
+  consumer_owners: string[];
+  sensitive_affected_count: number;
+  sensitive_affected: string[];
+  downstream_tables: {
+    full_name: string;
+    hop_distance: number;
+    owner: string | null;
+    has_sensitive_columns: boolean;
+  }[];
+}
+
+export interface GovernanceColumn {
+  name: string;
+  type: string;
+  nullable: string;
+  comment: string | null;
+  sensitivity: string | null;
+  sensitivity_source: string | null;
+}
+
+export interface GovernanceResponse {
+  table_full_name: string;
+  owner: string | null;
+  table_type: string | null;
+  created_by: string | null;
+  created_at: string | null;
+  last_altered_by: string | null;
+  last_altered_at: string | null;
+  comment: string | null;
+  tags: { name: string; value: string | null }[];
+  columns: GovernanceColumn[];
+  sensitive_columns: { column: string; sensitivity: string; source: string }[];
+  config_rules_applied: number;
+}
+
+export interface GovernanceRule {
+  rule_id: string;
+  catalog: string | null;
+  schema: string | null;
+  table_pattern: string | null;
+  column_pattern: string | null;
+  tag_name: string | null;
+  sensitivity: string;
+  owner: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  notes: string | null;
+}
+
+export interface GovernanceRuleInput {
+  rule_id?: string;
+  catalog?: string;
+  schema_name?: string;
+  table_pattern?: string;
+  column_pattern?: string;
+  tag_name?: string;
+  sensitivity: string;
+  notes?: string;
+}
+
+export interface AccessResponse {
+  table_full_name: string;
+  lookback_days: number;
+  identities: {
+    owner: string | null;
+    created_by: string | null;
+    created_at: string | null;
+    last_altered_by: string | null;
+    last_altered_at: string | null;
+  };
+  declared_grants: { principal: string; privilege: string; granted_by?: string | null; object_type?: string; [k: string]: unknown }[];
+  audit_access: { user_email: string; action_name?: string; access_count?: number; last_accessed_at?: string; [k: string]: unknown }[];
+  recent_events: { event_time: string; action_name: string | null; user_email: string | null; source_ip: string | null }[];
+  dormant_grants: string[];
+  unique_empirical_users: number;
+  grantee_count: number;
+  read_count: number;
+  write_count: number;
+}
+
+export type ProducerHealthStatus = "failed" | "stale" | "healthy" | "no_history";
+
+export interface ProducerHealth {
+  entity_type: string;
+  entity_id: string;
+  status: ProducerHealthStatus;
+  last_result: string | null;
+  last_run_at: string | null;
+  success_rate: number | null;
+}
+
+export interface FlaggedTable {
+  table: string;
+  short_name: string;
+  hop: number;
+  is_focus: boolean;
+  status: ProducerHealthStatus;
+  producers: ProducerHealth[];
+}
+
+export interface RootCauseTrace {
+  focus_table: string;
+  max_hops: number;
+  lookback_days: number;
+  stale_days: number;
+  counts: { failed: number; stale: number; healthy: number; no_history: number };
+  prime_suspect: FlaggedTable | null;
+  failure_path: { table: string; short_name: string; hop: number; status: ProducerHealthStatus }[];
+  flagged: FlaggedTable[];
+}
+
+export interface MlModel {
+  model_name: string;
+  model_version: string;
+  job_id: string | null;
+  run_id: string | null;
+  notebook_path: string | null;
+  registered_by?: string | null;
+  endpoints?: string[];
+  [k: string]: unknown;
+}
+
+export interface AnalyzeProducerColumn {
+  column?: string;
+  target_column?: string;
+  expression?: string;
+  transformation?: string;
+  source_columns?: string[];
+  category?: string;
+  confidence?: number | string;
+  [k: string]: unknown;
+}
+
+export interface AnalyzeProducerResponse {
+  source: "stored" | "llm" | "unavailable";
+  entity_type: string;
+  entity_id: string;
+  target_table: string;
+  columns: AnalyzeProducerColumn[];
+  source_hash: string | null;
+  llm_model: string | null;
+  version: number | null;
+  versions: AnalysisVersion[];
+  stale: boolean;
+  analyzed_at?: string;
+  analyzed_by?: string;
+  detail?: string;
+}
+
+export interface AnalysisVersion {
+  version: number;
+  llm_model: string | null;
+  source_hash: string | null;
+  analyzed_at: string;
+  analyzed_by: string | null;
+  target_table?: string;
+}
+
+export interface AnalysisVersionFull {
+  entity_type: string;
+  entity_id: string;
+  source_hash: string | null;
+  source_code: string | null;
+  target_table: string;
+  columns: AnalyzeProducerColumn[];
+  llm_model: string | null;
+  analyzed_at: string;
+  analyzed_by: string | null;
+  version: number;
+}
+
+export interface AnalysisCompare {
+  from: AnalysisVersionFull;
+  to: AnalysisVersionFull;
+  source_changed: boolean;
+  changed_count: number;
+  column_diffs: {
+    column: string;
+    status: "added" | "removed" | "changed" | "unchanged";
+    from: AnalyzeProducerColumn | null;
+    to: AnalyzeProducerColumn | null;
+  }[];
+}
+
 export const api = {
   getUserInfo: () => fetchJson<UserInfo>(`${BASE}/user-info`),
+
+  // Impact analysis (blast radius) — cap 18.
+  getImpact: (catalog: string, schema: string, table: string, maxHops?: number) =>
+    fetchJson<ImpactResponse>(
+      `${BASE}/impact?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}` +
+      (maxHops ? `&max_hops=${maxHops}` : "")
+    ),
+
+  // Governance & classification — cap 17.
+  getGovernance: (catalog: string, schema: string, table: string) =>
+    fetchJson<GovernanceResponse>(
+      `${BASE}/governance?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`
+    ),
+
+  // Governance classification rules — cap 17.
+  listGovernanceRules: () => fetchJson<{ rules: GovernanceRule[] }>(`${BASE}/governance/config`),
+
+  upsertGovernanceRule: async (rule: GovernanceRuleInput) => {
+    const res = await fetch(`${BASE}/governance/config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(rule),
+    });
+    if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+    return res.json() as Promise<{ rule_id: string; status: string }>;
+  },
+
+  deleteGovernanceRule: async (ruleId: string) => {
+    const res = await fetch(`${BASE}/governance/config?rule_id=${encodeURIComponent(ruleId)}`, {
+      method: "DELETE",
+    });
+    if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+    return res.json() as Promise<{ rule_id: string; status: string }>;
+  },
+
+  // Access & security lineage — cap 20.
+  getAccess: (catalog: string, schema: string, table: string) =>
+    fetchJson<AccessResponse>(
+      `${BASE}/access?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`
+    ),
+
+  // Health-based root-cause trace for a table — cap 09.
+  getRootCauseTrace: (catalog: string, schema: string, table: string, maxHops?: number) =>
+    fetchJson<RootCauseTrace>(
+      `${BASE}/root-cause/trace?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}` +
+      (maxHops ? `&max_hops=${maxHops}` : "")
+    ),
+
+  // ML models trained on a UC table — cap 21.
+  getMlModelsForTable: (catalog: string, schema: string, table: string) =>
+    fetchJson<{ models: MlModel[] }>(
+      `${BASE}/ml/models-for-table?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`
+    ),
+
+  // LLM producer source-code analysis — cap 27.
+  analyzeProducer: async (body: {
+    entity_type: string;
+    entity_id: string;
+    target_table: string;
+    force_rerun?: boolean;
+    target_columns?: string[];
+    model?: string;
+  }) => {
+    const res = await fetch(`${BASE}/analyze-producer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+    return res.json() as Promise<AnalyzeProducerResponse>;
+  },
+
+  // Available LLM serving endpoints for the model dropdown.
+  getAnalyzeModels: () => fetchJson<{ models: string[]; default: string }>(`${BASE}/analyze-producer/models`),
+
+  // A specific stored analysis version (full — incl. source snapshot).
+  getAnalysisVersion: (entityType: string, entityId: string, targetTable: string, version: number) =>
+    fetchJson<AnalysisVersionFull>(
+      `${BASE}/analyze-producer/version?entity_type=${encodeURIComponent(entityType)}&entity_id=${encodeURIComponent(entityId)}&target_table=${encodeURIComponent(targetTable)}&version=${version}`
+    ),
+
+  // Compare two stored versions (code + per-column diff).
+  compareAnalysisVersions: (entityType: string, entityId: string, targetTable: string, fromV: number, toV: number) =>
+    fetchJson<AnalysisCompare>(
+      `${BASE}/analyze-producer/compare?entity_type=${encodeURIComponent(entityType)}&entity_id=${encodeURIComponent(entityId)}&target_table=${encodeURIComponent(targetTable)}&from_version=${fromV}&to_version=${toV}`
+    ),
 
   getTables: () => fetchJson<{ tables: TableSearchItem[] }>(`${BASE}/tables`),
 

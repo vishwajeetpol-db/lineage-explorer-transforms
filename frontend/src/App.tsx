@@ -13,6 +13,7 @@ import { GlossaryPanel } from "./components/GlossaryPanel";
 import { NotificationsPanel } from "./components/NotificationsPanel";
 import { ExportPanel } from "./components/ExportPanel";
 import { RootCauseWizard } from "./components/RootCauseWizard";
+import TableLineageWorkspace from "./components/table-lineage/TableLineageWorkspace";
 import { BiConsumersPanel } from "./components/BiConsumersPanel";
 import { StreamingTopologyPanel } from "./components/StreamingTopologyPanel";
 import CatalogListView from "./components/browse/CatalogListView";
@@ -182,6 +183,9 @@ export default function App() {
         store.enterScopeLineage("catalog", route.catalog, "");
         fetchLineage(route.catalog, "");
       }
+    } else if (route.view === "tableLineage") {
+      // The Table Lineage workspace owns its own graph loading (via the tree
+      // selection); don't let the route-sync effect clear focusTable here.
     } else if (store.focusTable) {
       store.setFocusTable(null);
     }
@@ -284,6 +288,10 @@ export default function App() {
         <StreamingTopologyPanel />
       </div>
     );
+  }
+
+  if (route.view === "tableLineage") {
+    return <TableLineageWorkspace initialTable={route.table} />;
   }
 
   if (route.view === "lineage" || route.view === "schemaLineage" || route.view === "catalogLineage") {

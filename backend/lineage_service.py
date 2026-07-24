@@ -70,6 +70,11 @@ CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "28800"))  # default
 CACHE_MAX_ENTRIES = int(os.environ.get("CACHE_MAX_ENTRIES", "20000"))  # secondary safety valve
 CACHE_MAX_MEMORY_MB = int(os.environ.get("CACHE_MAX_MEMORY_MB", "250"))  # primary limit
 SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")  # max 50s per Databricks API limit (0s or 5-50s)
+# When a statement is still PENDING/RUNNING after the 50s API wait cap, _execute_sql
+# polls get_statement() until it completes or this budget is hit. Covers warehouse
+# cold-starts and heavy schema/catalog-wide lineage scans.
+SQL_POLL_MAX_S = int(os.environ.get("SQL_POLL_MAX_S", "120"))
+SQL_POLL_INTERVAL_S = int(os.environ.get("SQL_POLL_INTERVAL_S", "3"))
 # Safety cap for catalog-wide lineage: a catalog with thousands of tables would
 # produce a graph too large to lay out in the browser and too big for the cache.
 # When the in-scope table count exceeds this, we refuse rather than melt the
@@ -441,6 +446,19 @@ def _execute_sql(client: WorkspaceClient, sql: str, catalog: str = None) -> list
         catalog=catalog,
         wait_timeout=SQL_WAIT_TIMEOUT,
     )
+
+    # The API caps wait_timeout at 50s. A heavy lineage query (e.g. a schema-wide
+    # scan of system.access.column_lineage over a 365d window) can still be
+    # PENDING/RUNNING when that window expires — so poll past the cap rather than
+    # failing with "SQL did not complete: PENDING". Bounded by SQL_POLL_MAX_S.
+    deadline = time.time() + SQL_POLL_MAX_S
+    while resp.status.state in (StatementState.PENDING, StatementState.RUNNING):
+        if time.time() > deadline:
+            raise RuntimeError(
+                f"SQL exceeded {SQL_POLL_MAX_S}s budget: statement_id={resp.statement_id}"
+            )
+        time.sleep(SQL_POLL_INTERVAL_S)
+        resp = client.statement_execution.get_statement(resp.statement_id)
 
     if resp.status.state == StatementState.FAILED:
         raise RuntimeError(f"SQL failed: {resp.status.error.message if resp.status.error else 'Unknown error'}")

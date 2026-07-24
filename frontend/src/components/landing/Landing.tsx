@@ -1,10 +1,10 @@
 import { memo, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import { Search, FolderOpen, ChevronRight, Loader2, RefreshCw, Database, Eye, Layers, Zap, HardDrive, Clock, FolderTree } from "lucide-react";
+import { Search, FolderOpen, ChevronRight, Loader2, RefreshCw, Database, Eye, Layers, Zap, HardDrive, Clock, FolderTree, GitBranch } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
 import { api } from "../../api/client";
 import { useRecents } from "../../hooks/useRecents";
-import { goCatalogs } from "../../hooks/useRouter";
+import { goCatalogs, goTableLineage } from "../../hooks/useRouter";
 import HeaderMenu from "../layout/HeaderMenu";
 import LineagePicker from "./LineagePicker";
 import type { TableSearchItem } from "../../api/client";
@@ -124,7 +124,7 @@ function Landing({ onSelectTable }: Props) {
         <HeaderMenu variant="floating" />
       </div>
 
-      <div className="relative z-10 flex flex-col items-center gap-16 w-full max-w-2xl px-8 mt-[10vh]">
+      <div className="relative z-10 flex flex-col items-center gap-16 w-full max-w-3xl px-8 mt-[10vh]">
         {/* Header */}
         <motion.div
           initial={{ opacity: 0, y: -8 }}
@@ -148,8 +148,8 @@ function Landing({ onSelectTable }: Props) {
           </div>
         </motion.div>
 
-        {/* Tile row: Browse · Schema lineage · Catalog lineage */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 w-full">
+        {/* Tile row: Browse · Schema lineage · Catalog lineage · Table Lineage */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 w-full">
           {/* Browse catalog */}
           <motion.button
             initial={{ opacity: 0, scale: 0.96 }}
@@ -215,6 +215,28 @@ function Landing({ onSelectTable }: Props) {
             </div>
             <div className="flex items-center gap-1 text-[11px] text-slate-500 group-hover:text-accent-light transition-colors mt-1">
               Choose catalog <ChevronRight size={11} />
+            </div>
+          </motion.button>
+
+          {/* Table Lineage — advanced analysis suite */}
+          <motion.button
+            initial={{ opacity: 0, scale: 0.96 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ delay: 0.2 }}
+            whileHover={{ y: -3, scale: 1.02 }}
+            whileTap={{ scale: 0.98 }}
+            onClick={() => goTableLineage()}
+            className="group flex flex-col items-center gap-3 px-6 py-7 bg-surface-50/60 hover:bg-surface-50/90 border border-white/[0.08] hover:border-accent/40 rounded-3xl transition-all duration-200 shadow-[0_8px_30px_rgba(0,0,0,0.3)]"
+          >
+            <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-rose-500/25 to-orange-500/25 flex items-center justify-center group-hover:from-rose-500/35 group-hover:to-orange-500/35 transition-all">
+              <GitBranch size={22} className="text-rose-400" />
+            </div>
+            <div className="text-center">
+              <div className="text-[15px] font-semibold text-slate-100">Table Lineage</div>
+              <div className="text-[11px] text-slate-500 mt-0.5">Impact, governance, access &amp; more</div>
+            </div>
+            <div className="flex items-center gap-1 text-[11px] text-slate-500 group-hover:text-accent-light transition-colors mt-1">
+              Open suite <ChevronRight size={11} />
             </div>
           </motion.button>
         </div>

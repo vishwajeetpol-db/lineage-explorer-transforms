@@ -104,7 +104,11 @@ def get_table_governance(catalog: str, schema: str, table: str) -> dict:
     result: dict = {
         "table_full_name": full_name,
         "owner": None,
+        "table_type": None,
+        "created_by": None,
         "created_at": None,
+        "last_altered_by": None,
+        "last_altered_at": None,
         "comment": None,
         "tags": [],
         "columns": [],
@@ -115,13 +119,17 @@ def get_table_governance(catalog: str, schema: str, table: str) -> dict:
     # 1. Table-level metadata from information_schema
     try:
         rows = _execute_sql(
-            f"SELECT table_owner, created, comment "
+            f"SELECT table_owner, table_type, created, created_by, last_altered, last_altered_by, comment "
             f"FROM {catalog}.information_schema.tables "
             f"WHERE table_schema = '{schema}' AND table_name = '{table}' LIMIT 1"
         )
         if rows:
             result["owner"] = rows[0].get("table_owner")
-            result["created_at"] = str(rows[0].get("created") or "")
+            result["table_type"] = rows[0].get("table_type")
+            result["created_by"] = rows[0].get("created_by")
+            result["created_at"] = str(rows[0].get("created") or "") or None
+            result["last_altered_by"] = rows[0].get("last_altered_by")
+            result["last_altered_at"] = str(rows[0].get("last_altered") or "") or None
             result["comment"] = rows[0].get("comment")
     except Exception as e:
         logger.info(f"governance: could not fetch table metadata for {full_name}: {e}")
@@ -245,6 +253,14 @@ def upsert_governance_rule(rule: dict, actor: str) -> dict:
         f"'{safe(actor)}', current_timestamp(), current_timestamp(), '{safe(rule.get('notes'))}'"
     )
     return {"rule_id": rule_id, "status": "upserted"}
+
+
+def delete_governance_rule(rule_id: str) -> dict:
+    """Delete a governance classification rule by id."""
+    _ensure_governance_config_table()
+    safe_id = (rule_id or "").replace("'", "")
+    _execute_sql(f"DELETE FROM {GOV_CONFIG_TABLE} WHERE rule_id = '{safe_id}'")
+    return {"rule_id": safe_id, "status": "deleted"}
 
 
 def get_downstream_sensitivity_propagation(catalog: str, schema: str, table: str) -> list[dict]:

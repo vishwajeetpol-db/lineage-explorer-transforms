@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from backend.server.root_cause import (
     trace_root_cause,
+    trace_root_cause_table,
     _walk_upstream_columns,
     _get_failed_runs_around,
 )
@@ -75,6 +76,28 @@ async def analyze_root_cause(request: Request, body: RootCauseRequest):
             max_hops=body.max_hops,
         )
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/trace")
+async def root_cause_trace(
+    request: Request,
+    catalog: str = Query(...),
+    schema: str = Query(...),
+    table: str = Query(...),
+    max_hops: int = Query(6),
+):
+    """Health-based root-cause trace for a table (auto-run, no column needed).
+
+    Walks upstream tables, classifies each table's producers by recent run
+    health, and returns a prime suspect + failure path + flagged producers.
+    """
+    c = _validate(catalog, "catalog")
+    s = _validate(schema, "schema")
+    t = _validate(table, "table")
+    try:
+        return await asyncio.to_thread(trace_root_cause_table, c, s, t, max_hops)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -16,6 +16,7 @@ All functions are non-fatal.
 from __future__ import annotations
 
 import os
+import json
 import logging
 from typing import Optional
 
@@ -120,9 +121,111 @@ def get_endpoint_usage(endpoint_name: str) -> list[dict]:
 # Model → training-data lineage
 # ---------------------------------------------------------------------------
 
-def get_models_for_table(catalog: str, schema: str, table: str) -> list[dict]:
-    """Return registered models that were trained on `catalog.schema.table`."""
+def _run_input_tables(client, run_id: str) -> list[str]:
+    """UC tables a training run consumed, from its MLflow dataset_inputs."""
+    if not run_id:
+        return []
+    try:
+        resp = client.api_client.do("GET", "/api/2.0/mlflow/runs/get", query={"run_id": run_id})
+    except Exception:
+        return []
+    tables: list[str] = []
+    for di in ((resp.get("run", {}).get("inputs", {}) or {}).get("dataset_inputs", []) or []):
+        src = di.get("dataset", {}).get("source")
+        if not src:
+            continue
+        try:
+            s = json.loads(src) if isinstance(src, str) else src
+            t = s.get("table_name")
+            if t:
+                tables.append(t)
+        except Exception:
+            continue
+    return tables
+
+
+def _endpoints_for_model(client, model_fqn: str) -> list[str]:
+    """Serving endpoints currently serving a model FQN (live, from system.serving)."""
+    safe = model_fqn.replace("'", "")
+    try:
+        rows = _execute_sql(
+            f"SELECT DISTINCT endpoint_name FROM system.serving.served_entities "
+            f"WHERE endpoint_delete_time IS NULL AND entity_name = '{safe}'"
+        )
+        return [r["endpoint_name"] for r in rows if r.get("endpoint_name")]
+    except Exception:
+        return []
+
+
+def _derive_models_for_table_live(catalog: str, schema: str, table: str) -> list[dict]:
+    """Derive 'models trained on this table' live from the UC Model Registry +
+    MLflow run inputs — no app-owned registry table or manual populate needed.
+
+    Walks: registered models in the schema → each version's training run →
+    that run's input datasets. A model version whose run consumed `full_name`
+    is reported as trained on this table. (UC doesn't record model→table edges
+    in system.access.table_lineage, so this reverse walk is the real source.)
+    """
     full_name = f"{catalog}.{schema}.{table}"
+    client = _get_client()
+    out: list[dict] = []
+    try:
+        # Registered models live in a schema; scan the target table's schema
+        # (models are typically registered alongside the data they're built on).
+        resp = client.api_client.do(
+            "GET", "/api/2.1/unity-catalog/models",
+            query={"catalog_name": catalog, "schema_name": schema, "max_results": 400},
+        )
+        models = resp.get("registered_models", []) or []
+    except Exception as e:
+        logger.info(f"ml: could not list registered models in {catalog}.{schema}: {e}")
+        return []
+
+    for m in models:
+        model_fqn = m.get("full_name")
+        if not model_fqn:
+            continue
+        try:
+            vresp = client.api_client.do(
+                "GET", f"/api/2.1/unity-catalog/models/{model_fqn}/versions",
+                query={"max_results": 100},
+            )
+            versions = vresp.get("model_versions", []) or []
+        except Exception:
+            continue
+        for v in versions:
+            run_id = v.get("run_id")
+            inputs = _run_input_tables(client, run_id)
+            if full_name in inputs:
+                out.append({
+                    "model_name": model_fqn,
+                    "model_version": str(v.get("version") or ""),
+                    "run_id": run_id,
+                    "job_id": None,
+                    "notebook_path": None,
+                    "registered_by": v.get("created_by"),
+                    "endpoints": _endpoints_for_model(client, model_fqn),
+                })
+    return out
+
+
+def get_models_for_table(catalog: str, schema: str, table: str) -> list[dict]:
+    """Return registered models trained on `catalog.schema.table`.
+
+    Prefers a LIVE derivation from the UC Model Registry + MLflow run inputs
+    (works with zero setup); falls back to the app-owned model_lineage table for
+    any edges an operator registered explicitly via register_model_lineage()."""
+    full_name = f"{catalog}.{schema}.{table}"
+
+    # 1. Live derivation (primary).
+    try:
+        live = _derive_models_for_table_live(catalog, schema, table)
+        if live:
+            return live
+    except Exception as e:
+        logger.info(f"ml: live model derivation failed for {full_name}: {e}")
+
+    # 2. App-owned registry table (fallback / explicit registrations).
     try:
         _ensure_model_lineage_table()
         rows = _execute_sql(

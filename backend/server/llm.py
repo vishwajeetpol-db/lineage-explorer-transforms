@@ -23,33 +23,13 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "databricks-meta-llama-3-1-70b-instruct")
-LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "1024"))
+# Default to a Foundation Model endpoint that exists in the workspace. The old
+# default (databricks-meta-llama-3-1-70b-instruct) is not provisioned in newer
+# workspaces; databricks-claude-sonnet-4-6 is a broadly-available FMAPI endpoint.
+# Override with LLM_MODEL_NAME.
+LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "databricks-claude-sonnet-4-6")
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "4000"))
 LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", "60"))
-
-
-def _get_endpoint_url() -> str:
-    url = os.environ.get("LLM_ENDPOINT_URL", "")
-    if url:
-        return url
-    # Default: Databricks workspace FMAPI
-    from backend.lineage_service import _get_client
-    host = _get_client().config.host.rstrip("/")
-    return f"{host}/serving-endpoints/{LLM_MODEL_NAME}/invocations"
-
-
-def _get_api_token() -> str:
-    token = os.environ.get("LLM_API_TOKEN", "")
-    if token:
-        return token
-    token = os.environ.get("DATABRICKS_TOKEN", "")
-    if token:
-        return token
-    try:
-        from backend.lineage_service import _get_client
-        return _get_client().config.token or ""
-    except Exception:
-        return ""
 
 
 _SYSTEM_PROMPT = textwrap.dedent("""\
@@ -76,6 +56,7 @@ def analyze_source_code(
     source_code: str,
     target_table: str,
     target_columns: Optional[list[str]] = None,
+    model: Optional[str] = None,
 ) -> list[dict]:
     """Call the LLM to infer per-column transformations from `source_code`.
 
@@ -88,7 +69,13 @@ def analyze_source_code(
 
     col_hint = ""
     if target_columns:
-        col_hint = f"\n\nThe target table `{target_table}` has these output columns: {', '.join(target_columns)}."
+        col_hint = (
+            f"\n\nThe target table `{target_table}` has these output columns: "
+            f"{', '.join(target_columns)}.\n"
+            f"You MUST return exactly one entry for EVERY one of these {len(target_columns)} columns, "
+            f"in the same order. For columns that are copied unchanged from an upstream column, "
+            f"still include them with category PASS_THROUGH and the source column name — do not omit them."
+        )
 
     user_message = (
         f"Analyse the following source code that writes to `{target_table}`.{col_hint}\n\n"
@@ -96,7 +83,6 @@ def analyze_source_code(
     )
 
     payload = {
-        "model": LLM_MODEL_NAME,
         "messages": [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
@@ -106,34 +92,42 @@ def analyze_source_code(
     }
 
     try:
-        import urllib.request
-        req = urllib.request.Request(
-            _get_endpoint_url(),
-            data=json.dumps(payload).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {_get_api_token()}",
-            },
-            method="POST",
-        )
-        import socket
-        ctx = None
-        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT_SECONDS) as resp:
-            body = resp.read().decode()
-        data = json.loads(body)
+        # Route through the SDK's authenticated client so this works with the App's
+        # OAuth service principal (no static bearer token needed). An explicit
+        # LLM_ENDPOINT_URL override still wins for external / custom endpoints.
+        from backend.lineage_service import _get_client
+        client = _get_client()
+        endpoint = model or LLM_MODEL_NAME
+        override_url = os.environ.get("LLM_ENDPOINT_URL", "")
+        if override_url:
+            data = client.api_client.do("POST", override_url, body=payload)
+        else:
+            data = client.api_client.do(
+                "POST", f"/serving-endpoints/{endpoint}/invocations", body=payload
+            )
         content = data["choices"][0]["message"]["content"]
         # Strip markdown code fences if present
         stripped = content.strip()
         if stripped.startswith("```"):
             stripped = stripped.split("\n", 1)[-1].rsplit("```", 1)[0]
-        return json.loads(stripped)
+        parsed = json.loads(stripped)
+        # The model may return either a bare JSON array or {"columns": [...]}.
+        if isinstance(parsed, dict):
+            return parsed.get("columns", [])
+        return parsed
     except Exception as e:
         logger.info(f"llm: analysis failed for {target_table}: {e}")
         return []
 
 
 def is_llm_configured() -> bool:
-    """Return True if a token and reachable endpoint are available."""
-    token = _get_api_token()
-    url = _get_endpoint_url()
-    return bool(token and url)
+    """Return True if we can reach a serving endpoint.
+
+    In a Databricks App the SP authenticates via OAuth through the SDK client,
+    so no static token is required — a usable WorkspaceClient is sufficient.
+    """
+    try:
+        from backend.lineage_service import _get_client
+        return _get_client() is not None
+    except Exception:
+        return False

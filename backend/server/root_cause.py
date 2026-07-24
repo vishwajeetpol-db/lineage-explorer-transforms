@@ -295,3 +295,173 @@ def trace_root_cause(
     candidates.sort(key=lambda c: (-c["score"], c["hop"]))
     result["candidates"] = candidates[:20]  # cap at 20
     return result
+
+
+# ---------------------------------------------------------------------------
+# Table-level root-cause TRACE (health-based, no column/anomaly required)
+#
+# This is the "auto-run" trace the workspace surfaces the moment a table is
+# selected: walk upstream TABLES, find each table's producers, classify each
+# producer's recent run health, and surface a prime suspect + failure path.
+# ---------------------------------------------------------------------------
+
+STALE_DAYS = int(os.environ.get("ROOT_CAUSE_STALE_DAYS", "7"))
+
+
+def _walk_upstream_tables(start_table: str, max_hops: int = ROOT_CAUSE_MAX_HOPS) -> dict[str, int]:
+    """BFS upstream over system.access.table_lineage. Returns {table: min_hop}."""
+    visited: dict[str, int] = {}
+    frontier = [start_table]
+    hop = 0
+    while frontier and hop < max_hops:
+        hop += 1
+        quoted = ", ".join(f"'{t}'" for t in frontier)
+        try:
+            rows = _execute_sql(
+                f"SELECT DISTINCT source_table_full_name "
+                f"FROM system.access.table_lineage "
+                f"WHERE target_table_full_name IN ({quoted}) "
+                f"  AND source_table_full_name IS NOT NULL "
+                f"  AND event_time >= dateadd(DAY, -{LINEAGE_LOOKBACK_DAYS}, current_timestamp())"
+            )
+        except Exception as e:
+            logger.info(f"root_cause: upstream table walk hop {hop} failed: {e}")
+            break
+        nxt = []
+        for r in rows:
+            t = r.get("source_table_full_name")
+            if t and t != start_table and t not in visited:
+                visited[t] = hop
+                nxt.append(t)
+        frontier = nxt
+    return visited
+
+
+def _producers_for_table(table_fqn: str) -> list[dict]:
+    """Return distinct producers (JOB/PIPELINE/etc) that wrote to table_fqn."""
+    try:
+        rows = _execute_sql(
+            f"SELECT DISTINCT entity_type, entity_id "
+            f"FROM system.access.table_lineage "
+            f"WHERE target_table_full_name = '{table_fqn}' "
+            f"  AND entity_type IS NOT NULL AND entity_id IS NOT NULL "
+            f"  AND event_time >= dateadd(DAY, -{LINEAGE_LOOKBACK_DAYS}, current_timestamp()) "
+            f"LIMIT 20"
+        )
+        return [{"entity_type": r.get("entity_type"), "entity_id": str(r.get("entity_id"))} for r in rows]
+    except Exception as e:
+        logger.info(f"root_cause: producer lookup failed for {table_fqn}: {e}")
+        return []
+
+
+def _producer_health(entity_type: str, entity_id: str) -> dict:
+    """Classify a producer's recent run health as failed | stale | healthy | no_history."""
+    from backend.server.observability import get_job_run_health, get_pipeline_update_health
+
+    et = (entity_type or "").upper()
+    if et == "JOB":
+        h = get_job_run_health(entity_id)
+        total = h.get("total_runs", 0)
+        last_result = h.get("last_run_result")
+        last_at = h.get("last_run_at")
+        success_rate = h.get("success_rate")
+    elif et == "PIPELINE":
+        h = get_pipeline_update_health(entity_id)
+        total = h.get("total_updates", 0)
+        last_result = h.get("last_update_state")
+        last_at = h.get("last_update_at")
+        success_rate = h.get("success_rate")
+    else:
+        return {"entity_type": et, "entity_id": entity_id, "status": "no_history",
+                "last_result": None, "last_run_at": None, "success_rate": None}
+
+    if total == 0:
+        status = "no_history"
+    elif last_result in ("FAILED", "TIMEDOUT", "CANCELED"):
+        status = "failed"
+    else:
+        # Healthy last run — but is it stale? (no run within STALE_DAYS)
+        status = "healthy"
+        if last_at:
+            try:
+                dt = datetime.fromisoformat(str(last_at).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - dt > timedelta(days=STALE_DAYS):
+                    status = "stale"
+            except Exception:
+                pass
+    return {
+        "entity_type": et,
+        "entity_id": entity_id,
+        "status": status,
+        "last_result": last_result,
+        "last_run_at": str(last_at) if last_at else None,
+        "success_rate": success_rate,
+    }
+
+
+# Severity order for ranking a table's overall status from its producers.
+_STATUS_RANK = {"failed": 3, "stale": 2, "healthy": 1, "no_history": 0}
+
+
+def trace_root_cause_table(catalog: str, schema: str, table: str,
+                           max_hops: int = ROOT_CAUSE_MAX_HOPS) -> dict:
+    """Health-based root-cause trace for a table (no column/anomaly needed).
+
+    Walks upstream tables, classifies each table's producers by run health, then
+    surfaces:
+      - counts: failed / stale / healthy / no_history producer tables
+      - prime_suspect: the worst-health table closest to the focus
+      - failure_path: focus → prime suspect chain
+      - flagged: per-table producer health detail (worst-first)
+    """
+    focus = f"{catalog}.{schema}.{table}"
+    upstream = _walk_upstream_tables(focus, max_hops=max_hops)
+    # Include the focus table itself (hop 0) so its own producer shows up.
+    all_tables = {focus: 0, **upstream}
+
+    flagged: list[dict] = []
+    counts = {"failed": 0, "stale": 0, "healthy": 0, "no_history": 0}
+    for tbl, hop in all_tables.items():
+        producers = _producers_for_table(tbl)
+        healths = [_producer_health(p["entity_type"], p["entity_id"]) for p in producers]
+        # A table with no producers at all is a source/ingested table — skip counting.
+        if not healths:
+            continue
+        worst = max(healths, key=lambda h: _STATUS_RANK.get(h["status"], 0))
+        counts[worst["status"]] = counts.get(worst["status"], 0) + 1
+        flagged.append({
+            "table": tbl,
+            "short_name": ".".join(tbl.split(".")[-2:]),
+            "hop": hop,
+            "is_focus": tbl == focus,
+            "status": worst["status"],
+            "producers": healths,
+        })
+
+    # Rank flagged tables: worst status first, then closest hop.
+    flagged.sort(key=lambda f: (-_STATUS_RANK.get(f["status"], 0), f["hop"]))
+
+    # Prime suspect = worst-status upstream table (exclude the focus itself if a
+    # genuine upstream suspect exists) closest to the focus.
+    suspects = [f for f in flagged if f["status"] in ("failed", "stale") and not f["is_focus"]]
+    prime = suspects[0] if suspects else (flagged[0] if flagged else None)
+
+    # Failure path: focus → prime suspect (short chain, by hop).
+    failure_path: list[dict] = []
+    if prime and not prime["is_focus"]:
+        chain = [f for f in flagged if f["hop"] <= prime["hop"] and (f["is_focus"] or f["status"] in ("failed", "stale"))]
+        chain.sort(key=lambda f: f["hop"])
+        failure_path = [{"table": c["table"], "short_name": c["short_name"], "hop": c["hop"], "status": c["status"]} for c in chain]
+
+    return {
+        "focus_table": focus,
+        "max_hops": max_hops,
+        "lookback_days": LINEAGE_LOOKBACK_DAYS,
+        "stale_days": STALE_DAYS,
+        "counts": counts,
+        "prime_suspect": prime,
+        "failure_path": failure_path,
+        "flagged": flagged,
+    }

@@ -803,6 +803,18 @@ function LineageCanvas() {
     [columnLineageEnabled, selectedNode, setSelectedNode]
   );
 
+  // Double-click a TABLE node to re-focus on it (works even in column mode).
+  // The Table Lineage workspace watches `selectedNode` to refocus its panels;
+  // in the main app this just selects the node (harmless).
+  const handleNodeDoubleClick = useCallback(
+    (_: React.MouseEvent, node: Node) => {
+      if (!node.id.startsWith("entity:") && !node.id.startsWith("path:")) {
+        setSelectedNode(node.id);
+      }
+    },
+    [setSelectedNode]
+  );
+
   const handleResetLayout = useCallback(() => {
     setSelectedNode(null);
     setSelectedColumn(null);
@@ -871,6 +883,7 @@ function LineageCanvas() {
         onNodesChange={onNodesChange}
         onPaneClick={handlePaneClick}
         onNodeClick={handleNodeClick}
+        onNodeDoubleClick={handleNodeDoubleClick}
         nodesDraggable
         minZoom={0.1}
         maxZoom={3}

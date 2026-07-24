@@ -6,6 +6,7 @@ export type Route =
   | { view: "schemas"; catalog: string }
   | { view: "tables"; catalog: string; schema: string }
   | { view: "lineage"; table: string }
+  | { view: "tableLineage"; table?: string }
   | { view: "schemaLineage"; catalog: string; schema: string }
   | { view: "catalogLineage"; catalog: string }
   | { view: "admin" }
@@ -25,6 +26,13 @@ function parseRoute(): Route {
 
   if (params.get("admin") === "true") return { view: "admin" };
   if (params.get("controlPanel") === "true") return { view: "controlPanel" };
+
+  // Table Lineage workspace — checked before the bare `table` deep-link below so
+  // ?view=tableLineage&table=... opens the workspace, not the plain lineage graph.
+  if (params.get("view") === "tableLineage") {
+    const t = params.get("table");
+    return { view: "tableLineage", table: t && t.split(".").length === 3 ? t : undefined };
+  }
 
   const table = params.get("table");
   if (table && table.split(".").length === 3) {
@@ -76,6 +84,10 @@ function routeToSearch(route: Route): string {
       return `?view=tables&catalog=${encodeURIComponent(route.catalog)}&schema=${encodeURIComponent(route.schema)}`;
     case "lineage":
       return `?table=${encodeURIComponent(route.table)}`;
+    case "tableLineage":
+      return route.table
+        ? `?view=tableLineage&table=${encodeURIComponent(route.table)}`
+        : "?view=tableLineage";
     case "schemaLineage":
       return `?view=schemaLineage&catalog=${encodeURIComponent(route.catalog)}&schema=${encodeURIComponent(route.schema)}`;
     case "catalogLineage":
@@ -136,6 +148,7 @@ export const goSchemas = (catalog: string) => navigate({ view: "schemas", catalo
 export const goTables = (catalog: string, schema: string) =>
   navigate({ view: "tables", catalog, schema });
 export const goLineage = (table: string) => navigate({ view: "lineage", table });
+export const goTableLineage = (table?: string) => navigate({ view: "tableLineage", table });
 export const goSchemaLineage = (catalog: string, schema: string) =>
   navigate({ view: "schemaLineage", catalog, schema });
 export const goCatalogLineage = (catalog: string) =>

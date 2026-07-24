@@ -17,6 +17,7 @@ from backend.server.governance import (
     get_downstream_sensitivity_propagation,
     list_governance_rules,
     upsert_governance_rule,
+    delete_governance_rule,
 )
 
 router = APIRouter(prefix="/api/governance", tags=["governance"])
@@ -94,5 +95,18 @@ async def upsert_governance_config(request: Request, rule: GovernanceRuleIn):
     rule_dict["schema"] = rule_dict.pop("schema_name", None)
     try:
         return upsert_governance_rule(rule_dict, actor=_email or "unknown")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/config")
+async def delete_governance_config(request: Request, rule_id: str = Query(...)):
+    """Delete a classification rule by id. Admin-gated."""
+    from backend.main import _get_user_info
+    _email, is_admin = _get_user_info(request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin required to modify governance rules.")
+    try:
+        return delete_governance_rule(rule_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

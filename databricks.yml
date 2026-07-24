@@ -140,8 +140,6 @@ targets:
                 value: ${var.lineage_catalog}
               - name: LINEAGE_SCHEMA
                 value: ${var.lineage_schema}
-              - name: PIPELINE_NOTEBOOK_PATH
-                value: ${var.pipeline_notebook_path}
               - name: TRANSFORM_CACHE_TTL_SECONDS
                 value: ${var.transform_cache_ttl_seconds}
               - name: BUILD_CACHE_TTL_HOURS
@@ -191,8 +189,6 @@ targets:
                 value: ${var.lineage_catalog}
               - name: LINEAGE_SCHEMA
                 value: ${var.lineage_schema}
-              - name: PIPELINE_NOTEBOOK_PATH
-                value: ${var.pipeline_notebook_path}
               - name: TRANSFORM_CACHE_TTL_SECONDS
                 value: ${var.transform_cache_ttl_seconds}
               - name: BUILD_CACHE_TTL_HOURS

@@ -10,6 +10,7 @@ Endpoints:
 from __future__ import annotations
 
 import os
+import json
 import logging
 from typing import Optional
 
@@ -19,7 +20,11 @@ from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
 from backend.server.entities import resolve_entity, resolve_entities
 from backend.server.producer_source import analyze_producer
-from backend.server.analysis_store import list_analyses
+from backend.server.analysis_store import (
+    list_analyses,
+    list_versions,
+    get_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +256,7 @@ class AnalyzeProducerIn(BaseModel):
     target_table: str
     force_rerun: bool = False
     target_columns: Optional[list[str]] = None
+    model: Optional[str] = None  # LLM serving-endpoint name to use for this run
 
 
 @analyze_router.post("/api/analyze-producer")
@@ -277,6 +283,7 @@ async def analyze_producer_endpoint(request: Request, body: AnalyzeProducerIn):
             actor=email or "unknown",
             force_rerun=body.force_rerun,
             target_columns=body.target_columns,
+            model=body.model,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -295,3 +302,140 @@ async def analysis_history(
     if not is_admin:
         raise HTTPException(status_code=403, detail="Admin required.")
     return {"history": list_analyses(entity_type=entity_type, entity_id=entity_id, limit=limit)}
+
+
+@analyze_router.get("/api/analyze-producer/models")
+async def analyze_producer_models(request: Request):
+    """List LLM serving endpoints available for producer analysis (for the UI dropdown).
+
+    Returns chat/completions-capable Foundation Model endpoints. Falls back to a
+    curated default list if the serving inventory can't be read.
+    """
+    from backend.server.llm import LLM_MODEL_NAME
+    # Endpoint name fragments that are NOT chat/completion models (embeddings,
+    # rerankers, vision, speech) — the serving `task` field is often empty for
+    # FMAPI chat models, so we also filter by name.
+    _NON_CHAT = ("bge", "embed", "gte", "rerank", "whisper", "vision", "-tts", "clip")
+    models: list[str] = []
+    try:
+        client = _get_client()
+        for ep in client.serving_endpoints.list():
+            name = getattr(ep, "name", None)
+            if not name:
+                continue
+            lname = name.lower()
+            if any(frag in lname for frag in _NON_CHAT):
+                continue
+            task = (getattr(ep, "task", None) or "").lower()
+            # Skip endpoints that declare a non-chat task; keep unknown-task ones.
+            if task and "chat" not in task and "completion" not in task and "llm" not in task:
+                continue
+            models.append(name)
+    except Exception as e:
+        logger.info(f"analyze-producer/models: serving inventory unavailable: {e}")
+
+    if not models:
+        models = [
+            "databricks-claude-sonnet-4-6",
+            "databricks-claude-opus-4-8",
+            "databricks-gpt-oss-120b",
+            "databricks-meta-llama-3-3-70b-instruct",
+        ]
+    # Ensure the current default is present and first.
+    models = sorted(set(models))
+    if LLM_MODEL_NAME in models:
+        models.remove(LLM_MODEL_NAME)
+    models.insert(0, LLM_MODEL_NAME)
+    return {"models": models, "default": LLM_MODEL_NAME}
+
+
+@analyze_router.get("/api/analyze-producer/versions")
+async def analyze_producer_versions(
+    request: Request,
+    entity_type: str = Query(...),
+    entity_id: str = Query(...),
+    target_table: str = Query(...),
+):
+    """List stored analysis versions (metadata only) for one (producer, target table)."""
+    et = (entity_type or "").strip().upper()
+    eid = (entity_id or "").strip()
+    if not eid or not _ENTITY_ID_RE.match(eid):
+        raise HTTPException(status_code=400, detail="Invalid entity_id")
+    if not _FULL_NAME_RE.match(target_table):
+        raise HTTPException(status_code=400, detail="Invalid target_table")
+    return {"versions": list_versions(et, eid, target_table)}
+
+
+@analyze_router.get("/api/analyze-producer/version")
+async def analyze_producer_version(
+    request: Request,
+    entity_type: str = Query(...),
+    entity_id: str = Query(...),
+    target_table: str = Query(...),
+    version: int = Query(...),
+):
+    """Return one stored analysis version in full (columns + source snapshot)."""
+    et = (entity_type or "").strip().upper()
+    eid = (entity_id or "").strip()
+    if not eid or not _ENTITY_ID_RE.match(eid):
+        raise HTTPException(status_code=400, detail="Invalid entity_id")
+    if not _FULL_NAME_RE.match(target_table):
+        raise HTTPException(status_code=400, detail="Invalid target_table")
+    v = get_version(et, eid, target_table, version)
+    if v is None:
+        raise HTTPException(status_code=404, detail=f"No stored analysis version {version}.")
+    return v
+
+
+@analyze_router.get("/api/analyze-producer/compare")
+async def analyze_producer_compare(
+    request: Request,
+    entity_type: str = Query(...),
+    entity_id: str = Query(...),
+    target_table: str = Query(...),
+    from_version: int = Query(...),
+    to_version: int = Query(...),
+):
+    """Compare two stored versions — returns both full rows plus a per-column diff
+    and whether the source code changed between them."""
+    et = (entity_type or "").strip().upper()
+    eid = (entity_id or "").strip()
+    if not eid or not _ENTITY_ID_RE.match(eid):
+        raise HTTPException(status_code=400, detail="Invalid entity_id")
+    if not _FULL_NAME_RE.match(target_table):
+        raise HTTPException(status_code=400, detail="Invalid target_table")
+    a = get_version(et, eid, target_table, from_version)
+    b = get_version(et, eid, target_table, to_version)
+    if a is None or b is None:
+        raise HTTPException(status_code=404, detail="One or both versions not found.")
+
+    def _col_map(row: dict) -> dict:
+        out = {}
+        for c in row.get("columns", []):
+            key = c.get("target_column") or c.get("column")
+            if key:
+                out[key] = c
+        return out
+
+    ma, mb = _col_map(a), _col_map(b)
+    all_cols = sorted(set(ma) | set(mb))
+    col_diffs = []
+    for col in all_cols:
+        ca, cb = ma.get(col), mb.get(col)
+        if ca is None:
+            status = "added"
+        elif cb is None:
+            status = "removed"
+        elif json.dumps(ca, sort_keys=True) != json.dumps(cb, sort_keys=True):
+            status = "changed"
+        else:
+            status = "unchanged"
+        col_diffs.append({"column": col, "status": status, "from": ca, "to": cb})
+
+    return {
+        "from": a,
+        "to": b,
+        "source_changed": a.get("source_hash") != b.get("source_hash"),
+        "column_diffs": col_diffs,
+        "changed_count": sum(1 for d in col_diffs if d["status"] != "unchanged"),
+    }
