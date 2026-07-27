@@ -12,7 +12,7 @@ from collections import deque, OrderedDict
 from dataclasses import asdict
 
 # A5 FIX: Single source of truth for version. Sync with package.json, README, CHANGELOG.
-APP_VERSION = "2.5.5"
+APP_VERSION = "2.5.6"
 
 RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "60"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))

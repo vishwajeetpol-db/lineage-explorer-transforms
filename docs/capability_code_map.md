@@ -4,7 +4,13 @@
 > AND the **full feature inventory** (48 routes/subsystems) to code anchors.
 > Status: **HAVE** / **PARTIAL** / **GAP** — with closure notes for each.
 >
-> **v2.5.5 (this session):** added the **Table Lineage workspace** — a dedicated
+> **v2.5.6:** Column Transformation Lineage now uses a **unified precedence
+> resolver** (captured Spark plan → CDC spec → stored LLM → fresh LLM) with a
+> **cross-source version history + compare** (diff a captured plan against an
+> LLM deduction). Captured-plan tables are configurable so the reader can point
+> at the offline `lineage_capture` project's schema. See Part F.
+>
+> **v2.5.5:** added the **Table Lineage workspace** — a dedicated
 > sidebar-shell home + 3-pane workspace (catalog tree · lineage graph · draggable
 > capability panels) that surfaces Impact / Root Cause / Governance / Access / ML /
 > LLM-Transform per selected table. Several backend capabilities were reworked to be
@@ -74,7 +80,7 @@
 | 36 | Captured-Plan Precedence | `plan_capture_service.py`, `sublineage/backtrack.py` | `GET /api/transform/captured-expression` |
 | 37 | Federated Sync (peers) | `federated_sync.py` | `GET\|POST /api/control-panel/federated/*` |
 | 38 | Federated Source Overlay | `federated_service.py` | `GET /api/lineage/federated-overlay` |
-| 39 | LLM Producer Analysis | `routes/lineage.py` (analyze_router), `server/producer_source.py`, `server/llm.py`, `server/analysis_store.py`, `components/table-lineage/LLMTransformPanel.tsx` | `POST /api/analyze-producer`, `GET /api/analyze-producer/models`, `/api/analyze-producer/versions`, `/api/analyze-producer/version`, `/api/analyze-producer/compare` | v2.5.5: full rework — SDK OAuth call (no static token), configurable/valid model (default `databricks-claude-sonnet-4-6`) with a **model dropdown**, full-column-coverage prompt, notebook `ExportFormat` fix. **Versioning**: source-code snapshot per version, configurable table (`PRODUCER_ANALYSIS_TABLE`), versions keyed by (entity_type, entity_id, target_table), get-latest-on-load, stale/source-change detection driving the re-analyze button, and version **compare** (code + per-column diff) |
+| 39 | Column Transformation Lineage (LLM + captured plan) | `routes/lineage.py` (analyze_router), `server/producer_source.py`, `server/llm.py`, `server/analysis_store.py`, `plan_capture_service.py`, `components/table-lineage/ColumnTransformationPanel.tsx` | `POST /api/column-transformations`, `/api/column-transformations/versions`, `/api/column-transformations/compare`, `POST /api/analyze-producer`, `GET /api/analyze-producer/models` | v2.5.6: **unified precedence resolver** (POC-style) — captured Spark plan → captured CDC spec → stored LLM version (stale-flagged) → fresh LLM. `resolve_column_transformations()` picks best-source-first; `list_all_versions()` merges captured-plan + LLM versions (each with a `ref` like `plan_capture:2`/`llm:6`); `compare_transformation_versions()` diffs ANY two refs incl. **cross-source** (captured plan vs LLM). Captured-plan tables now configurable (`CAPTURED_PLANS_TABLE`/`CAPTURED_CDC_TABLE`) so the reader can point at the offline `lineage_capture` project's schema; NULL versions handled via `coalesce`. v2.5.5 base: SDK OAuth call, model dropdown, full-column prompt, per-(entity,target) versioning + source snapshot |
 | 40 | Pipeline Capture Installer | `routes/pipeline_installer.py` | `POST /api/pipeline/install-capture` |
 | 41 | SCD/CDC Spec Viewer | `routes/diagnostics.py` | `GET /api/diagnostics/scd` |
 | 42 | Schema-Change Detector | `routes/diagnostics.py` | `GET /api/diagnostics/schema-changes` |
@@ -112,7 +118,14 @@
 
 ## Part D — Closure History
 
-### v2.5.5 — Table Lineage workspace + UI shell (this session)
+### v2.5.6 — Unified column-transformation precedence + cross-source versioning
+
+| Item | Was | Now | How |
+|------|-----|-----|-----|
+| #39 Column Transformation | LLM-only panel; captured plans a separate flag-gated surface | HAVE (unified) | `resolve_column_transformations()` walks the POC precedence chain (captured plan → CDC → stored LLM → fresh LLM); `list_all_versions()` + `compare_transformation_versions()` give one version history across both sources and cross-source diff. Panel renamed **Column Transformation Lineage**. |
+| Captured-plan source | Read only from app-owned schema (empty in demo) | HAVE | `CAPTURED_PLANS_TABLE`/`CAPTURED_CDC_TABLE` env vars point the reader at the offline `lineage_capture` project's schema (`lineage_explorer`); NULL versions handled. Requires the SP to have `USE SCHEMA` on that schema + the `plan_capture` flag on. |
+
+### v2.5.5 — Table Lineage workspace + UI shell
 
 | Item | Was | Now | How |
 |------|-----|-----|-----|
@@ -194,7 +207,7 @@ service-principal-friendly.
 | `GovernancePanel.tsx` | Identity header + tags + classified columns + **Configure classification** (add/remove column & UC-tag rules) (cap 12). |
 | `AccessPanel.tsx` | Grantees/accessors/reads/writes stats, identities, grants, recent events (cap 13). |
 | `MLModelsPanel.tsx` | Models trained on the table + serving-endpoint status (cap 14). |
-| `LLMTransformPanel.tsx` | Model dropdown, versioned analysis, stale re-analyze, version compare (cap 39). |
+| `ColumnTransformationPanel.tsx` | Unified precedence source-of-truth banner (captured plan → CDC → stored LLM → fresh LLM), per-column cards, model dropdown, unified version history across sources, and cross-source version compare (cap 39). Replaces the old `LLMTransformPanel.tsx`. |
 | `panelShared.tsx` | Shared panel primitives (loading/error/empty states, stat tiles, sensitivity badges, `parseFqn`). |
 
 Routing: `hooks/useRouter.ts` adds `tableLineage` view + `goTableLineage(table?)`;
@@ -221,10 +234,11 @@ governance-rule, access, ml-models, root-cause-trace, and analyze-producer
 | `server/root_cause.py` + `routes/root_cause.py` | `trace_root_cause_table()` + `GET /api/root-cause/trace` (health-based) |
 | `server/ml.py` | live model→table derivation from UC registry + MLflow run inputs |
 | `server/llm.py` | SDK OAuth call; default `databricks-claude-sonnet-4-6`; full-column prompt; `max_tokens` 4000 |
-| `server/producer_source.py` | fetch target columns; `ExportFormat.SOURCE` fix; version-aware analyze; `model` param |
+| `server/producer_source.py` | fetch target columns; `ExportFormat.SOURCE` fix; version-aware analyze; `model` param; **v2.5.6** unified `resolve_column_transformations()` (precedence), `list_all_versions()` + `compare_transformation_versions()` (cross-source) |
 | `server/analysis_store.py` | source snapshot column; configurable `PRODUCER_ANALYSIS_TABLE`; per-(entity,target) version keying; get-latest/get-version/list-versions |
+| `plan_capture_service.py` | **v2.5.6** configurable `CAPTURED_PLANS_TABLE`/`CAPTURED_CDC_TABLE`; `coalesce(version,1)` for NULL versions; `get_captured_columns()`, `list_captured_versions()`, `get_captured_columns_version()`, `get_captured_cdc_spec()` |
 | `routes/impact.py` | `_consumers()` — reader entities grouped by type + resolved deep links |
-| `routes/lineage.py` | analyze-producer `models`/`versions`/`version`/`compare` endpoints; `model` in request |
+| `routes/lineage.py` | analyze-producer `models`/`versions`/`version`/`compare`; **v2.5.6** `POST /api/column-transformations` + `/versions` + `/compare` |
 | `server/entities.py` | `DASHBOARD_V3` (Lakeview) resolver + `/dashboardsv3/` deep link; `DBSQL_QUERY`/`DBSQL_DASHBOARD` aliases |
 | `server/observability.py` | fix `pipeline_update_timeline` column names (`result_state`/`period_*`) — also unblocks pipeline run health |
 | `lineage_service.py` | `_execute_sql` polls past the 50s SQL wait cap (fixes schema-lineage `PENDING` 500s) |

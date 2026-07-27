@@ -15,7 +15,7 @@ import ImpactPanel from "./ImpactPanel";
 import GovernancePanel from "./GovernancePanel";
 import AccessPanel from "./AccessPanel";
 import MLModelsPanel from "./MLModelsPanel";
-import LLMTransformPanel from "./LLMTransformPanel";
+import ColumnTransformationPanel from "./ColumnTransformationPanel";
 import RootCausePanel from "./RootCausePanel";
 
 type TabKey = "impact" | "rootCause" | "governance" | "access" | "ml" | "llm";
@@ -26,7 +26,7 @@ const TABS: { key: TabKey; label: string; icon: typeof GitBranch; accent: string
   { key: "governance", label: "Governance", icon: ScrollText, accent: "text-emerald-400" },
   { key: "access", label: "Access", icon: KeyRound, accent: "text-sky-400" },
   { key: "ml", label: "ML Models", icon: Boxes, accent: "text-cyan-400" },
-  { key: "llm", label: "LLM Transform", icon: Sparkles, accent: "text-violet-400" },
+  { key: "llm", label: "Column Transformation", icon: Sparkles, accent: "text-violet-400" },
 ];
 
 const PANEL_TITLE: Record<TabKey, string> = {
@@ -35,7 +35,7 @@ const PANEL_TITLE: Record<TabKey, string> = {
   governance: "Governance",
   access: "Access & security",
   ml: "ML models",
-  llm: "LLM column transformations",
+  llm: "Column Transformation Lineage",
 };
 
 function renderPanelBody(key: TabKey, table: string | null) {
@@ -45,7 +45,7 @@ function renderPanelBody(key: TabKey, table: string | null) {
     case "governance": return <GovernancePanel table={table} />;
     case "access": return <AccessPanel table={table} />;
     case "ml": return <MLModelsPanel table={table} />;
-    case "llm": return <LLMTransformPanel table={table} />;
+    case "llm": return <ColumnTransformationPanel table={table} />;
   }
 }
 

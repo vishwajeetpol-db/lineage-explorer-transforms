@@ -34,6 +34,12 @@ variables:
   pipeline_notebook_path:
     description: "Workspace path to the run_all notebook for building transformation lineage"
     default: ""
+  captured_plans_table:
+    description: "Delta table the lineage_capture wheel writes analyzed plans to (override if capture lands outside the app-owned schema)"
+    default: "lattice_lineage.lineage.captured_plans"
+  captured_cdc_table:
+    description: "Delta table for captured apply_changes/AUTO-CDC specs"
+    default: "lattice_lineage.lineage.captured_cdc_specs"
   transform_cache_ttl_seconds:
     description: "TTL (seconds) for transformation lineage cache (shorter than table lineage)"
     default: "3600"
@@ -140,6 +146,15 @@ targets:
                 value: ${var.lineage_catalog}
               - name: LINEAGE_SCHEMA
                 value: ${var.lineage_schema}
+              # Portable path to the deployed run_pipeline notebook — workspace.file_path
+              # auto-resolves per-user, so this is team-safe and never empty (an empty
+              # value here previously broke the Apps config update).
+              - name: PIPELINE_NOTEBOOK_PATH
+                value: ${workspace.file_path}/notebooks/run_pipeline
+              - name: CAPTURED_PLANS_TABLE
+                value: ${var.captured_plans_table}
+              - name: CAPTURED_CDC_TABLE
+                value: ${var.captured_cdc_table}
               - name: TRANSFORM_CACHE_TTL_SECONDS
                 value: ${var.transform_cache_ttl_seconds}
               - name: BUILD_CACHE_TTL_HOURS
@@ -189,6 +204,15 @@ targets:
                 value: ${var.lineage_catalog}
               - name: LINEAGE_SCHEMA
                 value: ${var.lineage_schema}
+              # Portable path to the deployed run_pipeline notebook — workspace.file_path
+              # auto-resolves per-user, so this is team-safe and never empty (an empty
+              # value here previously broke the Apps config update).
+              - name: PIPELINE_NOTEBOOK_PATH
+                value: ${workspace.file_path}/notebooks/run_pipeline
+              - name: CAPTURED_PLANS_TABLE
+                value: ${var.captured_plans_table}
+              - name: CAPTURED_CDC_TABLE
+                value: ${var.captured_cdc_table}
               - name: TRANSFORM_CACHE_TTL_SECONDS
                 value: ${var.transform_cache_ttl_seconds}
               - name: BUILD_CACHE_TTL_HOURS

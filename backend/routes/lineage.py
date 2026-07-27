@@ -19,7 +19,12 @@ from pydantic import BaseModel
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
 from backend.server.entities import resolve_entity, resolve_entities
-from backend.server.producer_source import analyze_producer
+from backend.server.producer_source import (
+    analyze_producer,
+    resolve_column_transformations,
+    list_all_versions,
+    compare_transformation_versions,
+)
 from backend.server.analysis_store import (
     list_analyses,
     list_versions,
@@ -302,6 +307,93 @@ async def analysis_history(
     if not is_admin:
         raise HTTPException(status_code=403, detail="Admin required.")
     return {"history": list_analyses(entity_type=entity_type, entity_id=entity_id, limit=limit)}
+
+
+class ColumnTransformIn(BaseModel):
+    catalog: str
+    schema_name: str
+    table: str
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+    force_rerun: bool = False
+    model: Optional[str] = None
+
+
+@analyze_router.post("/api/column-transformations")
+async def column_transformations(request: Request, body: ColumnTransformIn):
+    """Unified column-transformation lineage for a table, resolved best-source-
+    first: captured Spark plan → captured CDC spec → stored LLM version → fresh
+    LLM. Mirrors the reference tool's precedence."""
+    c = _validate(body.catalog, "catalog")
+    s = _validate(body.schema_name, "schema")
+    t = _validate(body.table, "table")
+    et = (body.entity_type or "").strip().upper() or None
+    eid = (body.entity_id or "").strip() or None
+    if eid and not _ENTITY_ID_RE.match(eid):
+        raise HTTPException(status_code=400, detail="Invalid entity_id")
+    from backend.main import _get_user_info
+    email, _ = _get_user_info(request)
+    try:
+        return resolve_column_transformations(
+            catalog=c, schema=s, table=t,
+            entity_type=et, entity_id=eid,
+            actor=email or "unknown",
+            force_rerun=body.force_rerun,
+            model=body.model,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class CTVersionsIn(BaseModel):
+    catalog: str
+    schema_name: str
+    table: str
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+
+
+@analyze_router.post("/api/column-transformations/versions")
+async def column_transformation_versions(request: Request, body: CTVersionsIn):
+    """Unified version list across sources (captured Spark plans + stored LLM
+    analyses) for a table, newest-first. Each entry has a `ref` for compare."""
+    c = _validate(body.catalog, "catalog")
+    s = _validate(body.schema_name, "schema")
+    t = _validate(body.table, "table")
+    et = (body.entity_type or "").strip().upper() or None
+    eid = (body.entity_id or "").strip() or None
+    if eid and not _ENTITY_ID_RE.match(eid):
+        raise HTTPException(status_code=400, detail="Invalid entity_id")
+    return {"versions": list_all_versions(c, s, t, et, eid)}
+
+
+class CTCompareIn(BaseModel):
+    catalog: str
+    schema_name: str
+    table: str
+    ref_from: str
+    ref_to: str
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+
+
+_REF_RE = __import__("re").compile(r"^(plan_capture|llm):[0-9]{1,9}$")
+
+
+@analyze_router.post("/api/column-transformations/compare")
+async def column_transformation_compare(request: Request, body: CTCompareIn):
+    """Compare two transformation versions from ANY source (captured plan vs LLM,
+    or two versions of one source) — per-column diff."""
+    c = _validate(body.catalog, "catalog")
+    s = _validate(body.schema_name, "schema")
+    t = _validate(body.table, "table")
+    if not _REF_RE.match(body.ref_from or "") or not _REF_RE.match(body.ref_to or ""):
+        raise HTTPException(status_code=400, detail="Invalid version ref (expected 'plan_capture:N' or 'llm:N')")
+    et = (body.entity_type or "").strip().upper() or None
+    eid = (body.entity_id or "").strip() or None
+    if eid and not _ENTITY_ID_RE.match(eid):
+        raise HTTPException(status_code=400, detail="Invalid entity_id")
+    return compare_transformation_versions(c, s, t, body.ref_from, body.ref_to, et, eid)
 
 
 @analyze_router.get("/api/analyze-producer/models")

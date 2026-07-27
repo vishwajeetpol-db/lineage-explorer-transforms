@@ -6,6 +6,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [2.5.6] - 2026-07-27
+
+> **Column Transformation Lineage — unified precedence + cross-source versioning.** The LLM Transform panel is reworked into **Column Transformation Lineage**, which resolves a table's per-column derivation best-source-first (mirroring the reference tool): captured Spark plan → captured CDC spec → stored LLM version → fresh LLM. Version history now spans both sources, and any two versions can be diffed — including a captured plan against an LLM deduction.
+
+### Added
+
+- **`POST /api/column-transformations`** — unified resolver. Returns columns + a `source` (`plan_capture` / `cdc_spec` / `stored` / `llm`) and a source label, picking the best available source. `force_rerun` skips captures/cache to a fresh LLM pass.
+- **`POST /api/column-transformations/versions`** — merged version list across sources (captured plans + LLM analyses), each with a `ref` (`plan_capture:2`, `llm:6`) and source tag.
+- **`POST /api/column-transformations/compare`** — diff any two version refs, including **cross-source** (captured plan vs LLM); per-column added/removed/changed with a `cross_source` flag.
+- **`plan_capture_service`**: `get_captured_columns()`, `list_captured_versions()`, `get_captured_columns_version()`, `get_captured_cdc_spec()` — table-level captured-plan reads used by the resolver.
+- **Configurable captured-plan tables** — `CAPTURED_PLANS_TABLE` / `CAPTURED_CDC_TABLE` env vars (bundle vars `captured_plans_table` / `captured_cdc_table`) let the reader point at wherever the offline `lineage_capture` wheel writes (e.g. the `lineage_explorer` schema), not just the app-owned schema.
+- **`PIPELINE_NOTEBOOK_PATH`** restored in `databricks.yml` as the portable `${workspace.file_path}/notebooks/run_pipeline` — fixes "Build pipeline not configured" without the empty-string value that previously broke the Apps config update.
+- **Makefile** — encodes the workspace `--var` overrides so a compute/config change or plain redeploy never drops env (`make redeploy` / `run` / `deploy` / `diagnostics` / `logs`).
+
+### Changed
+
+- **Column Transformation panel** — renamed from "LLM Transform"; adds a precedence-chain legend, a color-coded source-of-truth banner, richer per-column cards (category badge + `src → target` flow + expression), unified version history, and cross-source compare. (`ColumnTransformationPanel.tsx` replaces `LLMTransformPanel.tsx`.)
+- **`plan_capture_service`** — NULL `version` handled via `coalesce(version, 1)` when ordering/matching captured plans.
+- **`APP_VERSION` / package version → `2.5.6`**.
+
+### Fixed
+
+- Captured-plan lineage now actually resolves: the reader was pointed at the empty app-owned schema instead of the capture project's `lineage_explorer.captured_plans`, and the SP lacked `USE SCHEMA` on that schema.
+
+---
+
 ## [2.5.5] - 2026-07-24
 
 > **Table Lineage workspace + UI shell.** Adds a dedicated per-table analysis workspace (catalog tree · lineage graph · draggable capability panels) reached from a new Landing tile, a light/dark theme toggle, a redesigned sidebar-shell home, and a new logo across the app. Several backend capabilities were reworked to be service-principal-friendly and to match the reference tool (Data Lineage POC). No new scorecard capabilities — this session productizes the per-table UX over existing caps 08/09/12/13/14/39.

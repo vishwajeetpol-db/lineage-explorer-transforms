@@ -313,6 +313,48 @@ export interface AnalyzeProducerResponse {
   detail?: string;
 }
 
+export interface TransformVersion {
+  ref: string;                       // "plan_capture:3" | "llm:5"
+  source: "plan_capture" | "llm";
+  version: number | null;
+  label: string;
+  llm_model?: string | null;
+  captured_via?: string | null;
+  analyzed_at?: string | null;
+  analyzed_by?: string | null;
+}
+
+export interface CrossSourceCompare {
+  from: { ref: string; source: string; version: number | null; label: string; analyzed_at?: string | null };
+  to: { ref: string; source: string; version: number | null; label: string; analyzed_at?: string | null };
+  cross_source: boolean;
+  changed_count: number;
+  column_diffs: {
+    column: string;
+    status: "added" | "removed" | "changed" | "unchanged";
+    from: AnalyzeProducerColumn | null;
+    to: AnalyzeProducerColumn | null;
+  }[];
+  error?: string;
+}
+
+export interface ColumnTransformResult {
+  table_full_name: string;
+  entity_type: string | null;
+  entity_id: string | null;
+  columns: AnalyzeProducerColumn[];
+  source: "plan_capture" | "cdc_spec" | "stored" | "llm" | "unavailable" | "none" | null;
+  source_label: string | null;
+  version: number | null;
+  versions: AnalysisVersion[];
+  stale: boolean;
+  llm_model: string | null;
+  captured_at?: string;
+  analyzed_at?: string;
+  cdc_spec?: { keys?: unknown; sequence_by?: string; scd_type?: unknown; source?: string; version?: number };
+  detail?: string | null;
+}
+
 export interface AnalysisVersion {
   version: number;
   llm_model: string | null;
@@ -420,6 +462,43 @@ export const api = {
     });
     if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
     return res.json() as Promise<AnalyzeProducerResponse>;
+  },
+
+  // Unified version list across sources (captured plans + LLM).
+  listColumnTransformationVersions: async (body: {
+    catalog: string; schema_name: string; table: string; entity_type?: string; entity_id?: string;
+  }) => {
+    const res = await fetch(`${BASE}/column-transformations/versions`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+    return res.json() as Promise<{ versions: TransformVersion[] }>;
+  },
+
+  // Compare two transformation versions from any source (captured plan / LLM).
+  compareTransformationVersions: async (body: {
+    catalog: string; schema_name: string; table: string;
+    ref_from: string; ref_to: string; entity_type?: string; entity_id?: string;
+  }) => {
+    const res = await fetch(`${BASE}/column-transformations/compare`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+    return res.json() as Promise<CrossSourceCompare>;
+  },
+
+  // Unified column-transformation lineage (captured plan → CDC → stored LLM → fresh LLM).
+  resolveColumnTransformations: async (body: {
+    catalog: string; schema_name: string; table: string;
+    entity_type?: string; entity_id?: string; force_rerun?: boolean; model?: string;
+  }) => {
+    const res = await fetch(`${BASE}/column-transformations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+    return res.json() as Promise<ColumnTransformResult>;
   },
 
   // Available LLM serving endpoints for the model dropdown.
