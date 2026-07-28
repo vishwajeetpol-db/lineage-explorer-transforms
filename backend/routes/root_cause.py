@@ -87,17 +87,26 @@ async def root_cause_trace(
     schema: str = Query(...),
     table: str = Query(...),
     max_hops: int = Query(6),
+    refresh: bool = Query(False),
 ):
     """Health-based root-cause trace for a table (auto-run, no column needed).
 
     Walks upstream tables, classifies each table's producers by recent run
     health, and returns a prime suspect + failure path + flagged producers.
+    Served from the per-table capability cache unless `refresh=true`.
     """
     c = _validate(catalog, "catalog")
     s = _validate(schema, "schema")
     t = _validate(table, "table")
+    fqn = f"{c}.{s}.{t}"
+    from backend.main import _get_user_info
+    from backend.server.capability_cache import serve_or_compute
+    email, _ = _get_user_info(request)
     try:
-        return await asyncio.to_thread(trace_root_cause_table, c, s, t, max_hops)
+        return await asyncio.to_thread(
+            serve_or_compute, fqn, "root_cause",
+            lambda: trace_root_cause_table(c, s, t, max_hops), email or "", refresh,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

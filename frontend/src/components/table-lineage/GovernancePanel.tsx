@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Tag, Plus, X, Lock } from "lucide-react";
 import { api, type GovernanceResponse, type GovernanceRule } from "../../api/client";
 import { useLineageStore } from "../../store/lineageStore";
-import { PanelState, NoTable, SectionTitle, SensitivityBadge, parseFqn } from "./panelShared";
+import { PanelState, NoTable, SectionTitle, SensitivityBadge, CacheHeader, parseFqn } from "./panelShared";
 
 const SENSITIVITIES = ["PII", "PCI", "PHI", "SENSITIVE", "CONFIDENTIAL"];
 
@@ -38,11 +38,11 @@ export default function GovernancePanel({ table }: { table: string | null }) {
 
   const parts = parseFqn(table);
 
-  const loadGovernance = useCallback(() => {
+  const loadGovernance = useCallback((refresh = false) => {
     if (!parts) { setData(null); return; }
     let cancelled = false;
     setLoading(true); setError(null);
-    api.getGovernance(parts.catalog, parts.schema, parts.table)
+    api.getGovernance(parts.catalog, parts.schema, parts.table, refresh)
       .then((r) => { if (!cancelled) setData(r); })
       .catch((e) => { if (!cancelled) setError(e.message || "Failed to load governance"); })
       .finally(() => { if (!cancelled) setLoading(false); });
@@ -71,7 +71,7 @@ export default function GovernancePanel({ table }: { table: string | null }) {
         sensitivity: colSensitivity,
         notes: colTarget === "__whole_table__" ? "whole table" : `column ${colTarget}`,
       });
-      loadRules(); loadGovernance();
+      loadRules(); loadGovernance(true);
     } catch (e: any) {
       setActionError(e.message || "Failed to add rule");
     } finally { setBusy(false); }
@@ -87,7 +87,7 @@ export default function GovernancePanel({ table }: { table: string | null }) {
         notes: tagValue.trim() ? `tag ${tagKey}=${tagValue}` : `tag ${tagKey} (any value)`,
       });
       setTagKey(""); setTagValue("");
-      loadRules(); loadGovernance();
+      loadRules(); loadGovernance(true);
     } catch (e: any) {
       setActionError(e.message || "Failed to add rule");
     } finally { setBusy(false); }
@@ -97,13 +97,15 @@ export default function GovernancePanel({ table }: { table: string | null }) {
     setBusy(true); setActionError(null);
     try {
       await api.deleteGovernanceRule(ruleId);
-      loadRules(); loadGovernance();
+      loadRules(); loadGovernance(true);
     } catch (e: any) {
       setActionError(e.message || "Failed to delete rule");
     } finally { setBusy(false); }
   };
 
   return (
+    <>
+      <CacheHeader cache={data?._cache} loading={loading} onRefresh={() => loadGovernance(true)} />
     <PanelState loading={loading} error={error} empty={!data}>
       {data && (
         <div className="space-y-4">
@@ -268,5 +270,6 @@ export default function GovernancePanel({ table }: { table: string | null }) {
         </div>
       )}
     </PanelState>
+    </>
   );
 }

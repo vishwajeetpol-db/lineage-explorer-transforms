@@ -2,7 +2,14 @@ import { memo, useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, Activity, Database, Clock, Cpu, HardDrive, Zap, Users, Layers, AlertTriangle, RefreshCw, Trash2 } from "lucide-react";
 import { api } from "../api/client";
-import type { AdminStatus } from "../api/client";
+import type { AdminStatus, CapabilityCacheEntry } from "../api/client";
+
+const CAP_TAB_LABEL: Record<string, string> = {
+  impact: "Impact",
+  root_cause: "Root Cause",
+  governance: "Governance",
+  access: "Access",
+};
 
 interface Props {
   open: boolean;
@@ -28,6 +35,27 @@ function AdminDashboard({ open, onClose }: Props) {
   const [loading, setLoading] = useState(false);
   const [txBusy, setTxBusy] = useState(false);
   const [txMsg, setTxMsg] = useState<string | null>(null);
+  // Per-table capability cache (Impact / Root Cause / Governance / Access)
+  const [capEntries, setCapEntries] = useState<CapabilityCacheEntry[]>([]);
+  const [capBusy, setCapBusy] = useState(false);
+
+  const fetchCapCache = () => {
+    api.getCapabilityCacheInventory()
+      .then((r) => setCapEntries(r.entries))
+      .catch(() => setCapEntries([]));
+  };
+
+  const evictCap = async (scope: "entry" | "table" | "all", tableFqn?: string, tab?: string) => {
+    if (scope === "all" && !window.confirm(
+      "Evict the ENTIRE capability cache?\n\nEvery table's Impact / Root Cause / Governance / Access tab will recompute (slower) on next open until re-cached."
+    )) return;
+    setCapBusy(true);
+    try {
+      await api.evictCapabilityCache(scope, tableFqn, tab);
+      fetchCapCache();
+    } catch { /* non-fatal; inventory refresh will reflect reality */ }
+    finally { setCapBusy(false); }
+  };
 
   const invalidateTx = async (scope: "cache" | "all") => {
     if (scope === "all" && !window.confirm(
@@ -55,6 +83,7 @@ function AdminDashboard({ open, onClose }: Props) {
   useEffect(() => {
     if (!open) return;
     fetchStatus();
+    fetchCapCache();
     const interval = setInterval(fetchStatus, 10000); // auto-refresh every 10s
     return () => clearInterval(interval);
   }, [open]);
@@ -249,6 +278,66 @@ function AdminDashboard({ open, onClose }: Props) {
                               >
                                 EVICT
                               </button>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Per-table capability cache (Impact / Root Cause / Governance / Access) */}
+                  <div>
+                    <div className="flex items-center gap-2 mb-3">
+                      <Layers size={12} className="text-emerald-500/60" />
+                      <span className="font-mono text-[10px] uppercase tracking-[0.15em] text-emerald-500/60">Capability Cache</span>
+                      <span className="font-mono text-[10px] text-emerald-500/30">{capEntries.length} cached table·tab entries</span>
+                      <button
+                        onClick={() => evictCap("all")}
+                        disabled={capBusy || capEntries.length === 0}
+                        title="Evict the entire capability cache"
+                        className="ml-auto inline-flex items-center gap-1 px-2 py-1 rounded border border-red-500/30 text-[10px] font-mono text-red-400/90 hover:bg-red-500/10 disabled:opacity-40 transition-colors"
+                      >
+                        <Trash2 size={11} /> Evict all
+                      </button>
+                    </div>
+                    <div className="bg-black/30 border border-emerald-500/10 rounded-lg overflow-hidden">
+                      <div className="grid grid-cols-[1fr_90px_90px_60px_110px] gap-2 px-4 py-2 text-[9px] font-mono uppercase tracking-wider text-emerald-500/40 border-b border-emerald-500/10">
+                        <span>Table</span>
+                        <span>Tab</span>
+                        <span>Cached</span>
+                        <span>Status</span>
+                        <span></span>
+                      </div>
+                      <div className="max-h-[240px] overflow-y-auto">
+                        {capEntries.length === 0 ? (
+                          <div className="px-4 py-6 text-center text-[11px] font-mono text-emerald-500/30">No capability cache entries yet</div>
+                        ) : (
+                          capEntries.map((e) => (
+                            <div key={`${e.table_fqn}:${e.tab}`} className="grid grid-cols-[1fr_90px_90px_60px_110px] gap-2 px-4 py-1.5 text-[11px] font-mono border-b border-emerald-500/[0.04] hover:bg-emerald-500/[0.03] items-center">
+                              <span className="text-emerald-300/80 truncate" title={e.table_fqn}>{e.table_fqn}</span>
+                              <span className="text-emerald-500/60">{CAP_TAB_LABEL[e.tab] || e.tab}</span>
+                              <span className="text-emerald-500/50 text-[10px]">{e.cached_at ? new Date(e.cached_at).toLocaleString() : "—"}</span>
+                              <span className={`text-[9px] px-1.5 py-0.5 rounded ${e.stale ? "bg-amber-500/10 text-amber-400/70" : "bg-emerald-500/10 text-emerald-400/70"}`}>
+                                {e.stale ? "STALE" : "FRESH"}
+                              </span>
+                              <span className="flex items-center gap-2 justify-end">
+                                <button
+                                  onClick={() => evictCap("entry", e.table_fqn, e.tab)}
+                                  disabled={capBusy}
+                                  className="text-[9px] text-red-400/50 hover:text-red-400 transition-colors disabled:opacity-40"
+                                  title={`Evict ${CAP_TAB_LABEL[e.tab] || e.tab} for this table`}
+                                >
+                                  EVICT
+                                </button>
+                                <button
+                                  onClick={() => evictCap("table", e.table_fqn)}
+                                  disabled={capBusy}
+                                  className="text-[9px] text-red-400/40 hover:text-red-400 transition-colors disabled:opacity-40"
+                                  title="Evict all 4 tabs for this table"
+                                >
+                                  EVICT TABLE
+                                </button>
+                              </span>
                             </div>
                           ))
                         )}

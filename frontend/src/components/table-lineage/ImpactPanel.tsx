@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ShieldAlert, Users, ExternalLink, BarChart3, Settings, Workflow, FileCode, Search as SearchIcon } from "lucide-react";
 import { api, type ImpactResponse, type ConsumerEntity } from "../../api/client";
-import { PanelState, NoTable, Stat, SectionTitle, parseFqn } from "./panelShared";
+import { PanelState, NoTable, Stat, SectionTitle, CacheHeader, parseFqn } from "./panelShared";
 
 // Icon + friendly label per lineage entity_type.
 const TYPE_META: Record<string, { label: string; icon: typeof BarChart3; color: string }> = {
@@ -49,17 +49,19 @@ export default function ImpactPanel({ table }: { table: string | null }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const load = useCallback((refresh = false) => {
     const parts = parseFqn(table);
     if (!parts) { setData(null); return; }
     let cancelled = false;
     setLoading(true); setError(null);
-    api.getImpact(parts.catalog, parts.schema, parts.table)
+    api.getImpact(parts.catalog, parts.schema, parts.table, undefined, refresh)
       .then((r) => { if (!cancelled) setData(r); })
       .catch((e) => { if (!cancelled) setError(e.message || "Failed to load impact"); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [table]);
+
+  useEffect(() => { load(false); }, [load]);
 
   if (!table) return <NoTable />;
 
@@ -67,6 +69,8 @@ export default function ImpactPanel({ table }: { table: string | null }) {
   const byType = consumers?.by_type || {};
 
   return (
+    <>
+      <CacheHeader cache={data?._cache} loading={loading} onRefresh={() => load(true)} />
     <PanelState loading={loading} error={error} empty={!data} emptyLabel="No downstream impact found.">
       {data && (
         <div className="space-y-4">
@@ -141,5 +145,6 @@ export default function ImpactPanel({ table }: { table: string | null }) {
         </div>
       )}
     </PanelState>
+    </>
   );
 }

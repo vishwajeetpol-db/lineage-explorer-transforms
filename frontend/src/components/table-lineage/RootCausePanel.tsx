@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { AlertTriangle, Clock, CheckCircle2, HelpCircle, ArrowRight } from "lucide-react";
 import { api, type RootCauseTrace, type ProducerHealthStatus, type FlaggedTable } from "../../api/client";
-import { PanelState, NoTable, SectionTitle, parseFqn } from "./panelShared";
+import { PanelState, NoTable, SectionTitle, CacheHeader, parseFqn } from "./panelShared";
 
 /** Root-cause trace — modeled on the POC's health-based "Root-cause trace":
  *  auto-runs on table select, walks upstream producers, classifies each by run
@@ -52,23 +52,27 @@ export default function RootCausePanel({ table }: { table: string | null }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const load = useCallback((refresh = false) => {
     const parts = parseFqn(table);
     if (!parts) { setData(null); return; }
     let cancelled = false;
     setLoading(true); setError(null);
-    api.getRootCauseTrace(parts.catalog, parts.schema, parts.table)
+    api.getRootCauseTrace(parts.catalog, parts.schema, parts.table, undefined, refresh)
       .then((r) => { if (!cancelled) setData(r); })
       .catch((e) => { if (!cancelled) setError(e.message || "Failed to run trace"); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [table]);
 
+  useEffect(() => { load(false); }, [load]);
+
   if (!table) return <NoTable />;
 
   const prime = data?.prime_suspect;
 
   return (
+    <>
+      <CacheHeader cache={data?._cache} loading={loading} onRefresh={() => load(true)} />
     <PanelState loading={loading} error={error} empty={!data} emptyLabel="No producers to trace.">
       {data && (
         <div className="space-y-4">
@@ -138,5 +142,6 @@ export default function RootCausePanel({ table }: { table: string | null }) {
         </div>
       )}
     </PanelState>
+    </>
   );
 }

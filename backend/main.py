@@ -995,6 +995,58 @@ async def api_admin_evict_cache(request: Request, key: str = Query(...)):
 
 
 # ---------------------------------------------------------------------------
+# Per-table capability cache (Impact / Root Cause / Governance / Access)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/admin/capability-cache")
+async def api_admin_capability_cache_inventory(request: Request):
+    """Admin-only: list cached (table, tab) capability entries for the dashboard."""
+    _email, is_admin = await asyncio.to_thread(_get_user_info, request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    from backend.server.capability_cache import get_capability_cache
+    entries = await asyncio.to_thread(get_capability_cache().inventory)
+    return {"entries": entries, "count": len(entries)}
+
+
+@app.post("/api/admin/capability-cache/evict")
+async def api_admin_capability_cache_evict(
+    request: Request,
+    scope: str = Query(..., description="one of: entry | table | all"),
+    table_fqn: str | None = Query(None),
+    tab: str | None = Query(None),
+):
+    """Admin-only: evict capability-cache entries.
+
+    scope=entry → one (table_fqn, tab); scope=table → all tabs for table_fqn;
+    scope=all → the entire capability cache.
+    """
+    email, is_admin = await asyncio.to_thread(_get_user_info, request)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    from backend.server.capability_cache import get_capability_cache
+    cache = get_capability_cache()
+    if scope == "entry":
+        if not table_fqn or not tab:
+            raise HTTPException(status_code=400, detail="table_fqn and tab required for scope=entry")
+        ok = await asyncio.to_thread(cache.evict, table_fqn, tab)
+        logger.info(f"Admin {email} evicted capability cache {table_fqn}/{tab}")
+        return {"status": "ok" if ok else "error", "scope": scope, "table_fqn": table_fqn, "tab": tab}
+    if scope == "table":
+        if not table_fqn:
+            raise HTTPException(status_code=400, detail="table_fqn required for scope=table")
+        n = await asyncio.to_thread(cache.evict_table, table_fqn)
+        logger.info(f"Admin {email} evicted {n} capability-cache entries for {table_fqn}")
+        return {"status": "ok", "scope": scope, "table_fqn": table_fqn, "evicted": n}
+    if scope == "all":
+        n = await asyncio.to_thread(cache.evict_all)
+        logger.info(f"Admin {email} evicted the entire capability cache ({n} entries)")
+        return {"status": "ok", "scope": scope, "evicted": n}
+    raise HTTPException(status_code=400, detail="scope must be one of: entry | table | all")
+
+
+# ---------------------------------------------------------------------------
 # Transformation Lineage endpoints — the "microscopic" drill-down
 # ---------------------------------------------------------------------------
 

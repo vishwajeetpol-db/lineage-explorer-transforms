@@ -8,6 +8,8 @@ Endpoints:
 """
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from typing import Optional
@@ -49,13 +51,25 @@ async def governance_for_table(
     catalog: str = Query(...),
     schema: str = Query(...),
     table: str = Query(...),
+    refresh: bool = Query(False),
 ):
-    """Return ownership + column sensitivity classification for a table."""
+    """Return ownership + column sensitivity classification for a table.
+
+    Served from the per-table capability cache unless `refresh=true`. (The
+    user-defined rule list is fetched separately and is always live.)
+    """
     c = _validate(catalog, "catalog")
     s = _validate(schema, "schema")
     t = _validate(table, "table")
+    fqn = f"{c}.{s}.{t}"
+    from backend.main import _get_user_info
+    from backend.server.capability_cache import serve_or_compute
+    email, _ = _get_user_info(request)
     try:
-        return get_table_governance(c, s, t)
+        return await asyncio.to_thread(
+            serve_or_compute, fqn, "governance",
+            lambda: get_table_governance(c, s, t), email or "", refresh,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

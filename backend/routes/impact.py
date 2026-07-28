@@ -6,6 +6,7 @@ Endpoints:
 from __future__ import annotations
 
 import os
+import asyncio
 import logging
 from typing import Optional
 
@@ -126,32 +127,10 @@ def _consumers(scope_tables: list[str], resolve: bool = True) -> dict:
     return {"by_type": by_type, "total": len(raw), "entities": entities}
 
 
-@router.get("")
-async def get_impact(
-    request: Request,
-    catalog: str = Query(...),
-    schema: str = Query(...),
-    table: str = Query(...),
-    max_hops: Optional[int] = Query(None),
-):
-    """Return blast-radius analysis for `catalog.schema.table`.
-
-    Response includes:
-      - downstream_count: total downstream tables within max_hops
-      - consumer_owners: unique owners of downstream tables
-      - sensitive_affected: downstream tables that themselves contain sensitive columns
-      - downstream_tables: list of {full_name, hop_distance}
-    """
-    c = _validate(catalog, "catalog")
-    s = _validate(schema, "schema")
-    t = _validate(table, "table")
-    hops = min(max_hops or IMPACT_MAX_HOPS, 10)
+def _compute_impact(c: str, s: str, t: str, hops: int) -> dict:
+    """Compute blast-radius analysis for a table (the cacheable payload)."""
     full_name = f"{c}.{s}.{t}"
-
-    try:
-        downstream = _bfs_downstream(full_name, max_hops=hops)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    downstream = _bfs_downstream(full_name, max_hops=hops)
 
     # Enrich downstream tables with owner and sensitivity info (best-effort)
     consumer_owners: set[str] = set()
@@ -211,3 +190,35 @@ async def get_impact(
         "sensitive_affected": sensitive_affected,
         "downstream_tables": downstream_list,
     }
+
+
+@router.get("")
+async def get_impact(
+    request: Request,
+    catalog: str = Query(...),
+    schema: str = Query(...),
+    table: str = Query(...),
+    max_hops: Optional[int] = Query(None),
+    refresh: bool = Query(False),
+):
+    """Return blast-radius analysis for `catalog.schema.table`.
+
+    Served from the per-table capability cache unless `refresh=true`. Response
+    includes downstream_count, consumer_owners, sensitive_affected, and a
+    downstream_tables list, plus a `_cache` meta block.
+    """
+    c = _validate(catalog, "catalog")
+    s = _validate(schema, "schema")
+    t = _validate(table, "table")
+    hops = min(max_hops or IMPACT_MAX_HOPS, 10)
+    fqn = f"{c}.{s}.{t}"
+    from backend.main import _get_user_info
+    from backend.server.capability_cache import serve_or_compute
+    email, _ = _get_user_info(request)
+    try:
+        return await asyncio.to_thread(
+            serve_or_compute, fqn, "impact",
+            lambda: _compute_impact(c, s, t, hops), email or "", refresh,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -154,6 +154,25 @@ export interface ConsumerEntity {
   deep_link?: string | null;
 }
 
+// Per-table capability cache metadata, attached to Impact / Root Cause /
+// Governance / Access responses. Present whether served from cache or freshly
+// computed; `from_cache` + `stale` drive the panel's refresh badge.
+export interface CacheMeta {
+  from_cache: boolean;
+  cached_at: string | null;
+  cached_by: string | null;
+  stale: boolean;
+}
+
+// One row in the Admin capability-cache inventory.
+export interface CapabilityCacheEntry {
+  table_fqn: string;
+  tab: string;
+  cached_at: string | null;
+  cached_by: string | null;
+  stale: boolean;
+}
+
 export interface ImpactResponse {
   table_full_name: string;
   max_hops: number;
@@ -173,6 +192,7 @@ export interface ImpactResponse {
     owner: string | null;
     has_sensitive_columns: boolean;
   }[];
+  _cache?: CacheMeta;
 }
 
 export interface GovernanceColumn {
@@ -197,6 +217,7 @@ export interface GovernanceResponse {
   columns: GovernanceColumn[];
   sensitive_columns: { column: string; sensitivity: string; source: string }[];
   config_rules_applied: number;
+  _cache?: CacheMeta;
 }
 
 export interface GovernanceRule {
@@ -242,6 +263,7 @@ export interface AccessResponse {
   grantee_count: number;
   read_count: number;
   write_count: number;
+  _cache?: CacheMeta;
 }
 
 export type ProducerHealthStatus = "failed" | "stale" | "healthy" | "no_history";
@@ -273,6 +295,7 @@ export interface RootCauseTrace {
   prime_suspect: FlaggedTable | null;
   failure_path: { table: string; short_name: string; hop: number; status: ProducerHealthStatus }[];
   flagged: FlaggedTable[];
+  _cache?: CacheMeta;
 }
 
 export interface MlModel {
@@ -406,17 +429,19 @@ export interface AnalysisCompare {
 export const api = {
   getUserInfo: () => fetchJson<UserInfo>(`${BASE}/user-info`),
 
-  // Impact analysis (blast radius) — cap 18.
-  getImpact: (catalog: string, schema: string, table: string, maxHops?: number) =>
+  // Impact analysis (blast radius) — cap 18. Served from the per-table
+  // capability cache unless `refresh` is true.
+  getImpact: (catalog: string, schema: string, table: string, maxHops?: number, refresh?: boolean) =>
     fetchJson<ImpactResponse>(
       `${BASE}/impact?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}` +
-      (maxHops ? `&max_hops=${maxHops}` : "")
+      (maxHops ? `&max_hops=${maxHops}` : "") + (refresh ? "&refresh=true" : "")
     ),
 
   // Governance & classification — cap 17.
-  getGovernance: (catalog: string, schema: string, table: string) =>
+  getGovernance: (catalog: string, schema: string, table: string, refresh?: boolean) =>
     fetchJson<GovernanceResponse>(
-      `${BASE}/governance?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`
+      `${BASE}/governance?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}` +
+      (refresh ? "&refresh=true" : "")
     ),
 
   // Governance classification rules — cap 17.
@@ -441,16 +466,17 @@ export const api = {
   },
 
   // Access & security lineage — cap 20.
-  getAccess: (catalog: string, schema: string, table: string) =>
+  getAccess: (catalog: string, schema: string, table: string, refresh?: boolean) =>
     fetchJson<AccessResponse>(
-      `${BASE}/access?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`
+      `${BASE}/access?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}` +
+      (refresh ? "&refresh=true" : "")
     ),
 
   // Health-based root-cause trace for a table — cap 09.
-  getRootCauseTrace: (catalog: string, schema: string, table: string, maxHops?: number) =>
+  getRootCauseTrace: (catalog: string, schema: string, table: string, maxHops?: number, refresh?: boolean) =>
     fetchJson<RootCauseTrace>(
       `${BASE}/root-cause/trace?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}` +
-      (maxHops ? `&max_hops=${maxHops}` : "")
+      (maxHops ? `&max_hops=${maxHops}` : "") + (refresh ? "&refresh=true" : "")
     ),
 
   // ML models trained on a UC table — cap 21.
@@ -605,5 +631,21 @@ export const api = {
     const res = await fetch(`${BASE}/transform/invalidate?${q.toString()}`, { method: "POST" });
     if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
     return res.json() as Promise<{ status: string; scope: string; cleared?: string[] }>;
+  },
+
+  // -- Per-table capability cache (Impact / Root Cause / Governance / Access) --
+
+  /** List cached (table, tab) capability entries for the Admin dashboard. */
+  getCapabilityCacheInventory: () =>
+    fetchJson<{ entries: CapabilityCacheEntry[]; count: number }>(`${BASE}/admin/capability-cache`),
+
+  /** Evict capability cache. scope: entry (needs tableFqn+tab) | table (needs tableFqn) | all. */
+  evictCapabilityCache: async (scope: "entry" | "table" | "all", tableFqn?: string, tab?: string) => {
+    const q = new URLSearchParams({ scope });
+    if (tableFqn) q.set("table_fqn", tableFqn);
+    if (tab) q.set("tab", tab);
+    const res = await fetch(`${BASE}/admin/capability-cache/evict?${q.toString()}`, { method: "POST" });
+    if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+    return res.json() as Promise<{ status: string; scope: string; evicted?: number }>;
   },
 };

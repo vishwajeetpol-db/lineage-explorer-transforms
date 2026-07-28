@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ShieldOff } from "lucide-react";
 import { api, type AccessResponse } from "../../api/client";
-import { PanelState, NoTable, SectionTitle, parseFqn } from "./panelShared";
+import { PanelState, NoTable, SectionTitle, CacheHeader, parseFqn } from "./panelShared";
 
 /** Access & security — modeled on the POC's panel: a stat row (grantees /
  *  accessors / reads / writes), identity metadata, declared grants, empirical
@@ -59,21 +59,25 @@ export default function AccessPanel({ table }: { table: string | null }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const load = useCallback((refresh = false) => {
     const parts = parseFqn(table);
     if (!parts) { setData(null); return; }
     let cancelled = false;
     setLoading(true); setError(null);
-    api.getAccess(parts.catalog, parts.schema, parts.table)
+    api.getAccess(parts.catalog, parts.schema, parts.table, refresh)
       .then((r) => { if (!cancelled) setData(r); })
       .catch((e) => { if (!cancelled) setError(e.message || "Failed to load access"); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [table]);
 
+  useEffect(() => { load(false); }, [load]);
+
   if (!table) return <NoTable />;
 
   return (
+    <>
+      <CacheHeader cache={data?._cache} loading={loading} onRefresh={() => load(true)} />
     <PanelState loading={loading} error={error} empty={!data}>
       {data && (
         <div className="space-y-4">
@@ -169,5 +173,6 @@ export default function AccessPanel({ table }: { table: string | null }) {
         </div>
       )}
     </PanelState>
+    </>
   );
 }
