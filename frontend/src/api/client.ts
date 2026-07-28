@@ -266,6 +266,35 @@ export interface AccessResponse {
   _cache?: CacheMeta;
 }
 
+// One run/update in an entity's recent-runs health check.
+export interface EntityRun {
+  run_id: string | null;
+  result_state: string | null;
+  succeeded: boolean;
+  started_at: string | null;
+  ended_at: string | null;
+  duration_seconds: number | null;
+  cost_usd: number | null;
+  run_url: string | null;
+}
+
+// Health check for a JOB or PIPELINE — last N runs + summary.
+export interface EntityRuns {
+  entity_type: string;
+  entity_id: string;
+  lookback_days: number;
+  runs: EntityRun[];
+  verdict: "healthy" | "degraded" | "failing" | "unknown";
+  success_rate: number | null;
+  avg_duration_seconds: number | null;
+  duration_trend: "up" | "down" | "flat" | null;
+  total_cost_usd: number | null;
+  cost_spike_run_id: string | null;
+  entity_url: string | null;
+  detail?: string;
+  _cache?: CacheMeta;
+}
+
 export type ProducerHealthStatus = "failed" | "stale" | "healthy" | "no_history";
 
 export interface ProducerHealth {
@@ -618,6 +647,14 @@ export const api = {
   getEntityName: (entityType: string, entityId: string) =>
     fetchJson<{ name: string; owner?: string }>(
       `${BASE}/entity-name?entity_type=${encodeURIComponent(entityType)}&entity_id=${encodeURIComponent(entityId)}`
+    ),
+
+  // Health check for a JOB/PIPELINE node — last N runs + summary. Cached per
+  // entity; refresh=true recomputes live.
+  getEntityRuns: (entityType: string, entityId: string, limit = 5, refresh = false) =>
+    fetchJson<EntityRuns>(
+      `${BASE}/observability/runs?entity_type=${encodeURIComponent(entityType)}&entity_id=${encodeURIComponent(entityId)}&limit=${limit}` +
+      (refresh ? "&refresh=true" : "")
     ),
 
   getHealth: () => fetchJson<HealthResponse>(`/health`),
