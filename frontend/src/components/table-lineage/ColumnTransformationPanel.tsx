@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   GitFork, Play, Loader2, RefreshCw, GitCompare, AlertTriangle, History,
-  Cpu, Sparkles, Layers, ArrowRight, CheckCircle2,
+  Cpu, Sparkles, Layers, ArrowRight, CheckCircle2, ShieldAlert, Copy, Check,
 } from "lucide-react";
 import {
   api,
@@ -62,6 +62,69 @@ function ColumnCard({ c }: { c: AnalyzeProducerColumn }) {
         </div>
       )}
       {expr && <div className="font-mono text-[10px] text-slate-400 break-words bg-black/20 rounded px-2 py-1">{expr}</div>}
+    </div>
+  );
+}
+
+// Shown when the LLM path failed because the app's service principal can't read
+// the producer's source code — a common, user-fixable permission gap. Gives the
+// exact principal + resources and a copyable grant command.
+function AccessDeniedNotice({ data }: { data: ColumnTransformResult }) {
+  const [copied, setCopied] = useState(false);
+  const sp = data.app_service_principal;
+  const paths = data.denied_paths || [];
+  const grantCmd = sp
+    ? `# Grant the app's service principal read access to the producer, then re-analyze:\n`
+      + `databricks pipelines ... # or: grant CAN_VIEW on the producing pipeline/notebook\n`
+      + paths.map((p) => `# denied: ${p}`).join("\n")
+    : "";
+
+  const copy = () => {
+    if (!grantCmd) return;
+    navigator.clipboard?.writeText(grantCmd).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    });
+  };
+
+  return (
+    <div className="rounded-xl border border-amber-500/30 bg-amber-500/[0.07] px-3.5 py-3 space-y-2">
+      <div className="flex items-center gap-2">
+        <ShieldAlert size={15} className="text-amber-400 shrink-0" />
+        <span className="text-[12px] font-semibold text-amber-100">Access to producer code required</span>
+      </div>
+      <p className="text-[11px] text-amber-200/90 leading-relaxed">
+        The producer&apos;s source code exists, but this app can&apos;t read it — so the LLM
+        has nothing to analyze. Grant the app&apos;s service principal read access to the
+        producing entity and its source, then click <span className="font-medium">Re-analyze</span>.
+      </p>
+      {sp && (
+        <div className="text-[10px] text-amber-200/80">
+          <span className="text-amber-300/70">App service principal:</span>{" "}
+          <span className="font-mono select-all">{sp}</span>
+        </div>
+      )}
+      {paths.length > 0 && (
+        <div className="rounded-lg bg-black/25 border border-amber-500/15 px-2.5 py-1.5 space-y-1">
+          <div className="text-[9px] uppercase tracking-wider text-amber-300/60">Denied</div>
+          {paths.slice(0, 5).map((p, i) => (
+            <div key={i} className="font-mono text-[10px] text-amber-100/90 break-all">{p}</div>
+          ))}
+        </div>
+      )}
+      <div className="text-[10px] text-amber-200/70 leading-relaxed">
+        Grant <span className="font-mono text-amber-100">CAN_VIEW</span> /{" "}
+        <span className="font-mono text-amber-100">CAN_READ</span> on the producing
+        pipeline/notebook and the workspace files above (in the Databricks UI:
+        the entity&apos;s <span className="italic">Permissions</span> dialog).
+      </div>
+      {grantCmd && (
+        <button onClick={copy}
+          className="flex items-center gap-1.5 text-[10px] px-2 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-100 transition-colors">
+          {copied ? <Check size={11} /> : <Copy size={11} />}
+          {copied ? "Copied" : "Copy details"}
+        </button>
+      )}
     </div>
   );
 }
@@ -256,9 +319,13 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
       )}
 
       {data && data.columns.length === 0 && !loading && data.source !== "cdc_spec" && (
-        <div className="text-[11px] text-slate-500 py-2">
-          {data.detail || "No column transformations resolved. Pick a producer below to run LLM analysis."}
-        </div>
+        data.reason_code === "access_denied"
+          ? <AccessDeniedNotice data={data} />
+          : (
+            <div className="text-[11px] text-slate-500 py-2">
+              {data.detail || "No column transformations resolved. Pick a producer below to run LLM analysis."}
+            </div>
+          )
       )}
 
       {/* Producer + model — only needed for the LLM path */}

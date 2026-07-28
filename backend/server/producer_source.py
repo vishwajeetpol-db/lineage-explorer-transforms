@@ -35,10 +35,58 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Fetch diagnostics — lets the UI distinguish "producer source is genuinely
+# empty" from "the app service principal was denied access to it" (a common,
+# user-fixable situation: the pipeline/notebook is owned by someone else).
+# ---------------------------------------------------------------------------
+
+# The app's own service-principal client id (injected by the Apps runtime), so
+# the "grant access" hint can name exactly which principal needs the grant.
+APP_SP_CLIENT_ID = os.environ.get("DATABRICKS_CLIENT_ID", "")
+
+
+def _is_access_error(exc: Exception) -> bool:
+    """True if `exc` looks like an authorization failure (403 / PERMISSION_DENIED)
+    rather than a not-found or transient error."""
+    name = type(exc).__name__
+    if name in ("PermissionDenied", "Unauthorized", "Forbidden"):
+        return True
+    msg = str(exc).upper()
+    return (
+        "PERMISSION_DENIED" in msg
+        or "PERMISSION DENIED" in msg
+        or "DOES NOT HAVE" in msg
+        or "NOT AUTHORIZED" in msg
+        or "FORBIDDEN" in msg
+        or "403" in msg
+    )
+
+
+class _FetchDiag:
+    """Accumulates why a producer's source couldn't be read, so the caller can
+    surface an actionable message instead of a bare 'no source'."""
+
+    def __init__(self) -> None:
+        self.denied_paths: list[str] = []   # workspace paths access was denied to
+        self.entity_missing: bool = False   # the producer entity itself is gone
+
+    def note_exception(self, path: str, exc: Exception) -> None:
+        if _is_access_error(exc):
+            if path and path not in self.denied_paths:
+                self.denied_paths.append(path)
+        elif "NOT_FOUND" in str(exc).upper() or "was not found" in str(exc):
+            self.entity_missing = True
+
+    @property
+    def access_denied(self) -> bool:
+        return bool(self.denied_paths)
+
+
+# ---------------------------------------------------------------------------
 # Source-code fetchers per entity type
 # ---------------------------------------------------------------------------
 
-def _fetch_notebook_source(notebook_id: str) -> str:
+def _fetch_notebook_source(notebook_id: str, diag: Optional["_FetchDiag"] = None) -> str:
     """Export the latest version of a notebook as source text.
 
     `format` must be an ExportFormat enum — passing the bare string "SOURCE"
@@ -53,10 +101,12 @@ def _fetch_notebook_source(notebook_id: str) -> str:
         return base64.b64decode(content).decode("utf-8", errors="replace")
     except Exception as e:
         logger.info(f"producer_source: could not export notebook {notebook_id}: {e}")
+        if diag is not None:
+            diag.note_exception(notebook_id, e)
         return ""
 
 
-def _fetch_workspace_file(path: str) -> str:
+def _fetch_workspace_file(path: str, diag: Optional["_FetchDiag"] = None) -> str:
     """Read a plain workspace file's text (non-notebook, e.g. a bundle .py/.sql).
 
     Notebooks are read via `_fetch_notebook_source` (the export API); arbitrary
@@ -71,11 +121,15 @@ def _fetch_workspace_file(path: str) -> str:
             return data.decode("utf-8", errors="replace")
         return str(data or "")
     except Exception as e:
+        # An access error is meaningful — record it. A plain "not a file, use
+        # export" error is not, so only note true auth failures here and fall back.
+        if _is_access_error(e) and diag is not None:
+            diag.note_exception(path, e)
         logger.info(f"producer_source: download failed for {path}, trying export: {e}")
-        return _fetch_notebook_source(path)
+        return _fetch_notebook_source(path, diag=diag)
 
 
-def _fetch_query_source(query_id: str) -> str:
+def _fetch_query_source(query_id: str, diag: Optional["_FetchDiag"] = None) -> str:
     """Fetch the SQL text of a saved DBSQL query."""
     try:
         client = _get_client()
@@ -83,10 +137,12 @@ def _fetch_query_source(query_id: str) -> str:
         return q.query or ""
     except Exception as e:
         logger.info(f"producer_source: could not fetch query {query_id}: {e}")
+        if diag is not None:
+            diag.note_exception(f"query:{query_id}", e)
         return ""
 
 
-def _fetch_job_source(job_id: str) -> str:
+def _fetch_job_source(job_id: str, diag: Optional["_FetchDiag"] = None) -> str:
     """Fetch source code of the first notebook task in a Lakeflow Job."""
     try:
         client = _get_client()
@@ -95,11 +151,13 @@ def _fetch_job_source(job_id: str) -> str:
         for task in tasks:
             nb = getattr(task, "notebook_task", None)
             if nb and getattr(nb, "notebook_path", None):
-                return _fetch_notebook_source(nb.notebook_path)
+                return _fetch_notebook_source(nb.notebook_path, diag=diag)
         # No notebook task found
         return ""
     except Exception as e:
         logger.info(f"producer_source: could not fetch job source for {job_id}: {e}")
+        if diag is not None:
+            diag.note_exception(f"job:{job_id}", e)
         return ""
 
 
@@ -107,7 +165,9 @@ def _fetch_job_source(job_id: str) -> str:
 _PIPELINE_SOURCE_EXTS = (".py", ".sql", ".scala", ".r")
 
 
-def _list_workspace_source_files(root: str, max_files: int = 200) -> list[str]:
+def _list_workspace_source_files(
+    root: str, max_files: int = 200, diag: Optional["_FetchDiag"] = None
+) -> list[str]:
     """Recursively list source files (notebooks + workspace files) under `root`.
 
     Used for glob-style pipeline libraries whose source lives as individual
@@ -123,6 +183,8 @@ def _list_workspace_source_files(root: str, max_files: int = 200) -> list[str]:
             entries = list(client.workspace.list(path=cur))
         except Exception as e:
             logger.info(f"producer_source: could not list workspace dir {cur}: {e}")
+            if diag is not None:
+                diag.note_exception(cur, e)
             continue
         for obj in entries:
             otype = getattr(obj.object_type, "value", obj.object_type)
@@ -136,7 +198,7 @@ def _list_workspace_source_files(root: str, max_files: int = 200) -> list[str]:
     return found
 
 
-def _fetch_pipeline_source(pipeline_id: str) -> str:
+def _fetch_pipeline_source(pipeline_id: str, diag: Optional["_FetchDiag"] = None) -> str:
     """Concatenate source from all libraries in a pipeline.
 
     Handles the three library shapes a Lakeflow/DLT pipeline can declare:
@@ -157,7 +219,9 @@ def _fetch_pipeline_source(pipeline_id: str) -> str:
         # deserialization — which made glob/file pipelines look library-less.
         try:
             raw = client.api_client.do("GET", f"/api/2.0/pipelines/{pipeline_id}")
-        except Exception:
+        except Exception as e:
+            if diag is not None:
+                diag.note_exception(f"pipeline:{pipeline_id}", e)
             raw = {}
         libraries = ((raw.get("spec") or {}).get("libraries")) or []
         parts: list[str] = []
@@ -167,7 +231,8 @@ def _fetch_pipeline_source(pipeline_id: str) -> str:
             if not path or path in seen:
                 return
             seen.add(path)
-            src = _fetch_notebook_source(path) if is_notebook else _fetch_workspace_file(path)
+            src = (_fetch_notebook_source(path, diag=diag) if is_notebook
+                   else _fetch_workspace_file(path, diag=diag))
             if src:
                 parts.append(f"# --- {label}: {path} ---\n{src}")
 
@@ -187,7 +252,7 @@ def _fetch_pipeline_source(pipeline_id: str) -> str:
                 # Strip trailing glob wildcards to get a base directory to walk,
                 # e.g. ".../transformations/**" -> ".../transformations".
                 base = include.split("*", 1)[0].rstrip("/")
-                for path in _list_workspace_source_files(base):
+                for path in _list_workspace_source_files(base, diag=diag):
                     # export handles both, but plain files download more reliably;
                     # treat .py/.sql/etc. as files, everything else as a notebook.
                     is_nb = not path.lower().endswith(_PIPELINE_SOURCE_EXTS)
@@ -220,17 +285,17 @@ def _fetch_target_columns(target_table: str) -> list[str]:
         return []
 
 
-def _fetch_source(entity_type: str, entity_id: str) -> str:
+def _fetch_source(entity_type: str, entity_id: str, diag: Optional["_FetchDiag"] = None) -> str:
     """Dispatch source-code fetch to the right fetcher."""
     et = entity_type.upper()
     if et == "NOTEBOOK":
-        return _fetch_notebook_source(entity_id)
+        return _fetch_notebook_source(entity_id, diag=diag)
     if et == "QUERY":
-        return _fetch_query_source(entity_id)
+        return _fetch_query_source(entity_id, diag=diag)
     if et == "JOB":
-        return _fetch_job_source(entity_id)
+        return _fetch_job_source(entity_id, diag=diag)
     if et == "PIPELINE":
-        return _fetch_pipeline_source(entity_id)
+        return _fetch_pipeline_source(entity_id, diag=diag)
     return ""
 
 
@@ -305,9 +370,36 @@ def analyze_producer(
         return result
 
     # ---- Fresh analysis path ----
-    source_code = _fetch_source(entity_type, entity_id)
+    diag = _FetchDiag()
+    source_code = _fetch_source(entity_type, entity_id, diag=diag)
     if not source_code.strip():
-        result["detail"] = "No source code available for this entity."
+        if diag.access_denied:
+            # The producer's code exists but the app service principal can't read
+            # it — a common, user-fixable situation. Return an actionable reason
+            # + the exact resource(s) to grant so the UI can guide the fix.
+            result["reason_code"] = "access_denied"
+            result["denied_paths"] = diag.denied_paths
+            result["app_service_principal"] = APP_SP_CLIENT_ID or None
+            paths_str = ", ".join(diag.denied_paths[:5])
+            sp_str = (f" to the app's service principal ({APP_SP_CLIENT_ID})"
+                      if APP_SP_CLIENT_ID else " to the app's service principal")
+            result["detail"] = (
+                f"The app can't read this {entity_type.lower()}'s source code — access was "
+                f"denied to: {paths_str}. Grant CAN_READ (or CAN_VIEW){sp_str} on the "
+                f"producing {entity_type.lower()} and its source files, then re-analyze."
+            )
+        elif diag.entity_missing:
+            result["reason_code"] = "entity_missing"
+            result["detail"] = (
+                f"The producing {entity_type.lower()} ({entity_id}) no longer exists, "
+                f"so its source can't be read."
+            )
+        else:
+            result["reason_code"] = "no_source"
+            result["detail"] = (
+                "No source code available for this entity — the producer may be a "
+                "SQL/DLT/external writer whose source can't be fetched."
+            )
         return result
 
     result["source_hash"] = analysis_store._source_hash(source_code)
@@ -410,6 +502,9 @@ def resolve_column_transformations(
         "stale": False,
         "llm_model": None,
         "detail": None,
+        "reason_code": None,
+        "denied_paths": None,
+        "app_service_principal": None,
     }
 
     # 1 + 2 — offline captured plan / CDC spec (skip when forcing a fresh run).
@@ -479,6 +574,10 @@ def resolve_column_transformations(
         "llm_model": llm.get("llm_model"),
         "analyzed_at": llm.get("analyzed_at"),
         "detail": llm.get("detail"),
+        # Actionable failure metadata (present when source couldn't be read):
+        "reason_code": llm.get("reason_code"),
+        "denied_paths": llm.get("denied_paths"),
+        "app_service_principal": llm.get("app_service_principal"),
     }
 
 

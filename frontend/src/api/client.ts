@@ -362,6 +362,10 @@ export interface ColumnTransformResult {
   analyzed_at?: string;
   cdc_spec?: { keys?: unknown; sequence_by?: string; scd_type?: unknown; source?: string; version?: number };
   detail?: string | null;
+  // Actionable failure metadata (present when producer source couldn't be read).
+  reason_code?: "access_denied" | "entity_missing" | "no_source" | null;
+  denied_paths?: string[] | null;
+  app_service_principal?: string | null;
 }
 
 export interface AnalysisVersion {
