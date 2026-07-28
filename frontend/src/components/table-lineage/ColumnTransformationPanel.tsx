@@ -8,6 +8,7 @@ import {
   type ColumnTransformResult,
   type AnalyzeProducerColumn,
   type TransformVersion,
+  type TransformVersionDetail,
   type CrossSourceCompare,
 } from "../../api/client";
 import { useLineageStore } from "../../store/lineageStore";
@@ -86,8 +87,25 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
   const [compareTo, setCompareTo] = useState<string>("");
   const [compareData, setCompareData] = useState<CrossSourceCompare | null>(null);
   const [comparing, setComparing] = useState(false);
+  // A specific version being viewed from the history list (null = showing the resolved/current result).
+  const [viewingVersion, setViewingVersion] = useState<TransformVersionDetail | null>(null);
+  const [viewLoading, setViewLoading] = useState<string | null>(null);
 
   const parts = parseFqn(table);
+
+  const viewVersion = async (ref: string) => {
+    if (!parts) return;
+    setViewLoading(ref); setError(null);
+    try {
+      const v = await api.getTransformationVersion({
+        catalog: parts.catalog, schema_name: parts.schema, table: parts.table, ref,
+        entity_type: entityId ? entityType : undefined, entity_id: entityId || undefined,
+      });
+      setViewingVersion(v);
+    } catch (e: any) {
+      setError(e.message || "Failed to load version");
+    } finally { setViewLoading(null); }
+  };
 
   useEffect(() => {
     api.getAnalyzeModels()
@@ -112,7 +130,7 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
   // no producer/LLM needed. Runs the precedence chain.
   const resolve = useCallback(async (opts?: { et?: string; eid?: string; force?: boolean }) => {
     if (!parts) return;
-    setLoading(true); setError(null); setCompareData(null);
+    setLoading(true); setError(null); setCompareData(null); setViewingVersion(null);
     try {
       const r = await api.resolveColumnTransformations({
         catalog: parts.catalog, schema_name: parts.schema, table: parts.table,
@@ -128,7 +146,7 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
     } finally { setLoading(false); }
   }, [table, entityType, entityId, model, loadVersions]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => { setData(null); setError(null); setEntityId(""); setCompareData(null); setAllVersions([]); }, [table]);
+  useEffect(() => { setData(null); setError(null); setEntityId(""); setCompareData(null); setAllVersions([]); setViewingVersion(null); }, [table]);
   // Kick off an initial resolve (captured plan / stored) whenever the table changes.
   useEffect(() => { if (parts) resolve(); }, [table]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -291,23 +309,47 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
             <History size={13} className="text-cyan-400" /> Version history ({allVersions.length})
           </div>
 
-          {/* All versions, source-tagged */}
+          {/* All versions, source-tagged — click to view that version's columns */}
           <div className="rounded-lg border border-white/[0.06] overflow-hidden divide-y divide-white/[0.04] max-h-40 overflow-y-auto">
             {allVersions.map((v) => {
               const isPlan = v.source === "plan_capture";
+              const active = viewingVersion?.ref === v.ref;
               return (
-                <div key={v.ref} className="flex items-center gap-2 px-2.5 py-1.5 bg-surface-100/40">
+                <button key={v.ref} onClick={() => viewVersion(v.ref)}
+                  className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-left transition-colors ${
+                    active ? "bg-accent/15" : "bg-surface-100/40 hover:bg-white/[0.04]"}`}>
                   <span className={`text-[8px] px-1.5 py-0.5 rounded border uppercase tracking-wide shrink-0 ${
                     isPlan ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/25"
                            : "bg-violet-500/15 text-violet-300 border-violet-500/25"}`}>
                     {isPlan ? "plan" : "llm"}
                   </span>
-                  <span className="text-[11px] text-slate-200 truncate flex-1">{v.label}</span>
+                  <span className={`text-[11px] truncate flex-1 ${active ? "text-accent-light" : "text-slate-200"}`}>{v.label}</span>
+                  {viewLoading === v.ref && <Loader2 size={11} className="animate-spin text-accent shrink-0" />}
                   {v.analyzed_at && <span className="text-[9px] text-slate-600 shrink-0">{v.analyzed_at.slice(0, 10)}</span>}
-                </div>
+                </button>
               );
             })}
           </div>
+
+          {/* Viewing a specific version's columns */}
+          {viewingVersion && (
+            <div className="rounded-lg border border-accent/25 bg-accent/[0.04] overflow-hidden">
+              <div className="flex items-center gap-2 px-2.5 py-1.5 border-b border-white/[0.06]">
+                <History size={12} className="text-accent-light" />
+                <span className="text-[11px] font-medium text-slate-100">{viewingVersion.label}</span>
+                <span className="text-[9px] text-slate-500">{viewingVersion.columns.length} cols</span>
+                <button onClick={() => setViewingVersion(null)} className="ml-auto text-[10px] text-slate-500 hover:text-accent-light">
+                  ✕ back to current
+                </button>
+              </div>
+              <div className="divide-y divide-white/[0.04] max-h-72 overflow-y-auto">
+                {viewingVersion.columns.length === 0 && (
+                  <div className="px-2.5 py-2 text-[10px] text-slate-600">This version has no per-column detail.</div>
+                )}
+                {viewingVersion.columns.map((c, i) => <ColumnCard key={i} c={c} />)}
+              </div>
+            </div>
+          )}
 
           {/* Cross-source compare (only meaningful with 2+ versions) */}
           {allVersions.length > 1 && (

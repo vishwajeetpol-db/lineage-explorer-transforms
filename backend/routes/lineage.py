@@ -24,6 +24,7 @@ from backend.server.producer_source import (
     resolve_column_transformations,
     list_all_versions,
     compare_transformation_versions,
+    _columns_for_ref,
 )
 from backend.server.analysis_store import (
     list_analyses,
@@ -394,6 +395,34 @@ async def column_transformation_compare(request: Request, body: CTCompareIn):
     if eid and not _ENTITY_ID_RE.match(eid):
         raise HTTPException(status_code=400, detail="Invalid entity_id")
     return compare_transformation_versions(c, s, t, body.ref_from, body.ref_to, et, eid)
+
+
+class CTVersionIn(BaseModel):
+    catalog: str
+    schema_name: str
+    table: str
+    ref: str
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+
+
+@analyze_router.post("/api/column-transformations/version")
+async def column_transformation_version(request: Request, body: CTVersionIn):
+    """Load ONE transformation version's columns by ref (plan_capture:N | llm:N),
+    for viewing a specific version from the history list."""
+    c = _validate(body.catalog, "catalog")
+    s = _validate(body.schema_name, "schema")
+    t = _validate(body.table, "table")
+    if not _REF_RE.match(body.ref or ""):
+        raise HTTPException(status_code=400, detail="Invalid version ref (expected 'plan_capture:N' or 'llm:N')")
+    et = (body.entity_type or "").strip().upper() or None
+    eid = (body.entity_id or "").strip() or None
+    if eid and not _ENTITY_ID_RE.match(eid):
+        raise HTTPException(status_code=400, detail="Invalid entity_id")
+    v = _columns_for_ref(c, s, t, body.ref, et, eid)
+    if v is None:
+        raise HTTPException(status_code=404, detail=f"Version {body.ref} not found.")
+    return v
 
 
 @analyze_router.get("/api/analyze-producer/models")

@@ -75,29 +75,51 @@ This is the user-visible capability inventory. `docs/capability_code_map.md` is 
 
 Deploying to your own workspace is a short ordered checklist — not every step is automated, so follow them in order. Run `/api/diagnostics` at the end to confirm.
 
-**0. Account-admin prerequisites** (do these once, before deploying):
-- **Enable system tables** (Account console → Settings → System tables): `system.access` (lineage — *required*, the #1 "empty app" cause if missing), `system.billing` (cost), `system.information_schema` (Delta Sharing), `system.lakeflow` (observability), `system.serving` (ML lineage).
-- A **SQL warehouse** (serverless or pro) and **Unity Catalog**. Databricks CLI **v0.239+**.
+### Prerequisites
 
-**1. Deploy** (creates the app + its service principal):
+**Local tooling** (on the machine you deploy from):
+- **Node.js 18+ and npm** — required to build the React frontend (`tsc && vite build`). Verify with `node -v` / `npm -v`. Without this you'll hit `sh: tsc: command not found`.
+- **Python 3.10+** — only needed for local backend runs and the `make` helper targets (`status`/`diagnostics` shell out to `python3`).
+- **Databricks CLI v0.239+** — `databricks -v`. This is the new (Go) CLI that ships Asset Bundles, not the legacy `databricks-cli` pip package.
+
+**Account-admin prerequisites** (do these once, before deploying):
+- **Enable system tables** (Account console → Settings → System tables): `system.access` (lineage — *required*, the #1 "empty app" cause if missing), `system.billing` (cost), `system.information_schema` (Delta Sharing), `system.lakeflow` (observability), `system.serving` (ML lineage).
+- A **SQL warehouse** (serverless or pro) and **Unity Catalog**.
+
+### Install & deploy
+
+**1. Clone and install the frontend dependencies.** Databricks Apps serve a *prebuilt* `frontend/dist`, so the frontend must be built before (or during) deploy — and the build tools (`tsc`, `vite`) only exist after an install.
+
+    git clone <repo-url> && cd lineage-explorer-transforms
+    cd frontend && npm ci && cd ..     # `npm ci` installs the exact locked versions
+    npm --prefix frontend run build     # produces frontend/dist (the Makefile's `build` target does this too)
+
+> The backend deps (`requirements.txt`) are installed by the Databricks Apps runtime at deploy time — you don't need a local venv unless you're running the backend locally.
+
+**2. Deploy** (creates the app + its service principal):
 
     databricks auth login --profile <profile>
     databricks bundle deploy -t dev --profile <profile> --var warehouse_id=<warehouse-id>
     databricks bundle run bricktrace -t dev --profile <profile>
 
 > The app name defaults to `bricktrace-dev` (dev) / `bricktrace` (prod). In a shared workspace, override it to avoid collisions: `--var app_name=<your-name>`.
+>
+> **Shortcut — use the `Makefile`.** `make redeploy` runs build → deploy → run in one step and bakes in the required `--var` overrides (warehouse, app-owned catalog/schema) so a config change never drops them. Override defaults on the command line, e.g. `make redeploy PROFILE=<profile> WAREHOUSE_ID=<id>`. Run `make help` to list targets.
 
-**2. Grant the app's service principal** (as a **metastore admin**). The SP only exists after step 1. Easiest path — the helper resolves the SP and applies the grants:
+**3. Grant the app's service principal** (as a **metastore admin**). The SP only exists after step 2. Easiest path — the helper resolves the SP and applies the grants:
 
+    chmod +x grant_app_access.sh    # first time only — the script may land non-executable after clone
     ./grant_app_access.sh --profile <profile> --warehouse <warehouse-id> --catalogs "catalog_a catalog_b"
+
+> If you still see `permission denied`, run it through the shell directly: `bash grant_app_access.sh --profile <profile> ...`. And retype the arguments by hand rather than pasting — smart/curly quotes (the `“ ”` a doc or chat app auto-inserts) are **not** valid shell quotes and will corrupt the catalog names. Use plain straight quotes.
 
 Or do it by hand: fill the `:APP_SP` / `:CATALOG` placeholders in **[`setup.sql`](setup.sql)** and run it. End-to-end traces span catalogs, so grant `BROWSE` on **every** catalog you want visible.
 
-**3. (Optional) Live mode** — enable App on-behalf-of OAuth + scopes `iam.current-user:read`, `iam.access-control:read`, and set `--var admin_group_name=<your-admin-group>` if it isn't `admins`.
+**4. (Optional) Live mode** — enable App on-behalf-of OAuth + scopes `iam.current-user:read`, `iam.access-control:read`, and set `--var admin_group_name=<your-admin-group>` if it isn't `admins`.
 
-**4. Verify** — open `https://<app-url>/api/diagnostics`. It reports exactly which prerequisites the SP can reach (warehouse, `system.access`, `system.billing`, `information_schema`, catalog BROWSE), so a misconfigured deploy surfaces a clear reason instead of an empty graph.
+**5. Verify** — open `https://<app-url>/api/diagnostics` (or run `make diagnostics`). It reports exactly which prerequisites the SP can reach (warehouse, `system.access`, `system.billing`, `information_schema`, catalog BROWSE), so a misconfigured deploy surfaces a clear reason instead of an empty graph.
 
-**5. (Optional) Enable opt-in capabilities** — open the app, click the header menu → **Control Panel**, and as a workspace admin toggle on Runtime Plan Capture, Captured-Plan Precedence, and/or Federated Sync. All are OFF by default. See [docs/capabilites.md](docs/capabilites.md) for setup steps. The v2.5.0 API capabilities (governance, impact, observability, access, ML, discovery, DQ, diagnostics) are always-on — no toggle required.
+**6. (Optional) Enable opt-in capabilities** — open the app, click the header menu → **Control Panel**, and as a workspace admin toggle on Runtime Plan Capture, Captured-Plan Precedence, and/or Federated Sync. All are OFF by default. See [docs/capabilites.md](docs/capabilites.md) for setup steps. The v2.5.0 API capabilities (governance, impact, observability, access, ML, discovery, DQ, diagnostics) are always-on — no toggle required.
 
 ## Documentation
 

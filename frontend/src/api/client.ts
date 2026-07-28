@@ -324,6 +324,15 @@ export interface TransformVersion {
   analyzed_by?: string | null;
 }
 
+export interface TransformVersionDetail {
+  ref: string;
+  source: "plan_capture" | "llm";
+  version: number | null;
+  label: string;
+  columns: AnalyzeProducerColumn[];
+  analyzed_at?: string | null;
+}
+
 export interface CrossSourceCompare {
   from: { ref: string; source: string; version: number | null; label: string; analyzed_at?: string | null };
   to: { ref: string; source: string; version: number | null; label: string; analyzed_at?: string | null };
@@ -473,6 +482,17 @@ export const api = {
     });
     if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
     return res.json() as Promise<{ versions: TransformVersion[] }>;
+  },
+
+  // Load one transformation version's columns by ref (plan_capture:N | llm:N).
+  getTransformationVersion: async (body: {
+    catalog: string; schema_name: string; table: string; ref: string; entity_type?: string; entity_id?: string;
+  }) => {
+    const res = await fetch(`${BASE}/column-transformations/version`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+    return res.json() as Promise<TransformVersionDetail>;
   },
 
   // Compare two transformation versions from any source (captured plan / LLM).
