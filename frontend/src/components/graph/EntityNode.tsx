@@ -49,6 +49,7 @@ function formatTimeAgo(iso: string): string {
 
 function fmtDuration(secs: number | null): string {
   if (secs == null) return "—";
+  secs = Math.round(secs); // avg_duration_seconds can be fractional
   if (secs < 60) return `${secs}s`;
   const m = Math.floor(secs / 60);
   if (m < 60) return `${m}m ${secs % 60}s`;
@@ -134,11 +135,14 @@ function HealthPopover({ entityType, entityId }: { entityType: string; entityId:
                 </div>
                 <div className="text-[8px] uppercase tracking-wider text-slate-500 mt-1">Avg dur</div>
               </div>
-              <div className="rounded-lg bg-surface-200/50 px-2 py-1.5 text-center">
+              <div
+                className="rounded-lg bg-surface-200/50 px-2 py-1.5 text-center"
+                title={`Summed cost of the ${data.runs.length} run${data.runs.length !== 1 ? "s" : ""} below. The node badge shows a separate 30-day serverless total for the whole ${data.entity_type.toLowerCase()}.`}
+              >
                 <div className="text-[15px] font-semibold text-emerald-300 leading-none">
                   {disc(data.total_cost_usd) != null ? `$${disc(data.total_cost_usd)!.toFixed(2)}` : "—"}
                 </div>
-                <div className="text-[8px] uppercase tracking-wider text-slate-500 mt-1">Cost ({data.runs.length})</div>
+                <div className="text-[8px] uppercase tracking-wider text-slate-500 mt-1">Last {data.runs.length} runs</div>
               </div>
             </div>
 
@@ -286,7 +290,10 @@ function EntityNodeComponent({ data }: NodeProps<EntityNodeData>) {
             {label}
           </span>
           {costDisplay && (
-            <span className="font-mono font-bold text-[12px] text-emerald-300 bg-emerald-500/10 px-1.5 py-0.5 rounded flex-shrink-0">
+            <span
+              title="30-day serverless total for this entity. Open the health check (activity icon) for per-run costs."
+              className="font-mono font-bold text-[12px] text-emerald-300 bg-emerald-500/10 px-1.5 py-0.5 rounded flex-shrink-0"
+            >
               ${costDisplay}
             </span>
           )}
