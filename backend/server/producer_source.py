@@ -56,6 +56,25 @@ def _fetch_notebook_source(notebook_id: str) -> str:
         return ""
 
 
+def _fetch_workspace_file(path: str) -> str:
+    """Read a plain workspace file's text (non-notebook, e.g. a bundle .py/.sql).
+
+    Notebooks are read via `_fetch_notebook_source` (the export API); arbitrary
+    workspace files need the download API instead, which returns raw bytes.
+    Falls back to the notebook export path if download isn't available.
+    """
+    client = _get_client()
+    try:
+        resp = client.workspace.download(path)
+        data = resp.read() if hasattr(resp, "read") else resp
+        if isinstance(data, bytes):
+            return data.decode("utf-8", errors="replace")
+        return str(data or "")
+    except Exception as e:
+        logger.info(f"producer_source: download failed for {path}, trying export: {e}")
+        return _fetch_notebook_source(path)
+
+
 def _fetch_query_source(query_id: str) -> str:
     """Fetch the SQL text of a saved DBSQL query."""
     try:
@@ -84,19 +103,101 @@ def _fetch_job_source(job_id: str) -> str:
         return ""
 
 
+# Source-file extensions we try to export when walking a pipeline's glob root.
+_PIPELINE_SOURCE_EXTS = (".py", ".sql", ".scala", ".r")
+
+
+def _list_workspace_source_files(root: str, max_files: int = 200) -> list[str]:
+    """Recursively list source files (notebooks + workspace files) under `root`.
+
+    Used for glob-style pipeline libraries whose source lives as individual
+    workspace files rather than declared notebooks. Best-effort: returns [] on
+    any error and caps the walk to avoid pathological trees.
+    """
+    client = _get_client()
+    found: list[str] = []
+    stack = [root]
+    while stack and len(found) < max_files:
+        cur = stack.pop()
+        try:
+            entries = list(client.workspace.list(path=cur))
+        except Exception as e:
+            logger.info(f"producer_source: could not list workspace dir {cur}: {e}")
+            continue
+        for obj in entries:
+            otype = getattr(obj.object_type, "value", obj.object_type)
+            path = obj.path or ""
+            if otype == "DIRECTORY":
+                stack.append(path)
+            elif otype == "NOTEBOOK":
+                found.append(path)
+            elif otype == "FILE" and path.lower().endswith(_PIPELINE_SOURCE_EXTS):
+                found.append(path)
+    return found
+
+
 def _fetch_pipeline_source(pipeline_id: str) -> str:
-    """Concatenate source from all library notebooks in a pipeline."""
+    """Concatenate source from all libraries in a pipeline.
+
+    Handles the three library shapes a Lakeflow/DLT pipeline can declare:
+      * ``notebook.path`` — the classic single-notebook library.
+      * ``file.path``     — a direct workspace-file source reference.
+      * ``glob.include``  — modern bundle-deployed pipelines whose source is a
+        directory of ``.py``/``.sql`` files matched by a glob. We walk the
+        glob's base directory and export every source file under it.
+    Previously only ``notebook`` was handled, so glob/file pipelines yielded no
+    source — surfacing to the UI as "No source code available" (mislabeled as
+    "LLM unavailable").
+    """
     try:
         client = _get_client()
-        p = client.pipelines.get(pipeline_id=pipeline_id)
-        libraries = getattr(p.spec if p.spec else p, "libraries", None) or []
+        # Read the RAW pipeline spec via the REST API rather than the typed SDK
+        # object: the `glob` library field is newer than some SDK versions in our
+        # supported range, and an older SDK silently drops unrecognized fields on
+        # deserialization — which made glob/file pipelines look library-less.
+        try:
+            raw = client.api_client.do("GET", f"/api/2.0/pipelines/{pipeline_id}")
+        except Exception:
+            raw = {}
+        libraries = ((raw.get("spec") or {}).get("libraries")) or []
         parts: list[str] = []
+        seen: set[str] = set()
+
+        def _add(path: str, label: str, is_notebook: bool) -> None:
+            if not path or path in seen:
+                return
+            seen.add(path)
+            src = _fetch_notebook_source(path) if is_notebook else _fetch_workspace_file(path)
+            if src:
+                parts.append(f"# --- {label}: {path} ---\n{src}")
+
         for lib in libraries:
-            nb = getattr(lib, "notebook", None)
-            if nb and getattr(nb, "path", None):
-                src = _fetch_notebook_source(nb.path)
-                if src:
-                    parts.append(f"# --- Notebook: {nb.path} ---\n{src}")
+            nb = (lib.get("notebook") or {}).get("path")
+            if nb:
+                _add(nb, "Notebook", True)
+                continue
+
+            fl = (lib.get("file") or {}).get("path")
+            if fl:
+                _add(fl, "File", False)
+                continue
+
+            include = (lib.get("glob") or {}).get("include")
+            if include:
+                # Strip trailing glob wildcards to get a base directory to walk,
+                # e.g. ".../transformations/**" -> ".../transformations".
+                base = include.split("*", 1)[0].rstrip("/")
+                for path in _list_workspace_source_files(base):
+                    # export handles both, but plain files download more reliably;
+                    # treat .py/.sql/etc. as files, everything else as a notebook.
+                    is_nb = not path.lower().endswith(_PIPELINE_SOURCE_EXTS)
+                    _add(path, "File", is_nb)
+
+        if not parts:
+            logger.info(
+                f"producer_source: pipeline {pipeline_id} yielded no readable source "
+                f"({len(libraries)} librar(ies) inspected)"
+            )
         return "\n\n".join(parts)
     except Exception as e:
         logger.info(f"producer_source: could not fetch pipeline source for {pipeline_id}: {e}")
