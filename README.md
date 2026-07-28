@@ -99,12 +99,26 @@ Deploying to your own workspace is a short ordered checklist — not every step 
 **2. Deploy** (creates the app + its service principal):
 
     databricks auth login --profile <profile>
-    databricks bundle deploy -t dev --profile <profile> --var warehouse_id=<warehouse-id>
-    databricks bundle run bricktrace -t dev --profile <profile>
+    databricks bundle deploy -t dev --profile <profile> \
+      --var warehouse_id=<warehouse-id> \
+      --var lineage_catalog=<catalog-you-can-write> \
+      --var lineage_schema=<schema> \
+      --var captured_plans_table=<catalog>.<schema>.captured_plans \
+      --var captured_cdc_table=<catalog>.<schema>.captured_cdc_specs
+    databricks bundle run bricktrace -t dev --profile <profile> \
+      --var warehouse_id=<warehouse-id> \
+      --var lineage_catalog=<catalog-you-can-write> \
+      --var lineage_schema=<schema> \
+      --var captured_plans_table=<catalog>.<schema>.captured_plans \
+      --var captured_cdc_table=<catalog>.<schema>.captured_cdc_specs
 
+> **Which `--var`s are required.** Only `warehouse_id` has no default. But `lineage_catalog`/`lineage_schema` (where the app writes its own tables) default to `lattice_lineage.lineage`, and `captured_plans_table`/`captured_cdc_table` default under that same catalog — so **on any workspace that can't create `lattice_lineage`** (e.g. a metastore with no default storage root), leaving them unset causes `TABLE_OR_VIEW_NOT_FOUND` / catalog-creation failures. Point them at a catalog + schema the app's service principal can write to.
+>
+> **Pass the same `--var`s to `bundle run` too**, not just `deploy`. The App's runtime env is (re)applied on `bundle run`, so any var you drop there resets that env value — the usual cause of "No SQL warehouse available / `DATABRICKS_WAREHOUSE_ID` not set" after a restart.
+>
 > The app name defaults to `bricktrace-dev` (dev) / `bricktrace` (prod). In a shared workspace, override it to avoid collisions: `--var app_name=<your-name>`.
 >
-> **Shortcut — use the `Makefile`.** `make redeploy` runs build → deploy → run in one step and bakes in the required `--var` overrides (warehouse, app-owned catalog/schema) so a config change never drops them. Override defaults on the command line, e.g. `make redeploy PROFILE=<profile> WAREHOUSE_ID=<id>`. Run `make help` to list targets.
+> **Shortcut — use the `Makefile`.** `make redeploy` runs build → deploy → run in one step and bakes in all of the above `--var` overrides so a config change or restart never drops one. Override defaults on the command line, e.g. `make redeploy PROFILE=<profile> WAREHOUSE_ID=<id> LINEAGE_CATALOG=<cat> LINEAGE_SCHEMA=<schema>`. Run `make help` to list targets.
 
 **3. Grant the app's service principal** (as a **metastore admin**). The SP only exists after step 2. Easiest path — the helper resolves the SP and applies the grants:
 
