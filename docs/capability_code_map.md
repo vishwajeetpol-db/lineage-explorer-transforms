@@ -251,3 +251,45 @@ governance-rule, access, ml-models, root-cause-trace, and analyze-producer
 - **~20 service files** still have their own non-polling `_execute_sql` (only `access.py` + `lineage_service.py` fixed); latent, only bites on >50s queries.
 - **Deploy vars**: the app is deployed with `--var lineage_catalog=pritam_demo_workspace_catalog --var lineage_schema=bricktrace_lineage` (the default `lattice_lineage` catalog can't be created in the FEVM workspace). These are runtime `--var`s, not persisted in `databricks.yml`.
 - **Logo** still carries a baked background; a transparent PNG at `frontend/public/bricktrace-logo.logo` would render cleaner.
+
+## Part G — Cached panels, run health & multi-producer comparison (v2.6.0)
+
+### G1. Per-table capability cache
+
+| File | Role |
+|---|---|
+| `backend/server/capability_cache.py` | `CapabilityCache` (Delta table `{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.capability_cache`, keyed by `(table_fqn, tab)`); `get/set/evict/evict_table/evict_all/inventory`. `serve_or_compute(table_fqn, tab, compute, actor, refresh)` read-through helper attaches a `_cache` meta block. Always returns the payload + a computed `stale` flag (TTL `CAPABILITY_CACHE_TTL_SECONDS`, default 24h; 256 KB payload cap). |
+| `backend/routes/impact.py` · `root_cause.py` (`/trace`) · `governance.py` · `access.py` | Each GET takes `refresh: bool = Query(False)` and wraps its compute in `serve_or_compute`. Impact body extracted to `_compute_impact`. |
+| `backend/main.py` | `GET /api/admin/capability-cache` (inventory) · `POST /api/admin/capability-cache/evict?scope=entry\|table\|all` (admin-gated). |
+| `frontend/src/api/client.ts` | `CacheMeta` + `CapabilityCacheEntry` types; `_cache` on the 4 responses; `refresh?` param on `getImpact/getRootCauseTrace/getGovernance/getAccess`; `getCapabilityCacheInventory` + `evictCapabilityCache`. |
+| `frontend/src/components/table-lineage/panelShared.tsx` | `CacheHeader` — "cached Xh ago / may be stale" badge + Refresh icon; wired into all 4 panels (Governance forces `loadGovernance(true)` after rule edits). |
+| `frontend/src/components/AdminDashboard.tsx` | "Capability Cache" section: per-entry `EVICT`, `EVICT TABLE`, `Evict all`. |
+
+### G2. Per-node run health check
+
+| File | Role |
+|---|---|
+| `backend/server/observability.py` | `get_recent_runs(entity_type, entity_id, limit=5)` — per-run rows from `system.lakeflow.{job_run,pipeline_update}_timeline` grouped by `run_id`/`update_id` (terminal state via `MAX_BY(result_state, period_end_time) FILTER (...)`), LEFT-joined to `system.billing.usage` on `usage_metadata.job_run_id`/`dlt_update_id` for **per-run cost**. Computes verdict, success rate, avg duration + trend, cost total + spike, run/entity deep links. `OBSERVABILITY_LOOKBACK_DAYS` default 90. |
+| `backend/routes/observability.py` | `GET /api/observability/runs?entity_type=&entity_id=&limit=&refresh=` — cached via `serve_or_compute` (key `entity:{TYPE}:{id}`, tab `runs:{TYPE}:{limit}`). |
+| `frontend/src/api/client.ts` | `EntityRun` / `EntityRuns` types + `getEntityRuns`. |
+| `frontend/src/components/graph/EntityNode.tsx` | Activity icon on JOB/PIPELINE nodes → `HealthPopover` (summary tiles + last-5-runs, discount-aware costs, refresh). `fmtDuration` rounds fractional avg. Node cost badge = 30-day serverless total (distinct from popover last-N-runs total — both tooltipped). |
+
+### G3. Multi-producer transformation comparison
+
+| File | Role |
+|---|---|
+| `backend/server/producer_source.py` | `compare_producers(catalog, schema, table, producers[], actor, force_rerun)` — resolves **each producer from its own source via `analyze_producer`** (NOT `resolve_column_transformations`; a table-keyed captured plan would return identical results for every producer and hide divergence). Builds a per-column matrix (union of target columns × producers), flags `divergent` on `_cmp_key` (expr + source_columns) or present/absent mismatch. |
+| `backend/routes/lineage.py` | `POST /api/column-transformations/compare-producers` (needs ≥2 producers). |
+| `frontend/src/api/client.ts` | `ProducerCompare` / `ProducerCompareCell` types + `api.compareProducers`. |
+| `frontend/src/components/table-lineage/ColumnTransformationPanel.tsx` | Derives producers from graph `edges` whose `target` == focus table; shows "Compare side-by-side" banner + `ProducerCompareMatrix` (rows = columns, cols = producers, divergent rows highlighted) only when 2+ producers. |
+
+### G4. Producer-source fetch + access-denied UX (v2.6.0 fixes)
+
+| File | Role |
+|---|---|
+| `backend/server/producer_source.py` | `_fetch_pipeline_source` reads the **raw pipeline spec via REST** and handles `notebook.path` / `file.path` / `glob.include` (walks the glob dir, exports each `.py`/`.sql`) — fixes "LLM unavailable" on modern bundle/DLT pipelines. `_fetch_workspace_file` (download API). `_FetchDiag` + `_is_access_error` classify failures; `analyze_producer` returns `reason_code` (`access_denied`/`entity_missing`/`no_source`) + `denied_paths` + `app_service_principal` (from `DATABRICKS_CLIENT_ID`). |
+| `frontend/src/components/table-lineage/ColumnTransformationPanel.tsx` | `AccessDeniedNotice` — names the SP + denied paths + CAN_VIEW/CAN_READ grant guidance when `reason_code=access_denied`. |
+
+### Multi-producer demo
+
+`pritam_demo_workspace_catalog.multi_producer_demo.orders_curated` — written by 2 jobs (`mp_producer_a`=239232751351800, `mp_producer_b`=535053242967358); 3 of 4 columns diverge (amount_usd, status, region). SP needs `CAN_VIEW` on both jobs + `CAN_READ` on both producer notebooks for the comparison to resolve.

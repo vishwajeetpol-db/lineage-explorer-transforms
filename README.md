@@ -28,7 +28,7 @@
   <img src="https://img.shields.io/badge/TypeScript-3178C6?style=flat&logo=typescript&logoColor=white" alt="TypeScript"/>
   <img src="https://img.shields.io/badge/Databricks_Apps-FF3621?style=flat&logo=databricks&logoColor=white" alt="Databricks"/>
   <img src="https://img.shields.io/badge/ELK.js-layout-orange" alt="ELK.js"/>
-  <img src="https://img.shields.io/badge/version-2.5.6-6366F1" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-2.6.0-6366F1" alt="Version"/>
 </p>
 
 ---
@@ -70,6 +70,10 @@ This is the user-visible capability inventory. `docs/capability_code_map.md` is 
 - **Table Lineage workspace (v2.5.5)** — a dedicated per-table analysis workspace opened from the **Table Lineage** home tile (or `?view=tableLineage`): a left catalog tree, the cross-catalog lineage graph, a summary bar, and six **draggable** capability panels — Impact (with clickable consumer deep-links), Root Cause (health-based upstream trace), Governance (classification-rule management), Access & security, ML Models, and LLM Transform (model dropdown + versioning + version compare). See [docs/capability_code_map.md](docs/capability_code_map.md) Part F.
 - **Light / dark theme (v2.5.5)** — theme toggle (top-right) backed by CSS-variable color tokens; the whole UI flips from one class on `<html>`. Preference persists across sessions.
 - **Redesigned home + new logo (v2.5.5)** — sidebar-shell landing (nav, workspace selector, user profile, notifications, Recent Activity) and a new BrickTrace logo across the app.
+- **Cached capability panels (v2.6.0)** — Impact, Root Cause, Governance, and Access results are cached per table in Delta and served instantly on reopen (~25× faster than a cold scan). Each panel shows a "cached Xh ago / may be stale" badge and a refresh icon; admins can evict per entry, per table, or the whole cache from the ops dashboard. (`/api/admin/capability-cache`)
+- **Per-node run health check (v2.6.0)** — every job/pipeline node in the graph has a health icon opening a popover: Healthy/Degraded/Failing verdict, success rate, duration trend, total cost with a per-run spike flag, and the last 5 runs with **real per-run cost** and deep links. (`GET /api/observability/runs`)
+- **Multi-producer transformation comparison (v2.6.0)** — when a table is written by two or more producers, the Column Transformation panel shows a side-by-side per-column matrix that flags where producers compute the same column with different logic — catching silent consistency hazards. (`POST /api/column-transformations/compare-producers`)
+- **Actionable access-denied guidance (v2.6.0)** — when the LLM path can't read a producer's source, the panel names the exact resource and app service principal to grant, instead of a generic error. Pipeline source-fetch now also covers modern bundle/DLT pipelines whose source is `glob`- or `file`-based (not just declared notebooks).
 
 ## Quick start
 
@@ -180,6 +184,16 @@ The full reference lives in **[docs/REFERENCE.md](docs/REFERENCE.md)**:
 | [Capability → code map — Part F](docs/capability_code_map.md) | The `table-lineage/` workspace, per-panel file map, theme/logo shell, and the backend deltas (Impact consumers, Root Cause trace, SP-friendly Access, live ML derivation, LLM versioning). |
 | [CHANGELOG — 2.5.5](CHANGELOG.md) | Full added/changed list + known gaps. |
 | `?view=tableLineage` | The workspace route (`hooks/useRouter.ts` `goTableLineage`), opened from the Table Lineage home tile. |
+
+**New in v2.6.0** — cached capability panels, per-node run health, multi-producer comparison:
+
+| Topic | |
+|---|---|
+| [CHANGELOG — 2.6.0](CHANGELOG.md) | Full added/changed/fixed list. |
+| Per-table capability cache | `backend/server/capability_cache.py` (`serve_or_compute`) + `/api/admin/capability-cache` eviction; `CacheHeader` refresh badge in the 4 panels. |
+| Run health check | `observability.get_recent_runs()` + `GET /api/observability/runs`; `HealthPopover` on JOB/PIPELINE nodes in `EntityNode.tsx`. |
+| Multi-producer comparison | `producer_source.compare_producers()` + `POST /api/column-transformations/compare-producers`; `ProducerCompareMatrix` in `ColumnTransformationPanel.tsx`. |
+| Product one-pager | [`docs/BrickTrace_Product_Overview.pdf`](docs/BrickTrace_Product_Overview.pdf) — sales-oriented capabilities overview. |
 
 ## Tech stack
 

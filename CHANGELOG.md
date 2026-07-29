@@ -6,6 +6,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [2.6.0] - 2026-07-29
+
+> **Operational lineage — cached capability panels, node-level run health, and multi-producer transformation comparison.** The Table Lineage workspace gets a persistent per-table cache with refresh + admin eviction, every job/pipeline node gains a run-health check with per-run cost, and tables written by more than one producer can be compared column-by-column to catch divergent logic. Plus fixes that make the LLM Column Transformation path work on modern (glob/file) pipelines and clearly explain permission gaps.
+
+### Added
+
+- **Per-table capability cache** — Impact, Root Cause, Governance, and Access panel results are persisted per `(table, tab)` in an app-owned Delta table (`capability_cache`) and served instantly on reopen (measured ~25× faster; cold Access ~78s → warm ~3s). Each panel shows a **"cached Xh ago / may be stale"** badge (24h TTL, `CAPABILITY_CACHE_TTL_SECONDS`) and a **Refresh** icon that forces a live recompute. (`backend/server/capability_cache.py`, `serve_or_compute()`.)
+- **Admin capability-cache controls** — `GET /api/admin/capability-cache` (inventory) and `POST /api/admin/capability-cache/evict?scope=entry|table|all`. The Admin dashboard gains a "Capability Cache" section with per-entry, per-table, and evict-all actions.
+- **Per-node run health check** — every **JOB** and **PIPELINE** graph node has an activity icon opening a health popover: verdict (Healthy / Degraded / Failing) + success rate, average duration with a slower/faster **trend arrow**, total cost over the window with a per-run **spike flag**, and the **last 5 runs** — each with status, duration, **real per-run cost** (joined from `system.billing.usage` on `job_run_id` / `dlt_update_id`), and a deep link to the run. `GET /api/observability/runs?entity_type=&entity_id=&limit=&refresh=` (cached via the capability cache). (`observability.get_recent_runs()`, `EntityNode.tsx` `HealthPopover`.)
+- **Multi-producer column-transformation comparison** — when a table is written by 2+ producers, the Column Transformation panel shows a **"Compare side-by-side"** matrix (rows = target columns, columns = producers) that flags where producers compute the same column differently. `POST /api/column-transformations/compare-producers`. Each producer is resolved from **its own** source (per-entity LLM), not the table-level captured plan — so genuine divergence is surfaced rather than masked. (`producer_source.compare_producers()`, `ProducerCompareMatrix`.)
+- **Actionable "access denied" on the Column Transformation panel** — when the app can't read a producer's source, the panel now names the exact resource(s) and the app service-principal to grant, instead of a generic "LLM unavailable". Backend returns a structured `reason_code` (`access_denied` / `entity_missing` / `no_source`) with `denied_paths` + `app_service_principal`.
+
+### Changed
+
+- **`OBSERVABILITY_LOOKBACK_DAYS`** default 30 → 90 so recent-runs and health surface data in demo/low-activity workspaces.
+- **README Quick start** — documents Node/npm + Databricks CLI prerequisites, the `npm ci` frontend build step, the full set of required deploy `--var`s (not just `warehouse_id`), and that `bundle run` needs the same vars as `bundle deploy`.
+
+### Fixed
+
+- **LLM Column Transformation was mislabeled "unavailable" on modern pipelines** — `_fetch_pipeline_source` only handled `notebook`-style pipeline libraries. Bundle/DLT pipelines that declare source via `glob.include` (a directory of `.py`/`.sql`) or `file.path` yielded no source → "No source code available". Now reads the **raw pipeline spec via REST** (older SDK versions in our pinned range silently drop the `glob` field on typed deserialization), walks the glob directory, and exports each file. Added `_fetch_workspace_file` (download API for plain files).
+- **Multi-producer comparison masked divergence** — first implementation resolved each producer via table-level precedence, so a table-keyed captured Spark plan returned identical results for every producer (0 divergent). Fixed to resolve each producer from its own source.
+- **Run-health duration formatting** — `avg_duration_seconds` is a float; unrounded `secs % 60` rendered as `29.6000000000000023s`. Now rounded.
+- **`grant_app_access.sh` aborted under `set -u`** — a bare `$LINEAGE_SCHEMA` abutting a multibyte ellipsis was parsed as part of the variable name, aborting before the app-owned schema was created. Braced the vars; also committed the script's executable bit so fresh clones can run it directly.
+
+---
+
 ## [2.5.6] - 2026-07-27
 
 > **Column Transformation Lineage — unified precedence + cross-source versioning.** The LLM Transform panel is reworked into **Column Transformation Lineage**, which resolves a table's per-column derivation best-source-first (mirroring the reference tool): captured Spark plan → captured CDC spec → stored LLM version → fresh LLM. Version history now spans both sources, and any two versions can be diffed — including a captured plan against an LLM deduction.

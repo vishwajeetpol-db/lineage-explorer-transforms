@@ -17,8 +17,11 @@ deploy that upgrades to 2.4.0 — enabling one is an explicit admin action.
 | Excel export | Styled multi-sheet `.xlsx` of the current graph | `excel_export.py` |
 | Admin ops dashboard | Latency/memory/cache/thread-pool metrics | `AdminDashboard.tsx`, `/api/admin/status` |
 | Live mode | Admin-only cache bypass, direct system-table reads | `?live=true` internally, gated to `ADMIN_GROUP_NAME` |
-| Table Lineage workspace (v2.5.5) | Per-table analysis workspace: catalog tree + lineage graph + draggable panels for Impact, Root Cause, Governance, Access, ML Models, LLM Transform | `frontend/src/components/table-lineage/`, `?view=tableLineage` — see [capability_code_map.md](capability_code_map.md) Part F |
+| Table Lineage workspace (v2.5.5) | Per-table analysis workspace: catalog tree + lineage graph + draggable panels for Impact, Root Cause, Governance, Access, ML Models, Column Transformation | `frontend/src/components/table-lineage/`, `?view=tableLineage` — see [capability_code_map.md](capability_code_map.md) Part F |
 | Light / dark theme (v2.5.5) | Theme toggle (top-right); CSS-variable tokens flip the whole UI; persisted | `store/themeStore.ts`, `components/ui/ThemeToggle.tsx`, `styles/globals.css` |
+| Cached capability panels (v2.6.0) | Impact/Root Cause/Governance/Access cached per table in Delta; "cached / may be stale" badge + refresh; admin evict per entry/table/all | `server/capability_cache.py`, `/api/admin/capability-cache` — see [capability_code_map.md](capability_code_map.md) Part G |
+| Per-node run health check (v2.6.0) | Activity icon on every job/pipeline node → verdict + success rate + duration trend + cost total/spike + last-5 runs (per-run cost + deep links) | `server/observability.py` `get_recent_runs`, `/api/observability/runs`, `EntityNode.tsx` |
+| Multi-producer transformation comparison (v2.6.0) | Side-by-side per-column matrix when a table has 2+ producers, flagging divergent logic | `producer_source.compare_producers`, `/api/column-transformations/compare-producers` |
 
 ## Control Panel
 

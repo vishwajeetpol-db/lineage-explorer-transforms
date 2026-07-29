@@ -903,6 +903,10 @@ Single-process is the right default — it keeps the cache, coalescing, and rate
 | `TRANSFORM_CACHE_TTL_SECONDS` | `3600` (1h) | Transformation-lineage cache TTL |
 | `TRANSFORM_MAX_DEPTH` | `8` | Max BFS depth for the transformation backtrack |
 | `BUILD_CACHE_TTL_HOURS` | `24` | Hours before a built table's transformation lineage is considered stale |
+| `CAPABILITY_CACHE_TTL_SECONDS` | `86400` (24h) | Age before a cached Impact/Root Cause/Governance/Access panel is flagged stale (v2.6.0). Payload is still served past this — only the badge changes. |
+| `OBSERVABILITY_LOOKBACK_DAYS` | `90` | Lookback window for run-health aggregates and the last-N-runs health check (v2.6.0; was 30) |
+| `CAPTURED_PLANS_TABLE` | `<cat>.<schema>.captured_plans` | Delta table the offline `lineage_capture` wheel writes analyzed plans to (bundle var `captured_plans_table`) |
+| `CAPTURED_CDC_TABLE` | `<cat>.<schema>.captured_cdc_specs` | Delta table for captured apply_changes/AUTO-CDC specs (bundle var `captured_cdc_table`) |
 
 Override via DABs:
 
@@ -945,6 +949,20 @@ env:
 | `GET` | `/api/transform/categories` | Transform category → color map |
 | `GET` | `/api/transform/build-configured` | Whether the build pipeline path is configured |
 | `POST` | `/api/transform/invalidate?scope=cache\|table\|all[&table_fqn=]` | Flush transform cache / wipe stored lineage (**admin-only**) |
+| **Column transformations** | | |
+| `POST` | `/api/column-transformations` | Unified per-column derivation, best-source-first (captured plan → CDC → stored LLM → fresh LLM). Body `{catalog, schema_name, table, entity_type?, entity_id?, force_rerun?, model?}` |
+| `POST` | `/api/column-transformations/versions` | Merged version list across sources (each with a `ref`) |
+| `POST` | `/api/column-transformations/compare` | Diff any two version refs (incl. cross-source captured-plan vs LLM) |
+| `POST` | `/api/column-transformations/compare-producers` | **Multi-producer comparison (v2.6.0)** — per-column matrix across 2+ producers of the same table, flagging divergent logic. Body `{catalog, schema_name, table, producers:[{entity_type, entity_id}], force_rerun?}` |
+| **Observability / run health** | | |
+| `GET` | `/api/observability?entity_type=&entity_id=` | Aggregate run/update health for a job or pipeline |
+| `GET` | `/api/observability/runs?entity_type=&entity_id=&limit=5&refresh=false` | **Last-N runs health check (v2.6.0)** — per-run status, duration, **per-run cost**, deep links, plus verdict / success rate / duration trend / cost total + spike. Cached per entity |
+| `GET` | `/api/observability/producers?catalog=&schema=&table=` | Health of every producer of a table |
+| **Per-table capability cache (admin)** | | |
+| `GET` | `/api/admin/capability-cache` | Inventory of cached `(table, tab)` entries (admin-only) |
+| `POST` | `/api/admin/capability-cache/evict?scope=entry\|table\|all[&table_fqn=&tab=]` | Evict capability-cache entries (admin-only) |
+
+> **Cached capability panels (v2.6.0).** `GET /api/impact`, `/api/root-cause/trace`, `/api/governance`, and `/api/access` accept `&refresh=true` to bypass the per-table cache and recompute live; otherwise they serve the cached payload with a `_cache` meta block (`from_cache`, `cached_at`, `stale`).
 
 All identifier parameters are validated: alphanumeric + underscores, max 255 chars.
 

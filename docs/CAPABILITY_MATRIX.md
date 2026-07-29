@@ -1,6 +1,6 @@
 # BrickTrace — Capability Matrix
 
-> A single-page view of everything BrickTrace does. Version **2.5.5**.
+> A single-page view of everything BrickTrace does. Version **2.6.0**.
 > Status legend: ✅ **HAVE** (backend + shipped UI) · 🟡 **PARTIAL** (backend, limited UI/scope) · ⬜ **GAP**.
 > For code anchors and debug notes, see [capability_code_map.md](capability_code_map.md).
 
@@ -39,23 +39,31 @@
 | 16 | Search & Discovery | ✅ | `/api/search`, `/api/discover/*` |
 | 17 | Open Standards | ✅ | OpenLineage export + import + live producer |
 | 18 | Scalability | ✅ | Delta-backed distributed cache + cursor-paginated graph |
-| 19 | Observability | 🟡 | `/api/observability` (run health; no dedicated dashboard) |
+| 19 | Observability | ✅ | `/api/observability` (aggregate health) · **`/api/observability/runs`** (last-N runs w/ per-run cost + health verdict, on every job/pipeline node) |
 | 20 | Notifications | ✅ | detection scan + alert rules + webhooks + delivery queue |
 
-**Scorecard: 19 ✅ · 1 🟡 · 0 ⬜**
+**Scorecard: 20 ✅ · 0 🟡 · 0 ⬜**
 
-## 3. Table Lineage workspace (v2.5.5)
+## 3. Table Lineage workspace (v2.5.5, extended v2.6.0)
 
-Per-table analysis workspace (`?view=tableLineage`) — catalog tree + lineage graph + draggable capability panels:
+Per-table analysis workspace (`?view=tableLineage`) — catalog tree + lineage graph + draggable capability panels. The Impact/Root Cause/Governance/Access panels are **cached per table** (v2.6.0) with a "cached / may be stale" badge + refresh icon; admins can evict from the ops dashboard.
 
 | Panel | Status | What it shows |
 |---|---|---|
-| Impact | ✅ | Downstream tables + consumer entities (dashboards/jobs/pipelines) grouped by type, clickable deep-links |
-| Root Cause | ✅ | Health-based upstream trace: prime suspect + failure path from producer run health |
-| Governance | ✅ | Owner/type/tags/classified columns + add/remove classification rules (admin) |
-| Access & security | ✅ | Grantees, accessors, reads/writes, identities, recent events |
+| Impact | ✅ | Downstream tables + consumer entities (dashboards/jobs/pipelines) grouped by type, clickable deep-links · **cached** |
+| Root Cause | ✅ | Health-based upstream trace: prime suspect + failure path from producer run health · **cached** |
+| Governance | ✅ | Owner/type/tags/classified columns + add/remove classification rules (admin) · **cached** |
+| Access & security | ✅ | Grantees, accessors, reads/writes, identities, recent events · **cached** |
 | ML Models | ✅ | Models trained on the table (UC Registry + MLflow) + serving status |
-| LLM Transform | ✅ | AI-inferred column transforms · model dropdown · versioning · version compare |
+| Column Transformation | ✅ | Per-column derivation (captured plan → CDC → stored/fresh LLM) · model dropdown · versioning · cross-source compare · **multi-producer side-by-side comparison (v2.6.0)** · actionable access-denied guidance |
+
+## 3b. Run health & cache (v2.6.0)
+
+| Capability | Status | Surface |
+|---|---|---|
+| Per-node run health check | ✅ | Activity icon on every JOB/PIPELINE node → verdict + success rate + duration trend + cost total/spike + last-5 runs (per-run cost + deep links) · `/api/observability/runs` |
+| Per-table capability cache | ✅ | `capability_cache` Delta table; refresh badge per panel; `/api/admin/capability-cache` inventory + evict (entry/table/all) |
+| Multi-producer transformation comparison | ✅ | Side-by-side per-column matrix when a table has 2+ producers · `/api/column-transformations/compare-producers` |
 
 ## 4. Platform & UX
 
@@ -90,6 +98,7 @@ Per-table analysis workspace (`?view=tableLineage`) — catalog tree + lineage g
 - **Metadata-only** — reads UC system tables + `BROWSE`; never reads table row data. App writes only to one app-owned schema.
 - **Service-principal scoped** — some panels only show what the app SP can see: Access grants need `MANAGE` on the catalog/schema; audit-backed sections need account-admin `SELECT` on `system.access`.
 - **ML model→table** derivation needs the training run readable by the SP (fails if the run's notebook was deleted).
-- **Observability (#19)** is API-only; no dedicated monitoring dashboard in-app yet.
+- **Column Transformation & run health** need the app SP to read the producer's source/runs: jobs need `CAN_VIEW` **and** their task notebook needs `CAN_READ`; pipeline `glob`/`file` source needs read on the workspace files. The panel surfaces the exact grant when access is denied.
+- **Per-run cost** in the run-health check joins `system.billing.usage` on `job_run_id` / `dlt_update_id`; without `SELECT` on `system.billing` the runs still show but costs are blank.
 
-_Last updated: v2.5.5. Source of truth for code anchors: [capability_code_map.md](capability_code_map.md)._
+_Last updated: v2.6.0. Source of truth for code anchors: [capability_code_map.md](capability_code_map.md)._

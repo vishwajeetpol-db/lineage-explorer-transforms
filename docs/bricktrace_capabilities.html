@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>BrickTrace — Product Overview</title>
+<style>
+  :root {
+    --ink: #14161f;
+    --muted: #545b69;
+    --faint: #8a909c;
+    --line: #e3e6ec;
+    --brick: #ff3621;
+    --brick-deep: #c02611;
+    --violet: #6d5bd0;
+    --emerald: #0f9d6b;
+    --sky: #1b7fc4;
+    --amber: #c98a12;
+    --bg-soft: #f7f8fa;
+    --ink-panel: #10131c;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink); margin: 0; font-size: 12px; line-height: 1.55;
+  }
+  @page { size: A4; margin: 14mm 14mm; }
+  h2, h3 { letter-spacing: -0.3px; }
+  p { margin: 4px 0; }
+  em { color: var(--brick-deep); font-style: normal; font-weight: 600; }
+
+  /* ---------- Cover ---------- */
+  .cover {
+    height: 251mm; display: flex; flex-direction: column; justify-content: center;
+    padding: 0 4mm; page-break-after: always; position: relative;
+  }
+  .eyebrow { font-size: 11px; font-weight: 700; letter-spacing: 2.5px; text-transform: uppercase;
+    color: var(--brick); margin-bottom: 20px; }
+  .logo { display: flex; align-items: center; gap: 13px; margin-bottom: 30px; }
+  .logo svg { width: 56px; height: 56px; }
+  .logo .wm { font-size: 32px; font-weight: 800; letter-spacing: -0.5px; }
+  .logo .wm .b { color: #1a1a2e; } .logo .wm .t { color: var(--brick); }
+  .cover h1 { font-size: 39px; line-height: 1.12; margin: 0 0 14px; letter-spacing: -1.2px; max-width: 165mm; }
+  .cover .sub { font-size: 15.5px; color: var(--muted); max-width: 158mm; line-height: 1.5; }
+  .cover .value-row { margin-top: 30px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; max-width: 172mm; }
+  .value-row .v { border-left: 2.5px solid var(--brick); padding-left: 11px; }
+  .value-row .v .big { font-size: 21px; font-weight: 800; letter-spacing: -0.5px; }
+  .value-row .v .lbl { font-size: 10.5px; color: var(--muted); margin-top: 2px; }
+  .cover .meta { position: absolute; bottom: 2mm; left: 4mm; right: 4mm;
+    display: flex; justify-content: space-between; font-size: 10.5px; color: var(--faint);
+    border-top: 1px solid var(--line); padding-top: 9px; }
+
+  /* ---------- Section headers ---------- */
+  h2 { font-size: 19px; margin: 28px 0 3px; padding-bottom: 7px; border-bottom: 2px solid var(--brick); }
+  h2 .n { color: var(--brick); font-weight: 800; margin-right: 9px; }
+  .lead { color: var(--muted); margin: 5px 0 15px; font-size: 12.5px; }
+  .section-intro { page-break-after: avoid; }
+
+  /* ---------- Problem / Solution panel ---------- */
+  .ps { display: grid; grid-template-columns: 1fr 1fr; gap: 0; border: 1px solid var(--line);
+    border-radius: 12px; overflow: hidden; margin: 12px 0; page-break-inside: avoid; }
+  .ps .col { padding: 16px 18px; }
+  .ps .problem { background: var(--bg-soft); }
+  .ps .solution { background: #fff; border-left: 1px solid var(--line); }
+  .ps h4 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px; }
+  .ps .problem h4 { color: var(--brick-deep); }
+  .ps .solution h4 { color: var(--emerald); }
+  .ps ul { margin: 0; padding-left: 17px; } .ps li { margin: 6px 0; }
+
+  /* ---------- Value cards ---------- */
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 13px 15px;
+    margin: 10px 0; page-break-inside: avoid; background: #fff; }
+  .card .cap-head { display: flex; align-items: baseline; gap: 9px; margin-bottom: 3px; }
+  .card h3 { margin: 0; font-size: 13.5px; }
+  .tag { font-size: 8.5px; text-transform: uppercase; letter-spacing: .07em; font-weight: 700;
+    padding: 2px 7px; border-radius: 5px; white-space: nowrap; }
+  .tag.diff { background: #ffe9e5; color: var(--brick-deep); }
+  .tag.gov { background: #efe9ff; color: var(--violet); }
+  .tag.ops { background: #e6f1fa; color: var(--sky); }
+  .tag.core { background: #e7f6ef; color: var(--emerald); }
+  .value { margin-top: 7px; padding-top: 7px; border-top: 1px dashed var(--line);
+    color: var(--ink); font-size: 11.5px; }
+  .value b { color: var(--emerald); font-weight: 700; }
+  code { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 10.5px;
+    background: var(--bg-soft); padding: 1px 5px; border-radius: 4px; color: #33384a; }
+
+  /* ---------- Personas ---------- */
+  .personas { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
+  .persona { border: 1px solid var(--line); border-radius: 10px; padding: 13px 15px; page-break-inside: avoid; }
+  .persona .who { font-size: 13px; font-weight: 700; margin-bottom: 2px; }
+  .persona .role { font-size: 10px; color: var(--faint); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 7px; }
+  .persona ul { margin: 0; padding-left: 16px; } .persona li { margin: 3px 0; font-size: 11px; }
+
+  /* ---------- Differentiator strip ---------- */
+  .diffstrip { background: var(--ink-panel); color: #eef0f5; border-radius: 12px; padding: 18px 20px;
+    margin: 12px 0; page-break-inside: avoid; }
+  .diffstrip h3 { margin: 0 0 10px; color: #fff; font-size: 15px; }
+  .diffstrip .row { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 22px; }
+  .diffstrip .d { font-size: 11.5px; color: #c8ccd6; padding-left: 16px; position: relative; }
+  .diffstrip .d::before { content: "▸"; position: absolute; left: 0; color: var(--brick); }
+  .diffstrip .d b { color: #fff; font-weight: 700; }
+
+  /* ---------- Matrix ---------- */
+  table.matrix { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 10.5px; }
+  table.matrix th, table.matrix td { border: 1px solid var(--line); padding: 7px 9px; text-align: left; vertical-align: top; }
+  table.matrix th { background: var(--ink-panel); color: #fff; font-weight: 700; }
+  table.matrix tr:nth-child(even) td { background: var(--bg-soft); }
+  .cta { background: var(--bg-soft); border: 1px solid var(--line); border-left: 3px solid var(--brick);
+    border-radius: 10px; padding: 16px 18px; margin: 16px 0 4px; page-break-inside: avoid; }
+  .cta h3 { margin: 0 0 6px; font-size: 15px; }
+  .foot { color: var(--faint); font-size: 10px; margin-top: 26px; border-top: 1px solid var(--line); padding-top: 9px; }
+</style>
+</head>
+<body>
+
+<!-- ================= COVER ================= -->
+<section class="cover">
+  <div class="eyebrow">Product Overview</div>
+  <div class="logo">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+      <polygon points="50,82 85,65 50,48 15,65" fill="#8B1A00"/>
+      <polygon points="50,68 85,51 50,34 15,51" fill="#BB2700"/>
+      <polygon points="50,54 85,37 50,20 15,37" fill="#DD3700"/>
+      <polygon points="50,40 85,23 50,6 15,23" fill="#FF5520"/>
+    </svg>
+    <span class="wm"><span class="b">Brick</span><span class="t">Trace</span></span>
+  </div>
+  <h1>See how your data really flows — and act on it.</h1>
+  <div class="sub">BrickTrace turns Unity Catalog's raw lineage into an interactive map of your entire
+    data estate: every table, every column, the exact logic that transformed it, who can touch it,
+    what it costs, and whether it's healthy — in one click, across every catalog, with zero access to
+    your row data.</div>
+  <div class="value-row">
+    <div class="v"><div class="big">1 click</div><div class="lbl">from any table to its full upstream &amp; downstream lineage</div></div>
+    <div class="v"><div class="big">Column-deep</div><div class="lbl">reconstructs the actual SQL/PySpark that built each column</div></div>
+    <div class="v"><div class="big">Metadata-only</div><div class="lbl">reads system tables &amp; BROWSE — never your data</div></div>
+  </div>
+  <div class="meta">
+    <span>BrickTrace · Native Databricks App · Unity Catalog lineage intelligence</span>
+    <span>v2.6.0</span>
+  </div>
+</section>
+
+<!-- ================= THE PROBLEM / THE SOLUTION ================= -->
+<h2><span class="n">01</span>The opportunity</h2>
+<p class="lead section-intro">Unity Catalog already captures lineage from every operation. The value is
+   locked behind hand-written system-table SQL that only a few engineers can run. BrickTrace unlocks it
+   for the whole organization.</p>
+<div class="ps">
+  <div class="col problem">
+    <h4>Today, without BrickTrace</h4>
+    <ul>
+      <li>"Where does this number come from?" takes hours of tracing across notebooks, jobs, and SQL.</li>
+      <li>A schema change ships and <em>silently breaks</em> a downstream dashboard nobody knew existed.</li>
+      <li>Nobody can say <em>how</em> a column was calculated without reading the pipeline code.</li>
+      <li>Sensitive data spreads downstream untracked; access grants pile up unused.</li>
+      <li>Pipeline failures and cost spikes are found late, in separate tools.</li>
+    </ul>
+  </div>
+  <div class="col solution">
+    <h4>With BrickTrace</h4>
+    <ul>
+      <li>Pick any table → the <em>complete</em> lineage cone renders instantly, across all catalogs.</li>
+      <li>Blast-radius analysis shows exactly <em>who breaks</em> before you change anything.</li>
+      <li>Click a column → see the real transformation expression that produced it.</li>
+      <li>Sensitivity, ownership, and actual-vs-declared access are one panel away.</li>
+      <li>Run health, cost, and root cause live <em>on the graph</em> — no tool-hopping.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ================= DIFFERENTIATORS ================= -->
+<div class="diffstrip">
+  <h3>Why BrickTrace wins</h3>
+  <div class="row">
+    <div class="d"><b>Goes deeper than the catalog.</b> Reconstructs the actual expression behind every column — not just "A depends on B."</div>
+    <div class="d"><b>Whole-estate, one click.</b> Traces across every catalog &amp; schema automatically, with the pipelines in between.</div>
+    <div class="d"><b>Zero-trust by design.</b> Metadata-only — reads system tables &amp; BROWSE, never a single row of your data.</div>
+    <div class="d"><b>Native &amp; instant to deploy.</b> A Databricks App — one command, shared across your workspace, no external infra.</div>
+    <div class="d"><b>Scales to thousands.</b> Shared caching means the warehouse is barely touched, even org-wide.</div>
+    <div class="d"><b>Beyond lineage.</b> Governance, access, run health, and cost unified in the same view.</div>
+  </div>
+</div>
+
+<!-- ================= CORE CAPABILITIES ================= -->
+<h2><span class="n">02</span>What you get</h2>
+<p class="lead section-intro">Six capability areas, unified in one interactive workspace.</p>
+
+<div class="card">
+  <div class="cap-head"><h3>End-to-end lineage, instantly</h3><span class="tag core">Foundation</span></div>
+  <p>Select any table and BrickTrace auto-traces the full lineage cone — every upstream source back to
+     every downstream target, across all catalogs and schemas, with the mediating jobs and pipelines.
+     Switch between Tables, Pipelines, and Full views, cap the depth, and search the graph with
+     Cmd/Ctrl+K.</p>
+  <div class="value"><b>Business value:</b> onboard to any dataset in seconds and answer
+     "where does this come from and where does it go?" without tribal knowledge or a data-engineering ticket.</div>
+</div>
+
+<div class="card">
+  <div class="cap-head"><h3>Column &amp; transformation lineage</h3><span class="tag diff">Differentiator</span></div>
+  <p>Column-level lineage from real Unity Catalog edges — zero false positives. Then the layer no one
+     else has: BrickTrace parses the producing code to reconstruct the <em>actual</em> SQL/PySpark
+     expression behind each column — casts, aggregates, CASE logic, window functions, CTE chains —
+     across notebooks, jobs, DLT pipelines, views, and query history.</p>
+  <div class="value"><b>Business value:</b> prove how any metric was calculated for audits and
+     migrations, and trace a wrong number to the exact line of logic that caused it.</div>
+</div>
+
+<div class="card">
+  <div class="cap-head"><h3>Impact analysis &amp; blast radius</h3><span class="tag gov">Governance</span></div>
+  <p>Before you change or deprecate a table, see every downstream table it feeds, their owners, the
+     dashboards and jobs that consume it, and whether any of it carries sensitive data.</p>
+  <div class="value"><b>Business value:</b> ship changes with confidence and prevent the "silent break"
+     that turns into a Monday-morning incident.</div>
+</div>
+
+<div class="card">
+  <div class="cap-head"><h3>Governance, classification &amp; access</h3><span class="tag gov">Governance</span></div>
+  <p>Ownership and column sensitivity with downstream propagation, custom classification rules that
+     follow the data, and access lineage that joins <em>declared</em> grants with <em>actual</em>
+     audited usage — surfacing dormant grants to revoke.</p>
+  <div class="value"><b>Business value:</b> pass access recertification and data-privacy reviews faster,
+     and enforce least privilege with evidence instead of guesswork.</div>
+</div>
+
+<div class="card">
+  <div class="cap-head"><h3>Run health &amp; cost, on the graph</h3><span class="tag ops">Operations</span></div>
+  <p>Every job and pipeline node carries a live cost badge and a health check: a Healthy/Degraded/Failing
+     verdict, success rate, duration trend, and the last runs with per-run cost and direct links.
+     Root-cause tracing walks upstream to the prime-suspect producer when a table goes stale.</p>
+  <div class="value"><b>Business value:</b> cut mean-time-to-resolution on data incidents and spot the
+     expensive or failing pipelines to fix first — all without leaving the lineage view.</div>
+</div>
+
+<div class="card">
+  <div class="cap-head"><h3>Discovery, quality &amp; AI/ML lineage</h3><span class="tag ops">Insight</span></div>
+  <p>Full-text asset search, PII/sensitive-column and orphan-table finders, lightweight per-column data
+     quality rules, and model → training-data lineage that ties UC-registered models back to the tables
+     they learned from.</p>
+  <div class="value"><b>Business value:</b> retire unused assets, find hidden sensitive data, and know
+     instantly which ML models are exposed when a source table has an issue.</div>
+</div>
+
+<!-- ================= WHO IT'S FOR ================= -->
+<h2><span class="n">03</span>Who it's for</h2>
+<p class="lead section-intro">One tool, value for every data role.</p>
+<div class="personas">
+  <div class="persona">
+    <div class="who">Data Engineers</div>
+    <div class="role">Build &amp; operate pipelines</div>
+    <ul>
+      <li>Trace breakages to the exact upstream producer, fast.</li>
+      <li>See blast radius before shipping a schema change.</li>
+      <li>Monitor run health &amp; cost inline.</li>
+    </ul>
+  </div>
+  <div class="persona">
+    <div class="who">Data Stewards &amp; Governance</div>
+    <div class="role">Own trust &amp; compliance</div>
+    <ul>
+      <li>Track sensitive data as it propagates downstream.</li>
+      <li>Recertify access with declared-vs-actual evidence.</li>
+      <li>Apply classification rules that follow the data.</li>
+    </ul>
+  </div>
+  <div class="persona">
+    <div class="who">Analysts &amp; Data Consumers</div>
+    <div class="role">Trust &amp; use the data</div>
+    <ul>
+      <li>Self-serve "where does this number come from?"</li>
+      <li>See exactly how a metric was calculated.</li>
+      <li>Judge freshness and reliability at a glance.</li>
+    </ul>
+  </div>
+  <div class="persona">
+    <div class="who">Platform &amp; FinOps Leaders</div>
+    <div class="role">Cost, scale &amp; risk</div>
+    <ul>
+      <li>Find the costliest pipelines in any data flow.</li>
+      <li>Deploy org-wide with metadata-only security.</li>
+      <li>Scale to thousands of users on one warehouse.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ================= OUTCOMES ================= -->
+<h2><span class="n">04</span>Outcomes it drives</h2>
+<table class="matrix">
+  <thead><tr><th style="width:34%">Business question</th><th>How BrickTrace answers it</th><th style="width:22%">Outcome</th></tr></thead>
+  <tbody>
+    <tr><td>Where does this data come from and go to?</td><td>One-click end-to-end lineage across all catalogs</td><td>Faster onboarding &amp; analysis</td></tr>
+    <tr><td>Who breaks if I change this table?</td><td>Impact / blast-radius with owners &amp; consumers</td><td>Fewer production incidents</td></tr>
+    <tr><td>How was this column actually calculated?</td><td>Reconstructed transformation expressions</td><td>Audit-ready trust</td></tr>
+    <tr><td>Where is our sensitive data flowing?</td><td>Sensitivity classification + downstream propagation</td><td>Reduced compliance risk</td></tr>
+    <tr><td>Who can vs. actually accesses this?</td><td>Declared grants joined with audit usage</td><td>Least-privilege enforcement</td></tr>
+    <tr><td>Why is this dataset stale or wrong?</td><td>Health-based root-cause tracing to the prime suspect</td><td>Lower incident MTTR</td></tr>
+    <tr><td>What is this pipeline costing us?</td><td>Per-node serverless cost &amp; per-run breakdown</td><td>Targeted cost optimization</td></tr>
+    <tr><td>Which ML models used this table?</td><td>Model → training-data lineage</td><td>Contained model risk</td></tr>
+  </tbody>
+</table>
+
+<!-- ================= DEPLOY / CTA ================= -->
+<h2><span class="n">05</span>Built for Databricks, deployed in minutes</h2>
+<div class="cta">
+  <h3>Native, secure, and effortless to roll out</h3>
+  <p>BrickTrace ships as a <em>Databricks App</em> (FastAPI + React) — deploy with a single command and
+     it's instantly shared across your workspace. No external infrastructure, no data movement, no
+     Redis or third-party service. It reads only <code>BROWSE</code> metadata and Unity Catalog system
+     tables, and writes only to one dedicated app-owned schema — so it clears security review quickly.
+     Request coalescing and shared caching keep warehouse usage minimal even at organization scale.</p>
+</div>
+
+<div class="foot">
+  BrickTrace v2.6.0 — Interactive Unity Catalog lineage intelligence for Databricks. Metadata-only access;
+  no table data is read. Capabilities described reflect the current release; contact your BrickTrace team
+  for a tailored walkthrough or a proof-of-value in your workspace.
+</div>
+
+</body>
+</html>
