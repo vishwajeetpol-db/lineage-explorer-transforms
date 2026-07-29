@@ -80,6 +80,30 @@ replace it.
   not an error) for a column with no captured plan — this is a contract test
   that the frontend's "fall back to static parse" logic can rely on.
 
+## 1b. Unit tests added for v2.6.0 (`tests/`)
+
+New capabilities (cached panels, run health, multi-producer comparison) each have a test module. All mock the SDK/`_execute_sql` — no live workspace needed. Run with `pytest tests/ -m "not integration"`.
+
+### `test_capability_cache.py`
+* `CapabilityCache` singleton; `get`/`set`/`evict`/`evict_table`/`evict_all`/`inventory` all return safe defaults on SQL error (cache is optional, non-fatal).
+* `get()` returns the payload + `stale` flag regardless of age; treats NULL `value_json` as a miss; `set()` rejects oversized payloads and escapes single quotes.
+* `serve_or_compute()`: cache hit skips `compute` and marks `from_cache=True`; miss computes + stores; `refresh=True` bypasses the read; non-dict payloads pass through uncached.
+
+### `test_run_health.py`
+* `get_recent_runs()`: verdict/success-rate math, per-run cost mapping + total + spike flag (>2× median), duration-trend (latest vs prior avg), JOB vs PIPELINE dispatch + deep-link shape, unsupported entity type, missing-billing → null costs (not error), timeline error → empty (not raise).
+* `GET /api/observability/runs`: bad entity_type/injection → 400, out-of-range limit → 422, valid request returns the payload (cache bypassed via patched `CapabilityCache`).
+
+### `test_producer_source.py`
+* `_is_access_error` / `_FetchDiag` classification (access_denied vs entity_missing, path dedup).
+* `_fetch_pipeline_source` handles `notebook` / `file` / `glob` library shapes from the raw REST spec (glob base dir stripped of wildcards then walked).
+* `analyze_producer` returns `reason_code` (`access_denied` with `denied_paths`+`app_service_principal`, or `no_source`).
+* `compare_producers`: divergent-column flagging, present/absent divergence, and that it resolves each producer via `analyze_producer` (per-entity) — **not** `resolve_column_transformations` (table-level) which would mask divergence.
+* `POST /api/column-transformations/compare-producers`: requires ≥2 producers, rejects injection, returns the matrix.
+
+### `test_capability_cache_routes.py`
+* Impact/Access/Root Cause routes attach a `_cache` meta block; a cache hit skips recompute; `refresh=true` bypasses the read and recomputes; a miss computes then caches.
+* `GET /api/admin/capability-cache` + `POST .../evict` are admin-gated (403 for non-admin), validate `scope` (entry needs table+tab; invalid scope → 400), and return the evicted count.
+
 ## 2. Frontend checks
 
 * `useFeatureFlagStore` — `updateFlagEnabled` only mutates the targeted flag's
