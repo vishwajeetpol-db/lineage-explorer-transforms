@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   GitFork, Play, Loader2, RefreshCw, GitCompare, AlertTriangle, History,
-  Cpu, Sparkles, Layers, ArrowRight, CheckCircle2, ShieldAlert, Copy, Check,
+  Cpu, Sparkles, Layers, ArrowRight, CheckCircle2, ShieldAlert, Copy, Check, Columns3,
 } from "lucide-react";
 import {
   api,
@@ -10,6 +10,7 @@ import {
   type TransformVersion,
   type TransformVersionDetail,
   type CrossSourceCompare,
+  type ProducerCompare,
 } from "../../api/client";
 import { useLineageStore } from "../../store/lineageStore";
 import { NoTable, SectionTitle, parseFqn } from "./panelShared";
@@ -129,12 +130,94 @@ function AccessDeniedNotice({ data }: { data: ColumnTransformResult }) {
   );
 }
 
+// Per-column matrix comparing how each producer computes each output column.
+// Rows = target columns; columns = producers; divergent rows highlighted.
+function ProducerCompareMatrix({ cmp, onRefresh }: { cmp: ProducerCompare; onRefresh: () => void }) {
+  const shortLabel = (p: ProducerCompare["producers"][number]) =>
+    p.label && !p.label.startsWith(p.entity_type) ? p.label : `${p.entity_type} ${p.entity_id.slice(0, 8)}`;
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2 text-[10px] text-slate-400">
+        <span>
+          <b className="text-amber-300">{cmp.divergent_count}</b> of {cmp.column_count} columns differ across producers
+        </span>
+        <button onClick={onRefresh} title="Re-resolve all producers"
+          className="ml-auto flex items-center gap-1 text-slate-500 hover:text-accent-light transition-colors">
+          <RefreshCw size={11} /> Refresh
+        </button>
+      </div>
+
+      {/* Producer legend + any that couldn't be read */}
+      {cmp.producers.some((p) => p.source === "unavailable") && (
+        <div className="text-[10px] text-amber-200/80 bg-amber-500/10 border border-amber-500/25 rounded px-2 py-1">
+          Some producers couldn't be read (e.g. access denied) — their column cells show "—".
+        </div>
+      )}
+
+      <div className="overflow-x-auto rounded-lg border border-white/[0.08]">
+        <table className="w-full border-collapse text-[10.5px]">
+          <thead>
+            <tr className="bg-surface-200/60">
+              <th className="text-left font-medium text-slate-400 px-2 py-1.5 sticky left-0 bg-surface-200/60 border-r border-white/[0.06]">
+                Column
+              </th>
+              {cmp.producers.map((p) => (
+                <th key={p.key} className="text-left font-medium text-slate-300 px-2 py-1.5 min-w-[150px] border-r border-white/[0.04] last:border-0">
+                  <span className="truncate block max-w-[180px]" title={`${p.entity_type} ${p.entity_id}`}>{shortLabel(p)}</span>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {cmp.columns.map((row) => (
+              <tr key={row.column} className={`border-t border-white/[0.05] ${row.divergent ? "bg-amber-500/[0.06]" : ""}`}>
+                <td className="align-top px-2 py-1.5 sticky left-0 border-r border-white/[0.06] bg-surface-100/80">
+                  <span className="font-mono text-slate-200 flex items-center gap-1">
+                    {row.divergent && <AlertTriangle size={10} className="text-amber-400 shrink-0" />}
+                    {row.column}
+                  </span>
+                </td>
+                {row.cells.map((cell) => (
+                  <td key={cell.producer} className="align-top px-2 py-1.5 border-r border-white/[0.04] last:border-0">
+                    {cell.present ? (
+                      <div className="space-y-0.5">
+                        <div className="font-mono text-slate-300 break-words">{cell.expression || "—"}</div>
+                        {cell.source_columns.length > 0 && (
+                          <div className="text-[9px] text-slate-500 font-mono">← {cell.source_columns.join(", ")}</div>
+                        )}
+                        {cell.category && (
+                          <span className="text-[8px] uppercase tracking-wide text-slate-500">{cell.category}</span>
+                        )}
+                      </div>
+                    ) : (
+                      <span className="text-slate-600">—</span>
+                    )}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 export default function ColumnTransformationPanel({ table }: { table: string | null }) {
   const nodes = useLineageStore((s) => s.nodes);
+  const edges = useLineageStore((s) => s.edges);
   const entityNodes = useMemo(
     () => nodes.filter((n): n is Extract<typeof n, { node_type: "entity" }> => n.node_type === "entity"),
     [nodes],
   );
+  // Producers = entity nodes with an edge INTO the focus table (i.e. they write it).
+  const producerNodes = useMemo(() => {
+    if (!table) return [];
+    const producerIds = new Set(
+      edges.filter((e) => e.target === table).map((e) => e.source),
+    );
+    return entityNodes.filter((n) => producerIds.has(n.id));
+  }, [entityNodes, edges, table]);
 
   const [entityType, setEntityType] = useState("PIPELINE");
   const [entityId, setEntityId] = useState("");
@@ -153,6 +236,11 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
   // A specific version being viewed from the history list (null = showing the resolved/current result).
   const [viewingVersion, setViewingVersion] = useState<TransformVersionDetail | null>(null);
   const [viewLoading, setViewLoading] = useState<string | null>(null);
+
+  // Multi-producer comparison (only when the table has 2+ producers).
+  const [showProducerCompare, setShowProducerCompare] = useState(false);
+  const [producerCmp, setProducerCmp] = useState<ProducerCompare | null>(null);
+  const [pcLoading, setPcLoading] = useState(false);
 
   const parts = parseFqn(table);
 
@@ -175,6 +263,22 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
       .then((r) => { setModels(r.models); setModel((m) => m || r.default); })
       .catch(() => { setModels(["databricks-claude-sonnet-4-6"]); setModel((m) => m || "databricks-claude-sonnet-4-6"); });
   }, []);
+
+  // Resolve every producer of this table and build the comparison matrix.
+  const runProducerCompare = useCallback(async (force = false) => {
+    if (!parts || producerNodes.length < 2) return;
+    setPcLoading(true); setError(null);
+    try {
+      const r = await api.compareProducers({
+        catalog: parts.catalog, schema_name: parts.schema, table: parts.table,
+        producers: producerNodes.map((n) => ({ entity_type: n.entity_type, entity_id: n.entity_id })),
+        force_rerun: force,
+      });
+      setProducerCmp(r);
+    } catch (e: any) {
+      setError(e.message || "Failed to compare producers");
+    } finally { setPcLoading(false); }
+  }, [parts, producerNodes]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Refresh the unified version list (captured + LLM) for the current table/producer.
   const loadVersions = useCallback(async (et?: string, eid?: string) => {
@@ -209,7 +313,7 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
     } finally { setLoading(false); }
   }, [table, entityType, entityId, model, loadVersions]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => { setData(null); setError(null); setEntityId(""); setCompareData(null); setAllVersions([]); setViewingVersion(null); }, [table]);
+  useEffect(() => { setData(null); setError(null); setEntityId(""); setCompareData(null); setAllVersions([]); setViewingVersion(null); setShowProducerCompare(false); setProducerCmp(null); }, [table]);
   // Kick off an initial resolve (captured plan / stored) whenever the table changes.
   useEffect(() => { if (parts) resolve(); }, [table]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -262,6 +366,45 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
           <span className="px-1.5 py-0.5 rounded bg-fuchsia-500/15 text-fuchsia-300 border border-fuchsia-500/25">Fresh LLM</span>
         </div>
       </div>
+
+      {/* Multi-producer comparison — only when this table has 2+ producers. */}
+      {producerNodes.length >= 2 && (
+        <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.06] px-3.5 py-3">
+          <div className="flex items-center gap-2">
+            <Columns3 size={14} className="text-amber-400 shrink-0" />
+            <span className="text-[12px] font-semibold text-amber-100">
+              {producerNodes.length} producers write this table
+            </span>
+            <button
+              onClick={() => {
+                const next = !showProducerCompare;
+                setShowProducerCompare(next);
+                if (next && !producerCmp) runProducerCompare(false);
+              }}
+              className="ml-auto text-[11px] px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-100 font-medium transition-colors"
+            >
+              {showProducerCompare ? "Hide comparison" : "Compare side-by-side"}
+            </button>
+          </div>
+          <p className="text-[10px] text-amber-200/80 mt-1">
+            Each may compute the same column differently — compare to catch divergent logic.
+          </p>
+
+          {showProducerCompare && (
+            <div className="mt-3">
+              {pcLoading && (
+                <div className="flex items-center justify-center gap-2 py-6 text-slate-400">
+                  <Loader2 size={15} className="animate-spin text-accent" />
+                  <span className="text-[11px]">Resolving {producerNodes.length} producers…</span>
+                </div>
+              )}
+              {!pcLoading && producerCmp && (
+                <ProducerCompareMatrix cmp={producerCmp} onRefresh={() => runProducerCompare(true)} />
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {loading && (
         <div className="flex items-center justify-center gap-2 py-10 text-slate-500">

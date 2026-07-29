@@ -399,6 +399,26 @@ export interface CrossSourceCompare {
   error?: string;
 }
 
+// Multi-producer comparison: a per-column matrix across N producers of one table.
+export interface ProducerCompareCell {
+  producer: string;              // "JOB:123" key matching producers[].key
+  present: boolean;
+  expression: string | null;
+  source_columns: string[];
+  category: string | null;
+}
+export interface ProducerCompare {
+  table_full_name: string;
+  producers: {
+    key: string; entity_type: string; entity_id: string;
+    label: string; source: string | null; reason_code?: string | null; detail?: string | null;
+  }[];
+  columns: { column: string; divergent: boolean; cells: ProducerCompareCell[] }[];
+  divergent_count: number;
+  column_count: number;
+  error?: string;
+}
+
 export interface ColumnTransformResult {
   table_full_name: string;
   entity_type: string | null;
@@ -564,6 +584,18 @@ export const api = {
     });
     if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
     return res.json() as Promise<CrossSourceCompare>;
+  },
+
+  // Compare column transformations across multiple producers of the same table.
+  compareProducers: async (body: {
+    catalog: string; schema_name: string; table: string;
+    producers: { entity_type: string; entity_id: string }[]; force_rerun?: boolean;
+  }) => {
+    const res = await fetch(`${BASE}/column-transformations/compare-producers`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+    return res.json() as Promise<ProducerCompare>;
   },
 
   // Unified column-transformation lineage (captured plan → CDC → stored LLM → fresh LLM).

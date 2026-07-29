@@ -704,3 +704,116 @@ def compare_transformation_versions(
         "column_diffs": diffs,
         "changed_count": sum(1 for d in diffs if d["status"] != "unchanged"),
     }
+
+
+def _cmp_key(c: dict) -> str:
+    """Canonical form of a column's transformation for divergence detection —
+    expression + source columns only (ignores cosmetic category naming)."""
+    import json as _json
+    return _json.dumps({
+        "expr": (c.get("expression") or c.get("transformation") or "").strip(),
+        "src": sorted(c.get("source_columns") or []),
+    }, sort_keys=True)
+
+
+def compare_producers(
+    catalog: str, schema: str, table: str, producers: list[dict],
+    actor: str = "", force_rerun: bool = False,
+) -> dict:
+    """Resolve column transformations for MULTIPLE producers of the same table
+    and build a per-column comparison matrix.
+
+    A table can be written by more than one job/pipeline (e.g. two jobs that both
+    populate `orders_curated`). Each may compute the same output column with
+    DIFFERENT logic — a real consistency hazard. This resolves each producer via
+    the normal best-source-first precedence (cached; only calls the LLM where
+    nothing is stored) and returns:
+
+      producers[]:  one entry per producer (label, source, resolve status)
+      columns[]:    one row per target column, with a per-producer cell
+                    (expression / source_columns / category) and a `divergent`
+                    flag set when producers that DO define the column disagree.
+
+    `producers` is a list of {"entity_type", "entity_id"} dicts.
+    """
+    full = f"{catalog}.{schema}.{table}"
+    resolved: list[dict] = []
+    for p in producers:
+        et = (p.get("entity_type") or "").strip().upper()
+        eid = (p.get("entity_id") or "").strip()
+        if not et or not eid:
+            continue
+        # Resolve each producer from ITS OWN source (stored-or-fresh LLM keyed by
+        # entity), NOT the table-level precedence: a captured Spark plan / CDC spec
+        # is keyed by table, so it would return the same result for every producer
+        # and hide exactly the divergence this comparison exists to surface.
+        try:
+            r = analyze_producer(
+                entity_type=et, entity_id=eid, target_table=full,
+                actor=actor, force_rerun=force_rerun,
+            )
+            # analyze_producer returns source in {stored, llm, unavailable}; give the
+            # matrix a friendly per-producer label.
+            src = r.get("source")
+            r["source_label"] = {
+                "stored": f"Stored LLM v{r.get('version')} ({r.get('llm_model') or 'llm'})",
+                "llm": f"Fresh LLM v{r.get('version')} ({r.get('llm_model') or 'llm'})",
+                "unavailable": "Source unavailable",
+            }.get(src, src)
+        except Exception as e:
+            r = {"source": "unavailable", "columns": [], "detail": str(e), "source_label": "Source unavailable"}
+        # Stable per-producer key for matrix cells.
+        pkey = f"{et}:{eid}"
+        resolved.append({
+            "key": pkey,
+            "entity_type": et,
+            "entity_id": eid,
+            "label": r.get("source_label") or f"{et} {eid[:8]}",
+            "source": r.get("source"),
+            "reason_code": r.get("reason_code"),
+            "detail": r.get("detail"),
+            "columns": {(c.get("target_column") or c.get("column")): c
+                        for c in (r.get("columns") or []) if (c.get("target_column") or c.get("column"))},
+        })
+
+    # Union of all target columns across producers, preserving first-seen order.
+    col_order: list[str] = []
+    seen: set[str] = set()
+    for rp in resolved:
+        for col in rp["columns"]:
+            if col not in seen:
+                seen.add(col)
+                col_order.append(col)
+
+    rows: list[dict] = []
+    divergent_count = 0
+    for col in col_order:
+        cells = []
+        present_keys = []
+        for rp in resolved:
+            c = rp["columns"].get(col)
+            if c is not None:
+                present_keys.append(_cmp_key(c))
+            cells.append({
+                "producer": rp["key"],
+                "present": c is not None,
+                "expression": (c.get("expression") or c.get("transformation")) if c else None,
+                "source_columns": (c.get("source_columns") or []) if c else [],
+                "category": c.get("category") if c else None,
+            })
+        # Divergent = at least two producers define it AND they don't all agree,
+        # OR some producers define it and others (that produce this table) omit it.
+        defining = sum(1 for cell in cells if cell["present"])
+        divergent = (len(set(present_keys)) > 1) or (0 < defining < len(resolved))
+        if divergent:
+            divergent_count += 1
+        rows.append({"column": col, "divergent": divergent, "cells": cells})
+
+    return {
+        "table_full_name": f"{catalog}.{schema}.{table}",
+        "producers": [{k: rp[k] for k in ("key", "entity_type", "entity_id", "label", "source", "reason_code", "detail")}
+                      for rp in resolved],
+        "columns": rows,
+        "divergent_count": divergent_count,
+        "column_count": len(rows),
+    }

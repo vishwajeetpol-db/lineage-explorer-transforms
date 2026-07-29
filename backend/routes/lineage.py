@@ -14,6 +14,8 @@ import json
 import logging
 from typing import Optional
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from databricks.sdk.service.sql import StatementState
@@ -24,6 +26,7 @@ from backend.server.producer_source import (
     resolve_column_transformations,
     list_all_versions,
     compare_transformation_versions,
+    compare_producers,
     _columns_for_ref,
 )
 from backend.server.analysis_store import (
@@ -395,6 +398,46 @@ async def column_transformation_compare(request: Request, body: CTCompareIn):
     if eid and not _ENTITY_ID_RE.match(eid):
         raise HTTPException(status_code=400, detail="Invalid entity_id")
     return compare_transformation_versions(c, s, t, body.ref_from, body.ref_to, et, eid)
+
+
+class ProducerRef(BaseModel):
+    entity_type: str
+    entity_id: str
+
+
+class CTCompareProducersIn(BaseModel):
+    catalog: str
+    schema_name: str
+    table: str
+    producers: list[ProducerRef]
+    force_rerun: bool = False
+
+
+@analyze_router.post("/api/column-transformations/compare-producers")
+async def column_transformation_compare_producers(request: Request, body: CTCompareProducersIn):
+    """Compare column transformations across MULTIPLE producers of one table —
+    per-column matrix flagging where producers compute the same column differently."""
+    c = _validate(body.catalog, "catalog")
+    s = _validate(body.schema_name, "schema")
+    t = _validate(body.table, "table")
+    producers = []
+    for p in (body.producers or []):
+        et = (p.entity_type or "").strip().upper()
+        eid = (p.entity_id or "").strip()
+        if et and eid:
+            if not _ENTITY_ID_RE.match(eid):
+                raise HTTPException(status_code=400, detail=f"Invalid entity_id: {eid[:80]}")
+            producers.append({"entity_type": et, "entity_id": eid})
+    if len(producers) < 2:
+        raise HTTPException(status_code=400, detail="Provide at least 2 producers to compare.")
+    from backend.main import _get_user_info
+    email, _ = _get_user_info(request)
+    try:
+        return await asyncio.to_thread(
+            compare_producers, c, s, t, producers, email or "", body.force_rerun,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 class CTVersionIn(BaseModel):
