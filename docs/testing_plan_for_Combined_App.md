@@ -104,6 +104,25 @@ New capabilities (cached panels, run health, multi-producer comparison) each hav
 * Impact/Access/Root Cause routes attach a `_cache` meta block; a cache hit skips recompute; `refresh=true` bypasses the read and recomputes; a miss computes then caches.
 * `GET /api/admin/capability-cache` + `POST .../evict` are admin-gated (403 for non-admin), validate `scope` (entry needs table+tab; invalid scope → 400), and return the evicted count.
 
+## 1c. Full backend-route coverage sweep (v2.6.0)
+
+A coverage audit found ~41% of endpoints had tests; the following files were added so **every** router has at least validation + admin-gate + happy-path coverage (service layer mocked, no live workspace):
+
+| File | Router(s) covered |
+|---|---|
+| `test_routes_core_lineage.py` | core lineage in `main.py` — `/api/lineage`, `/lineage/trace`, `/columns`, `/column-lineage`, `/schema-column-lineage`, `/tables`, `/catalogs`, `/schemas`, `/sharing/*`, `/entity-name`, `/lineage/export` |
+| `test_routes_column_transformations.py` | `/api/analyze-producer/*`, `/api/column-transformations(+versions/compare)`, `/api/lineage/column-path\|entities\|freshness` |
+| `test_routes_root_cause.py` | `/api/root-cause/analyze\|trace\|upstream-path\|run-failures` |
+| `test_routes_coverage_extras.py` | `/api/access(+schema)`, `/api/observability/producers`, ML extensions, `/api/governance/config` DELETE, `/api/dq-rules/propagation` |
+| `test_routes_glossary.py` | `/api/glossary/*` (terms, domains, KPIs, links, overlays) |
+| `test_routes_snapshots.py` | `/api/snapshots/*` (capture/list/get/diff/delete) |
+| `test_routes_scalability.py` | `/api/scalability/*` (graph pagination, cache stats/invalidate, health) |
+| `test_routes_openlineage.py` | `/api/export\|import/openlineage`, `/api/openlineage/producer/*` |
+| `test_routes_pipeline_installer.py` | `/api/pipeline/install-capture(+preview)` (admin gate) |
+| `test_routes_diagnostics.py` | `/api/diagnostics/*` (root-cause, scd, schema-changes, profile, federated) |
+
+Run the whole backend suite with `pytest tests/ -m "not integration"`.
+
 ## 2. Frontend checks
 
 * `useFeatureFlagStore` — `updateFlagEnabled` only mutates the targeted flag's
