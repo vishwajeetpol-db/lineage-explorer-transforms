@@ -129,6 +129,34 @@ class TestAdminStatus:
         assert resp.status_code == 200
         assert resp.json()["cache"]["entries"] == 2
 
+    def test_status_falls_back_to_resource_when_proc_unreadable(self, admin_client):
+        """When /proc/self/status can't be read, RSS is taken from the resource
+        module fallback branch."""
+        with patch("backend.main.open", side_effect=OSError("no /proc"), create=True), \
+             patch("backend.main.get_cache_snapshot", return_value=([], 0, 0)):
+            resp = admin_client.get("/api/admin/status")
+        assert resp.status_code == 200
+        assert "rss_mb" in resp.json()["memory"]
+
+    def test_status_reads_vmrss_and_latencies(self, admin_client):
+        """Exercise the VmRSS /proc parse branch and the non-empty latency
+        percentile branch."""
+        import backend.main as m
+        from io import StringIO
+        # Seed latency samples so p50/p95/p99 use the populated-list branch.
+        with m._metrics_lock:
+            m._request_latencies.clear()
+            for v in range(1, 21):
+                m._request_latencies.append((__import__("time").time(), float(v)))
+        proc_status = StringIO("Name:\tpython\nVmRSS:\t524288 kB\nThreads:\t8\n")
+        with patch("backend.main.open", return_value=proc_status, create=True), \
+             patch("backend.main.get_cache_snapshot", return_value=([], 0, 0)):
+            resp = admin_client.get("/api/admin/status")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["memory"]["rss_mb"] == 512.0  # 524288 KB / 1024
+        assert body["latency"]["sample_count"] == 20
+
 
 class TestCacheInvalidate:
     def test_non_admin_403(self, non_admin_client):
@@ -519,6 +547,20 @@ class TestStaticServing:
         assert resp.status_code == 200
 
     def test_path_traversal_falls_back_to_index(self, app_client):
-        resp = app_client.get("/../../../etc/passwd")
+        # URL-encoded ../ so the client doesn't normalize it away — the resolved
+        # path escapes static_dir and the handler returns index.html.
+        resp = app_client.get("/%2e%2e/%2e%2e/etc/passwd")
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
+
+    def test_existing_static_file_served(self, app_client):
+        # index.html exists under dist → served directly (not the SPA fallback).
+        resp = app_client.get("/index.html")
+        assert resp.status_code == 200
+
+    def test_logo_missing_falls_back_to_index(self, app_client):
+        # When the .logo asset is absent, the route returns index.html instead.
+        with patch("backend.main.os.path.isfile", return_value=False):
+            resp = app_client.get("/bricktrace-logo.png")
         assert resp.status_code == 200
         assert "text/html" in resp.headers["content-type"]
