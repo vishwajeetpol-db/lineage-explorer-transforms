@@ -19,7 +19,7 @@
 <p align="center"><em>End-to-End Data Lineage for Databricks</em></p>
 
 <p align="center">
-  <strong>Unified lineage visualization with transformation drill-down</strong> — end-to-end table &amp; column lineage, expression-level transformation graphs, pipeline/job visibility, serverless cost, and Delta Sharing, across every catalog in your metastore. One command to deploy; zero access to your row data.
+  <strong>Unified lineage visualization with transformation drill-down</strong> — end-to-end table &amp; column lineage, expression-level transformation graphs, pipeline/job visibility, serverless cost, and Delta Sharing, across every catalog in your metastore. One command to deploy; zero access to your rows data.
 </p>
 
 <p align="center">
