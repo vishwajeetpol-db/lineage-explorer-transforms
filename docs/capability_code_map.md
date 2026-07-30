@@ -68,7 +68,7 @@
 | 24 | In-graph Tools (search, fit, drag) | `frontend/src/components/graph/` | client-side Cmd+K, fitView, drag |
 | 25 | Cross-Schema/Catalog Enrichment | `lineage_service.py` | included in `/api/lineage` response |
 | 26 | Expression-Level Transform | `transform_service.py`, `transformation_lineage/` | `GET /api/transform/{table}/{column}` |
-| 27 | Transform Freshness + Builder | `build_service.py` | `POST /api/transform/build`, `GET /api/transform/status` |
+| 27 | Transform Freshness + Builder | `build_service.py` (`get_pipeline_notebook_path()`, `submit_build_job()`, `is_build_configured()`) | `POST /api/transform/build`, `GET /api/transform/status/{run_id}`, `GET /api/transform/build-configured` | v2.6.0: lazy-cached path resolution (env → App source discovery via `apps.get` → fail-closed); `/build-configured` returns `notebook_path`; `_reset_pipeline_notebook_path_cache()` for test isolation |
 | 28 | Transform Diagnostics | `transform_service.py` | `GET /api/transform/diagnose` |
 | 29 | Delta Sharing Overlay | `lineage_service.py` → `get_sharing_overlay()` | included in lineage response |
 | 30 | Serverless Cost on Nodes | `cost_service.py` | `GET /api/cost/{entity}` |

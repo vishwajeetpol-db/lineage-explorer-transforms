@@ -69,6 +69,7 @@ from backend.build_service import (
     submit_build_job,
     get_build_status,
     is_build_configured,
+    get_pipeline_notebook_path,
     BUILD_STEPS,
 )
 from backend.models import BuildJobRequest

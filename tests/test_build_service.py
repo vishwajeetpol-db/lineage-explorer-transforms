@@ -1,6 +1,7 @@
 """Tests for backend/build_service.py — covers A7, A12, and general build submission.
 
-A7:  Path derivation no longer uses __file__; fails closed when PIPELINE_NOTEBOOK_PATH unset.
+A7:  Path derivation uses get_pipeline_notebook_path() with env-first + App source
+     discovery fallback. Never derives from __file__.
 A12: Per-table build lock prevents concurrent duplicate Jobs for the same FQN.
 """
 import os
@@ -11,59 +12,200 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# A7 — Path derivation fail-closed
+# A7 — Path derivation via get_pipeline_notebook_path()
 # ---------------------------------------------------------------------------
 
 class TestPipelineNotebookPath:
-    """A7: build_service must NOT derive broken container paths from __file__."""
+    """A7: build_service must NOT derive broken container paths from __file__.
+    Uses get_pipeline_notebook_path() with lazy cache."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self):
+        """Reset the lazy cache before each test."""
+        import backend.build_service as bs
+        bs._reset_pipeline_notebook_path_cache()
+        yield
+        bs._reset_pipeline_notebook_path_cache()
 
     def test_path_from_env_is_used_directly(self):
         """When PIPELINE_NOTEBOOK_PATH is set, use it as-is."""
+        import backend.build_service as bs
         with patch.dict(os.environ, {"PIPELINE_NOTEBOOK_PATH": "/Workspace/Users/me/notebooks/run_pipeline"}):
-            # Re-import to pick up the env var
-            import importlib
-            import backend.build_service as bs
-            importlib.reload(bs)
-            assert bs.PIPELINE_NOTEBOOK_PATH == "/Workspace/Users/me/notebooks/run_pipeline"
+            bs._reset_pipeline_notebook_path_cache()
+            assert bs.get_pipeline_notebook_path() == "/Workspace/Users/me/notebooks/run_pipeline"
 
-    def test_empty_when_env_unset(self):
-        """When PIPELINE_NOTEBOOK_PATH is NOT set, return empty — fail closed."""
+    def test_empty_when_env_unset_and_no_app(self):
+        """When PIPELINE_NOTEBOOK_PATH is NOT set and no DATABRICKS_APP_NAME, return empty."""
+        import backend.build_service as bs
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("PIPELINE_NOTEBOOK_PATH", None)
-            import importlib
-            import backend.build_service as bs
-            importlib.reload(bs)
-            assert bs.PIPELINE_NOTEBOOK_PATH == ""
+            os.environ.pop("DATABRICKS_APP_NAME", None)
+            bs._reset_pipeline_notebook_path_cache()
+            assert bs.get_pipeline_notebook_path() == ""
+
+    def test_whitespace_only_env_treated_as_unset(self):
+        """Whitespace-only PIPELINE_NOTEBOOK_PATH is treated as unset."""
+        import backend.build_service as bs
+        with patch.dict(os.environ, {"PIPELINE_NOTEBOOK_PATH": "   \t  "}, clear=False):
+            os.environ.pop("DATABRICKS_APP_NAME", None)
+            bs._reset_pipeline_notebook_path_cache()
+            assert bs.get_pipeline_notebook_path() == ""
 
     def test_is_build_configured_false_when_empty(self):
         """is_build_configured() must return False when path is empty."""
+        import backend.build_service as bs
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("PIPELINE_NOTEBOOK_PATH", None)
-            import importlib
-            import backend.build_service as bs
-            importlib.reload(bs)
+            os.environ.pop("DATABRICKS_APP_NAME", None)
+            bs._reset_pipeline_notebook_path_cache()
             assert bs.is_build_configured() is False
 
     def test_no_container_path_derivation(self):
         """A7 regression: must NOT produce paths like /Workspace/app/backend/..."""
+        import backend.build_service as bs
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("PIPELINE_NOTEBOOK_PATH", None)
-            import importlib
-            import backend.build_service as bs
-            importlib.reload(bs)
-            # The old code would produce something like /Workspace/app/notebooks/run_pipeline
-            assert not bs.PIPELINE_NOTEBOOK_PATH.startswith("/Workspace/app")
-            assert "/app/" not in bs.PIPELINE_NOTEBOOK_PATH
+            os.environ.pop("DATABRICKS_APP_NAME", None)
+            bs._reset_pipeline_notebook_path_cache()
+            path = bs.get_pipeline_notebook_path()
+            assert not path.startswith("/Workspace/app")
+            assert "/app/" not in path
 
     def test_submit_raises_when_not_configured(self):
         """submit_build_job raises RuntimeError when path is empty."""
+        import backend.build_service as bs
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("PIPELINE_NOTEBOOK_PATH", None)
-            import importlib
-            import backend.build_service as bs
-            importlib.reload(bs)
+            os.environ.pop("DATABRICKS_APP_NAME", None)
+            bs._reset_pipeline_notebook_path_cache()
             with pytest.raises(RuntimeError, match="PIPELINE_NOTEBOOK_PATH is not configured"):
                 bs.submit_build_job("catalog.schema.table")
+
+    def test_cache_is_lazy_and_reused(self):
+        """Once resolved, get_pipeline_notebook_path() returns cached value without re-reading env."""
+        import backend.build_service as bs
+        with patch.dict(os.environ, {"PIPELINE_NOTEBOOK_PATH": "/Workspace/first"}):
+            bs._reset_pipeline_notebook_path_cache()
+            assert bs.get_pipeline_notebook_path() == "/Workspace/first"
+        # Even after env changes, cache retains old value
+        with patch.dict(os.environ, {"PIPELINE_NOTEBOOK_PATH": "/Workspace/second"}):
+            assert bs.get_pipeline_notebook_path() == "/Workspace/first"
+        # Reset cache picks up new value
+        with patch.dict(os.environ, {"PIPELINE_NOTEBOOK_PATH": "/Workspace/second"}):
+            bs._reset_pipeline_notebook_path_cache()
+            assert bs.get_pipeline_notebook_path() == "/Workspace/second"
+
+
+# ---------------------------------------------------------------------------
+# A7 — App source discovery fallback
+# ---------------------------------------------------------------------------
+
+class TestAppSourceDiscovery:
+    """A7: When env is unset but DATABRICKS_APP_NAME is set, discover from App source."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self):
+        import backend.build_service as bs
+        bs._reset_pipeline_notebook_path_cache()
+        yield
+        bs._reset_pipeline_notebook_path_cache()
+
+    def test_discover_from_default_source_code_path(self):
+        """Discovers notebook path from app_info.default_source_code_path."""
+        import backend.build_service as bs
+
+        mock_app = MagicMock()
+        mock_app.default_source_code_path = "/Workspace/Users/deploy@db.com/bricktrace"
+        mock_app.source_code_path = None
+        mock_app.active_deployment = None
+        mock_app.pending_deployment = None
+
+        with patch.dict(os.environ, {"DATABRICKS_APP_NAME": "bricktrace-dev"}, clear=False):
+            os.environ.pop("PIPELINE_NOTEBOOK_PATH", None)
+            with patch("backend.build_service._get_client") as mock_client:
+                mock_client.return_value.apps.get.return_value = mock_app
+                bs._reset_pipeline_notebook_path_cache()
+                result = bs.get_pipeline_notebook_path()
+                assert result == "/Workspace/Users/deploy@db.com/bricktrace/notebooks/run_pipeline"
+
+    def test_discover_from_active_deployment(self):
+        """Falls back to active_deployment.source_code_path."""
+        import backend.build_service as bs
+
+        mock_deploy = MagicMock()
+        mock_deploy.source_code_path = "/Workspace/Shared/apps/bricktrace"
+
+        mock_app = MagicMock()
+        mock_app.default_source_code_path = None
+        mock_app.source_code_path = None
+        mock_app.active_deployment = mock_deploy
+        mock_app.pending_deployment = None
+
+        with patch.dict(os.environ, {"DATABRICKS_APP_NAME": "bt"}, clear=False):
+            os.environ.pop("PIPELINE_NOTEBOOK_PATH", None)
+            with patch("backend.build_service._get_client") as mock_client:
+                mock_client.return_value.apps.get.return_value = mock_app
+                bs._reset_pipeline_notebook_path_cache()
+                result = bs.get_pipeline_notebook_path()
+                assert result == "/Workspace/Shared/apps/bricktrace/notebooks/run_pipeline"
+
+    def test_users_prefix_normalized_to_workspace(self):
+        """/Users/... prefix is normalized to /Workspace/Users/..."""
+        import backend.build_service as bs
+
+        mock_app = MagicMock()
+        mock_app.default_source_code_path = "/Users/me@db.com/bricktrace"
+        mock_app.source_code_path = None
+        mock_app.active_deployment = None
+        mock_app.pending_deployment = None
+
+        with patch.dict(os.environ, {"DATABRICKS_APP_NAME": "bt"}, clear=False):
+            os.environ.pop("PIPELINE_NOTEBOOK_PATH", None)
+            with patch("backend.build_service._get_client") as mock_client:
+                mock_client.return_value.apps.get.return_value = mock_app
+                bs._reset_pipeline_notebook_path_cache()
+                result = bs.get_pipeline_notebook_path()
+                assert result == "/Workspace/Users/me@db.com/bricktrace/notebooks/run_pipeline"
+
+    def test_shared_prefix_normalized_to_workspace(self):
+        """/Shared/... prefix is normalized to /Workspace/Shared/..."""
+        import backend.build_service as bs
+
+        mock_app = MagicMock()
+        mock_app.default_source_code_path = "/Shared/team/bricktrace"
+        mock_app.source_code_path = None
+        mock_app.active_deployment = None
+        mock_app.pending_deployment = None
+
+        with patch.dict(os.environ, {"DATABRICKS_APP_NAME": "bt"}, clear=False):
+            os.environ.pop("PIPELINE_NOTEBOOK_PATH", None)
+            with patch("backend.build_service._get_client") as mock_client:
+                mock_client.return_value.apps.get.return_value = mock_app
+                bs._reset_pipeline_notebook_path_cache()
+                result = bs.get_pipeline_notebook_path()
+                assert result == "/Workspace/Shared/team/bricktrace/notebooks/run_pipeline"
+
+    def test_discovery_failure_returns_empty(self):
+        """If apps.get raises, return empty (fail closed, non-fatal)."""
+        import backend.build_service as bs
+
+        with patch.dict(os.environ, {"DATABRICKS_APP_NAME": "bt"}, clear=False):
+            os.environ.pop("PIPELINE_NOTEBOOK_PATH", None)
+            with patch("backend.build_service._get_client") as mock_client:
+                mock_client.return_value.apps.get.side_effect = Exception("API error")
+                bs._reset_pipeline_notebook_path_cache()
+                assert bs.get_pipeline_notebook_path() == ""
+
+    def test_env_takes_precedence_over_app_discovery(self):
+        """Env var wins even when DATABRICKS_APP_NAME is set."""
+        import backend.build_service as bs
+
+        with patch.dict(os.environ, {
+            "PIPELINE_NOTEBOOK_PATH": "/Workspace/explicit/path",
+            "DATABRICKS_APP_NAME": "bt",
+        }, clear=False):
+            bs._reset_pipeline_notebook_path_cache()
+            assert bs.get_pipeline_notebook_path() == "/Workspace/explicit/path"
 
 
 # ---------------------------------------------------------------------------
@@ -76,14 +218,14 @@ class TestPerTableBuildLock:
     @pytest.fixture(autouse=True)
     def _reload_build_service(self):
         """Ensure clean state for each test."""
+        import backend.build_service as bs
         with patch.dict(os.environ, {"PIPELINE_NOTEBOOK_PATH": "/Workspace/test/nb"}):
-            import importlib
-            import backend.build_service as bs
-            importlib.reload(bs)
+            bs._reset_pipeline_notebook_path_cache()
             # Clear any leftover locks
             bs._build_locks.clear()
             self.bs = bs
             yield
+            bs._reset_pipeline_notebook_path_cache()
 
     def test_lock_registered_on_submit(self):
         """After successful submit, the FQN is registered in _build_locks."""

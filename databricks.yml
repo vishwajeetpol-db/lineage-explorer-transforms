@@ -147,8 +147,9 @@ targets:
               - name: LINEAGE_SCHEMA
                 value: ${var.lineage_schema}
               # Portable path to the deployed run_pipeline notebook — workspace.file_path
-              # auto-resolves per-user, so this is team-safe and never empty (an empty
-              # value here previously broke the Apps config update).
+              # auto-resolves per-user, so this is team-safe and never empty.
+              # If this env var is unset/empty at runtime, the backend will fall back to
+              # discovering the path from the App's source_code_path (apps.get API).
               - name: PIPELINE_NOTEBOOK_PATH
                 value: ${workspace.file_path}/notebooks/run_pipeline
               - name: CAPTURED_PLANS_TABLE

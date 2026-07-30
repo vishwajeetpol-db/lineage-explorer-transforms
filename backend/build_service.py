@@ -30,39 +30,144 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 LINEAGE_CATALOG = os.environ.get("LINEAGE_CATALOG", "lattice_lineage")
 LINEAGE_SCHEMA = os.environ.get("LINEAGE_SCHEMA", "lineage")
-# If PIPELINE_NOTEBOOK_PATH is set, use it directly.
-# Otherwise, derive from the app's own deployed location (notebooks/run_pipeline).
-_raw_notebook_path = os.environ.get("PIPELINE_NOTEBOOK_PATH", "")
+# ---------------------------------------------------------------------------
+# Pipeline notebook path resolution (A7 FIX)
+#
+# Resolution order:
+#   a) PIPELINE_NOTEBOOK_PATH env var (strip whitespace; empty/whitespace = unset)
+#   b) If unset AND DATABRICKS_APP_NAME is set: call apps.get to discover the
+#      deployed source_code_path, normalize /Users or /Shared → /Workspace/...,
+#      then append /notebooks/run_pipeline
+#   c) Else return "" — callers must check is_build_configured() and fail closed
+#
+# A7 rule: NEVER derive from __file__ — container paths are meaningless.
+# ---------------------------------------------------------------------------
+_pipeline_notebook_path_cache: str | None = None  # lazy cache (None = not yet resolved)
+_pipeline_path_lock = threading.Lock()
 
 
-def _derive_pipeline_notebook_path() -> str:
-    """Return the configured pipeline notebook path.
+def _normalize_workspace_path(path: str) -> str:
+    """Ensure a path starts with /Workspace.
 
-    A7 FIX: No longer derives from __file__ — in a Databricks App container,
-    __file__ resolves to container paths (e.g. /app/backend/build_service.py),
-    and prefixing /Workspace produces nonsense paths that fail on submission.
-
-    Now: require PIPELINE_NOTEBOOK_PATH to be explicitly set. If not set,
-    return empty string — callers must check is_build_configured() and fail
-    closed with a clear error message.
+    Databricks Apps may report source_code_path as /Users/... or /Shared/...
+    (workspace-relative) — prepend /Workspace so it resolves for job submission.
     """
-    if _raw_notebook_path:
-        # Validate that it looks like a workspace path
-        if not _raw_notebook_path.startswith("/Workspace"):
-            logger.warning(
-                f"PIPELINE_NOTEBOOK_PATH does not start with /Workspace: {_raw_notebook_path}. "
-                "This may fail when submitting jobs."
+    path = path.rstrip("/")
+    if path.startswith("/Workspace"):
+        return path
+    if path.startswith("/Users") or path.startswith("/Shared") or path.startswith("/Repos"):
+        return f"/Workspace{path}"
+    # Already absolute or unknown prefix — return as-is with a warning
+    if not path.startswith("/"):
+        logger.warning(f"source_code_path is not absolute: {path}")
+    return path
+
+
+def _discover_from_app_source() -> str:
+    """Discover notebook path from the App's deployed source_code_path.
+
+    Calls apps.get(DATABRICKS_APP_NAME) and walks common attribute locations
+    for the source root. Returns "" if discovery fails (non-fatal).
+    """
+    app_name = os.environ.get("DATABRICKS_APP_NAME", "").strip()
+    if not app_name:
+        return ""
+    try:
+        client = _get_client()
+        app_info = client.apps.get(app_name)
+
+        # Try multiple paths the SDK may expose the source root
+        source_root = None
+        for attr in (
+            "default_source_code_path",
+            "source_code_path",
+        ):
+            val = getattr(app_info, attr, None)
+            if val:
+                source_root = val
+                break
+
+        # Check active/pending deployment
+        if not source_root:
+            for deploy_attr in ("active_deployment", "pending_deployment"):
+                deploy = getattr(app_info, deploy_attr, None)
+                if deploy:
+                    val = getattr(deploy, "source_code_path", None)
+                    if val:
+                        source_root = val
+                        break
+
+        if not source_root:
+            logger.info(
+                f"App '{app_name}' found but no source_code_path in response. "
+                "Set PIPELINE_NOTEBOOK_PATH explicitly."
             )
-        return _raw_notebook_path
-    # A7 FIX: Do NOT try to derive — fail closed instead of producing bad paths
-    logger.info(
-        "PIPELINE_NOTEBOOK_PATH not set. Transform build will be unavailable. "
-        "Set it in databricks.yml env section to enable builds."
-    )
-    return ""
+            return ""
+
+        normalized = _normalize_workspace_path(source_root)
+        notebook_path = f"{normalized}/notebooks/run_pipeline"
+        logger.info(f"Discovered pipeline notebook path from App source: {notebook_path}")
+        return notebook_path
+
+    except Exception as e:
+        logger.warning(
+            f"Failed to discover pipeline path from App '{app_name}': {e}. "
+            "Set PIPELINE_NOTEBOOK_PATH explicitly to enable builds."
+        )
+        return ""
 
 
-PIPELINE_NOTEBOOK_PATH = _derive_pipeline_notebook_path()
+def get_pipeline_notebook_path() -> str:
+    """Return the resolved pipeline notebook path (lazy-cached).
+
+    Resolution order:
+      a) PIPELINE_NOTEBOOK_PATH env (strip whitespace; empty = unset)
+      b) App source discovery (if DATABRICKS_APP_NAME is set)
+      c) "" — fail closed
+    """
+    global _pipeline_notebook_path_cache
+    if _pipeline_notebook_path_cache is not None:
+        return _pipeline_notebook_path_cache
+
+    with _pipeline_path_lock:
+        # Double-check after acquiring lock
+        if _pipeline_notebook_path_cache is not None:
+            return _pipeline_notebook_path_cache
+
+        # (a) Env var — strip whitespace; whitespace-only = unset
+        raw = os.environ.get("PIPELINE_NOTEBOOK_PATH", "").strip()
+        if raw:
+            if not raw.startswith("/Workspace"):
+                logger.warning(
+                    f"PIPELINE_NOTEBOOK_PATH does not start with /Workspace: {raw}. "
+                    "This may fail when submitting jobs."
+                )
+            _pipeline_notebook_path_cache = raw
+            return _pipeline_notebook_path_cache
+
+        # (b) Discover from App source
+        discovered = _discover_from_app_source()
+        if discovered:
+            _pipeline_notebook_path_cache = discovered
+            return _pipeline_notebook_path_cache
+
+        # (c) Fail closed
+        logger.info(
+            "PIPELINE_NOTEBOOK_PATH not set and App source discovery unavailable. "
+            "Transform build will be unavailable. "
+            "Set it in databricks.yml env section to enable builds."
+        )
+        _pipeline_notebook_path_cache = ""
+        return _pipeline_notebook_path_cache
+
+
+def _reset_pipeline_notebook_path_cache() -> None:
+    """Reset the lazy cache — for tests only."""
+    global _pipeline_notebook_path_cache
+    with _pipeline_path_lock:
+        _pipeline_notebook_path_cache = None
+
+
 WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 
 # Build pipeline step names (for progress UI)
@@ -117,7 +222,8 @@ def submit_build_job(
     Returns the run_id as a string.
     Raises RuntimeError if PIPELINE_NOTEBOOK_PATH is not configured.
     """
-    if not PIPELINE_NOTEBOOK_PATH:
+    notebook_path = get_pipeline_notebook_path()
+    if not notebook_path:
         raise RuntimeError(
             "PIPELINE_NOTEBOOK_PATH is not configured. Set it in databricks.yml "
             "(env section) to the workspace path of the run_all notebook."
