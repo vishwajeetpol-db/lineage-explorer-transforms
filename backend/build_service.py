@@ -253,7 +253,7 @@ def submit_build_job(
         "tasks": [{
             "task_key": "build_lineage",
             "notebook_task": {
-                "notebook_path": PIPELINE_NOTEBOOK_PATH,
+                "notebook_path": notebook_path,
                 "source": "WORKSPACE",
                 "base_parameters": {
                     # Option A — single dedicated, app-SP-owned lineage store.
@@ -390,4 +390,4 @@ def get_build_status(run_id: str) -> BuildJobStatus:
 
 def is_build_configured() -> bool:
     """Check if the build pipeline notebook path is configured."""
-    return bool(PIPELINE_NOTEBOOK_PATH)
+    return bool(get_pipeline_notebook_path())
