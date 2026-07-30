@@ -6,6 +6,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Tests & tooling
+
+- **Backend test coverage raised to a 90%+ gate.** Coverage went from ~38% (with 210 failing tests) to **90.5%** across `backend/` with **0 failing** (1,423 tests). Added `.coveragerc` (`fail_under = 90`, branch mode, scoped to `backend/`, omitting the standalone offline pipeline `transformation_lineage/` + `backend/plan_capture/` capture-cell wheel + `startup.py`/`perf_patches.py` bootstrap). Run: `pytest tests/ -m "not integration" --cov=backend --cov-fail-under=90`.
+- **New unit tests** for every previously-thin module: all `server/*` engines (access, governance, discovery, entities, scd_lineage, column_profiling, schema_change, root_cause, ml, analysis_store, llm) at 97–100%; `lineage_service` (92% isolated), `producer_source` (97%), `transform_service` (92%), `capability_cache`, `observability`, `edge_case_guards`, `cache_service`, `feature_flags`, `federated_sync`, `circuit_breaker`, `validators`, `parallel`; and deep route tests for impact, glossary, dq, ml, diagnostics, snapshots, openlineage, external_sources, pipeline_installer, notifications, scalability, root_cause, plus main.py routes/internals.
+- **Fixed 42 pre-existing broken tests** (stale `_execute_sql`/`_sql` mock targets, out-of-date response-shape and endpoint-param assertions, admin-gate expectations) and a **suite-isolation defect**: the process-wide FastAPI app's rate-limiter buckets + auth cache + lineage LRU/cost globals leaked across tests, causing order-dependent 429s (the main cause of the original mass failure). A `conftest.py` autouse fixture now resets them before/after each test.
+- **Frontend test harness scaffolded** (Vitest + React Testing Library + jsdom + v8 coverage): `frontend/vitest.config.ts` (90% thresholds, graph/canvas rendering layer excluded), `src/test/setup.ts`, and `test`/`coverage` npm scripts. Frontend test-writing to 90% is in progress.
+
+### Fixed
+
+- **`build_service.py` runtime crash after the notebook-path refactor** — `submit_build_job` and `is_build_configured` still referenced the removed module-level `PIPELINE_NOTEBOOK_PATH` constant (`NameError` on build submit). Both now use `get_pipeline_notebook_path()` / the resolved local path.
+
+---
+
 ## [2.6.0] - 2026-07-29
 
 > **Operational lineage — cached capability panels, node-level run health, and multi-producer transformation comparison.** The Table Lineage workspace gets a persistent per-table cache with refresh + admin eviction, every job/pipeline node gains a run-health check with per-run cost, and tables written by more than one producer can be compared column-by-column to catch divergent logic. Plus fixes that make the LLM Column Transformation path work on modern (glob/file) pipelines and clearly explain permission gaps.

@@ -44,3 +44,4 @@ generate_stress_test.py
 # Databricks local state
 .databricks/
 .claude/
+frontend/coverage/

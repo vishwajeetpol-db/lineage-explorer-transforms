@@ -195,6 +195,23 @@ The full reference lives in **[docs/REFERENCE.md](docs/REFERENCE.md)**:
 | Multi-producer comparison | `producer_source.compare_producers()` + `POST /api/column-transformations/compare-producers`; `ProducerCompareMatrix` in `ColumnTransformationPanel.tsx`. |
 | Product one-pager | [`docs/BrickTrace_Product_Overview.pdf`](docs/BrickTrace_Product_Overview.pdf) — sales-oriented capabilities overview. |
 
+## Testing
+
+The backend suite enforces a **≥90% line+branch coverage gate** (currently ~90.5%, 1,400+ tests, all mocked — no live workspace needed). Use a Python 3.11+ venv (the app uses `str | None` unions):
+
+```bash
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt pytest-cov
+
+# Run the suite (skip integration tests that need a live workspace)
+pytest tests/ -m "not integration"
+
+# Enforce the coverage gate
+pytest tests/ -m "not integration" --cov=backend --cov-fail-under=90 --cov-report=term-missing
+```
+
+Gate config lives in `.coveragerc`. The frontend uses **Vitest + React Testing Library** (`cd frontend && npm test` / `npm run coverage`). See [docs/testing_plan_for_Combined_App.md](docs/testing_plan_for_Combined_App.md) for the full plan and per-module coverage notes.
+
 ## Tech stack
 
 FastAPI + Uvicorn (single process, 64-thread pool) · Databricks SDK + DBSQL over UC system tables · React + TypeScript + React Flow + ELK.js (layout in a Web Worker) · deployed via Databricks Asset Bundles.
