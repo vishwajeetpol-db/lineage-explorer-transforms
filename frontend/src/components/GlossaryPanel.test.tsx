@@ -88,4 +88,45 @@ describe("GlossaryPanel", () => {
     render(<GlossaryPanel />);
     expect(await screen.findByText(/No terms found/)).toBeInTheDocument();
   });
+
+  it("searches terms on Enter", async () => {
+    const fetchMock = fullFetch();
+    global.fetch = fetchMock as any;
+    const user = userEvent.setup();
+    render(<GlossaryPanel />);
+    await screen.findByText("Revenue");
+    const search = screen.getByPlaceholderText("Search terms...");
+    await user.type(search, "rev{Enter}");
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("q=rev"))).toBe(true);
+    });
+  });
+
+  it("edits all add-term form fields", async () => {
+    global.fetch = fullFetch() as any;
+    const user = userEvent.setup();
+    render(<GlossaryPanel />);
+    await screen.findByText("Revenue");
+    await user.click(screen.getByText("+ Add Term"));
+    await user.type(screen.getByPlaceholderText("Term name"), "N");
+    await user.type(screen.getByPlaceholderText("Domain"), "D");
+    await user.type(screen.getByPlaceholderText("Owner"), "O");
+    await user.type(screen.getByPlaceholderText("Definition"), "def");
+    await user.selectOptions(screen.getByRole("combobox"), "approved");
+    expect((screen.getByPlaceholderText("Term name") as HTMLInputElement).value).toBe("N");
+    // toggle form closed via Cancel
+    await user.click(screen.getByText("Cancel"));
+    expect(screen.queryByPlaceholderText("Term name")).not.toBeInTheDocument();
+  });
+
+  it("shows empty domains and kpis states", async () => {
+    global.fetch = fullFetch({ "glossary/domains": { domains: [] }, "glossary/kpis": { kpis: [] } }) as any;
+    const user = userEvent.setup();
+    render(<GlossaryPanel />);
+    await screen.findByText("Revenue");
+    await user.click(screen.getByText("Domains"));
+    expect(await screen.findByText("No domains defined yet.")).toBeInTheDocument();
+    await user.click(screen.getByText("KPIs"));
+    expect(await screen.findByText("No KPIs defined yet.")).toBeInTheDocument();
+  });
 });

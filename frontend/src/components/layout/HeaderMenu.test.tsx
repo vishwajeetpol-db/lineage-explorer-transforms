@@ -79,11 +79,14 @@ describe("HeaderMenu", () => {
     expect(screen.queryByText("Admin Dashboard")).not.toBeInTheDocument();
   });
 
-  it("shows admin link when isAdmin", async () => {
+  it("shows admin link when isAdmin and closes menu on click", async () => {
     useLineageStore.setState({ isAdmin: true });
     const user = userEvent.setup();
     render(<HeaderMenu variant="floating" />);
     await user.click(screen.getByLabelText("Open menu"));
-    expect(screen.getByText("Admin Dashboard")).toBeInTheDocument();
+    const adminLink = screen.getByText("Admin Dashboard");
+    expect(adminLink).toBeInTheDocument();
+    await user.click(adminLink);
+    expect(screen.queryByText("Browse catalogs")).not.toBeInTheDocument();
   });
 });

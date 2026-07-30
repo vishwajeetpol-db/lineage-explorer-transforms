@@ -30,6 +30,31 @@ describe("RootCauseWizard", () => {
     expect(screen.getByText("Analyze Root Cause")).toBeDisabled();
   });
 
+  it("enables analyze after filling every field", async () => {
+    const user = userEvent.setup();
+    render(<RootCauseWizard />);
+    await user.type(screen.getByPlaceholderText("my_catalog"), "c");
+    await user.type(screen.getByPlaceholderText("my_schema"), "s");
+    await user.type(screen.getByPlaceholderText("affected_table"), "t");
+    await user.type(screen.getByPlaceholderText("affected_column"), "col");
+    expect(screen.getByText("Analyze Root Cause")).not.toBeDisabled();
+  });
+
+  it("renders low and medium score colors", async () => {
+    global.fetch = mockFetch({
+      summary: "", upstream_path: [], timeline: [],
+      candidates: [
+        { candidate_table: "a", candidate_column: "", hop_distance: 1, score: 0.6, evidence: [] },
+        { candidate_table: "b", candidate_column: "x", hop_distance: 3, score: 0.2, evidence: [] },
+      ],
+    }) as any;
+    const user = userEvent.setup();
+    render(<RootCauseWizard catalog="c" schema="s" table="t" column="col" />);
+    await user.click(screen.getByText("Analyze Root Cause"));
+    expect(await screen.findByText("60%")).toBeInTheDocument();
+    expect(screen.getByText("20%")).toBeInTheDocument();
+  });
+
   it("runs analysis and shows candidates", async () => {
     global.fetch = mockFetch(withCandidates) as any;
     const user = userEvent.setup();
