@@ -98,4 +98,55 @@ describe("ColumnTransformationPanel", () => {
     render(<ColumnTransformationPanel table={TABLE} />);
     expect(await screen.findByText(/boom|failed/i)).toBeInTheDocument();
   });
+
+  it("renders version history and views a version", async () => {
+    (api.listColumnTransformationVersions as any).mockResolvedValue({
+      versions: [
+        { ref: "llm:2", source: "llm", label: "LLM v2", analyzed_at: "2026-07-02T00:00:00Z" },
+        { ref: "plan_capture:1", source: "plan_capture", label: "Captured plan v1", analyzed_at: "2026-07-01T00:00:00Z" },
+      ],
+    });
+    (api.getTransformationVersion as any).mockResolvedValue({
+      ref: "llm:2", label: "LLM v2", columns: [
+        { target_column: "status", source_columns: ["raw"], expression: "UPPER(raw)" },
+      ],
+    });
+    const user = userEvent.setup();
+    render(<ColumnTransformationPanel table={TABLE} />);
+    // "Version history (2)" header confirms the list rendered.
+    expect(await screen.findByText(/version history/i)).toBeInTheDocument();
+    // Click the history-row entry (first "LLM v2" occurrence) to view it.
+    await user.click((await screen.findAllByText("LLM v2"))[0]);
+    await waitFor(() => expect(api.getTransformationVersion).toHaveBeenCalled());
+  });
+
+  it("shows the cross-version compare controls when 2+ versions exist", async () => {
+    (api.listColumnTransformationVersions as any).mockResolvedValue({
+      versions: [
+        { ref: "llm:2", source: "llm", label: "LLM v2", analyzed_at: "2026-07-02T00:00:00Z" },
+        { ref: "plan_capture:1", source: "plan_capture", label: "Captured plan v1", analyzed_at: "2026-07-01T00:00:00Z" },
+      ],
+    });
+    render(<ColumnTransformationPanel table={TABLE} />);
+    // Version history + the compare "from…/to…" dropdowns render (allVersions>1 branch).
+    expect(await screen.findByText(/version history/i)).toBeInTheDocument();
+    const selects = screen.getAllByRole("combobox");
+    // model dropdown + 2 compare selects
+    expect(selects.length).toBeGreaterThanOrEqual(3);
+    expect(screen.getByText(/diff/i)).toBeInTheDocument();
+  });
+
+  it("re-analyzes with the LLM when a producer is entered", async () => {
+    const user = userEvent.setup();
+    render(<ColumnTransformationPanel table={TABLE} />);
+    await screen.findAllByText("amount_usd");
+    // type an entity id then click the analyze button
+    const idInput = screen.getByPlaceholderText(/entity id/i);
+    await user.type(idInput, "job-123");
+    const btn = screen.getByRole("button", { name: /analyze with llm|re-analyze/i });
+    await user.click(btn);
+    await waitFor(() =>
+      expect((api.resolveColumnTransformations as any).mock.calls.some((c: any[]) => c[0]?.force_rerun)).toBe(true),
+    );
+  });
 });
