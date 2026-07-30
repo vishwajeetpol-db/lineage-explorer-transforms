@@ -137,6 +137,18 @@ Notes for maintainers:
 - Tests are hermetic: `conftest.py` has an autouse fixture that resets the FastAPI app's rate-limiter buckets, the user-info auth cache, and the `lineage_service` LRU + cost globals before/after each test (prevents order-dependent 429s and cache-served fetch paths that would otherwise deflate coverage).
 - Everything is mocked (`_get_client`, per-module `_execute_sql`/`_sql`, service functions) — no live workspace, no network.
 
+## 1e. Frontend coverage gate (Vitest, ≥90%)
+
+The frontend has a **Vitest + React Testing Library** suite with a coverage gate: **97% lines / 96% statements / 95% functions / 87% branches** (554 tests, all passing). Thresholds in `frontend/vitest.config.ts` (lines/statements/functions 90, branches 85). Run:
+
+```bash
+cd frontend
+npm test           # vitest run
+npm run coverage   # vitest run --coverage (enforces the thresholds)
+```
+
+Excluded from the frontend denominator (documented in `vitest.config.ts`): the graph/canvas rendering layer (React Flow + ELK: `components/graph/**`, `transform/TransformCanvas|Node|Edge`, `lib/elkLayout.ts`), the `App.tsx` shell (wiring around the excluded canvas; its logic is covered via the unit-tested stores/hooks/panels), the dead `LLMTransformPanel.tsx`, `main.tsx`, and type/barrel files. Setup shims (localStorage, matchMedia, ResizeObserver, pointer-capture, scrollIntoView) live in `src/test/setup.ts`.
+
 ## 2. Frontend checks
 
 * `useFeatureFlagStore` — `updateFlagEnabled` only mutates the targeted flag's
