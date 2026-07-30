@@ -54,16 +54,20 @@ class TestBIConsumers:
                 # Field is bi_tool (from client_application alias), NOT tool_type
                 assert "bi_tool" in data["bi_consumers"][0]
 
-    def test_sql_error_returns_empty_with_note(self, app_client):
-        """A10: SQL failure returns {bi_consumers: [], note: ...} not 500.
-        This silent failure masks grant issues (system.query missing)."""
+    def test_sql_error_returns_empty_with_availability_flag(self, app_client):
+        """A10: SQL failure returns {bi_consumers: [], available: false, error: ...}
+        with a 200 — the grant/infra issue is signalled via `available`/`error`
+        rather than surfaced as a 500 (documents the swallowed-failure behavior,
+        now at least flagged instead of a silent empty)."""
         with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
             mock_sql.side_effect = RuntimeError("system.query not accessible")
             resp = app_client.get("/api/lineage/bi-consumers", params={"catalog": "main"})
             assert resp.status_code == 200
             data = resp.json()
             assert data["bi_consumers"] == []
-            assert "note" in data  # Error swallowed into note field
+            # Failure is signalled explicitly, not silently swallowed.
+            assert data["available"] is False
+            assert "error" in data
 
     def test_sql_injection_in_catalog_param(self, app_client):
         """A1: catalog is interpolated into LIKE clause without parameterization.
@@ -264,26 +268,32 @@ class TestWebhooks:
 class TestAutoCapture:
     """POST /api/snapshots/auto-capture endpoint.
 
-    A2: This endpoint is NOT admin-gated (bug) — any App opener can trigger.
-    Validates current ungated behavior and documents the vulnerability.
+    A2 FIX: This endpoint is now admin-gated — a non-admin cannot trigger the
+    expensive scan (403). Only an admin reaches the SQL path.
     """
 
-    def test_auto_capture_runs_without_auth(self, app_client):
-        """A2 BUG: auto-capture is ungated — any user can trigger expensive scans."""
+    def test_auto_capture_rejects_non_admin(self, non_admin_client):
+        """A2 FIX: auto-capture is admin-gated — non-admin gets 403."""
         with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
             mock_sql.return_value = []
-            resp = app_client.post("/api/snapshots/auto-capture")
-            # Currently 200 (ungated) — should be 403 after fix
+            resp = non_admin_client.post("/api/snapshots/auto-capture")
+            assert resp.status_code == 403
+
+    def test_auto_capture_admin_succeeds(self, admin_client):
+        """Admin can trigger auto-capture and gets the status/captured payload."""
+        with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = admin_client.post("/api/snapshots/auto-capture")
             assert resp.status_code == 200
             data = resp.json()
             assert "status" in data
             assert "captured" in data
 
-    def test_auto_capture_handles_sql_failure(self, app_client):
-        """C8: Warehouse failure should return 500 not hang."""
+    def test_auto_capture_handles_sql_failure(self, admin_client):
+        """C8: For an admin, a warehouse failure surfaces as 500, not a hang."""
         with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
             mock_sql.side_effect = RuntimeError("Warehouse stopped")
-            resp = app_client.post("/api/snapshots/auto-capture")
+            resp = admin_client.post("/api/snapshots/auto-capture")
             assert resp.status_code == 500
 
 
@@ -331,21 +341,34 @@ class TestSnapshotTimeline:
 class TestRecordDQMetrics:
     """POST /api/dq-rules/record-metrics endpoint.
 
-    A2: This endpoint is NOT admin-gated (bug).
+    A2 FIX: This endpoint is now admin-gated.
     """
 
-    def test_record_metrics_ungated(self, app_client):
-        """A2 BUG: record-metrics is ungated — any user can write to DQ history."""
+    def test_record_metrics_rejects_non_admin(self, non_admin_client):
+        """A2 FIX: record-metrics is admin-gated — a non-admin cannot write to
+        the DQ history table (403)."""
         with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
             mock_sql.return_value = []
-            resp = app_client.post("/api/dq-rules/record-metrics", json={
+            resp = non_admin_client.post("/api/dq-rules/record-metrics", json={
                 "table_fqn": "main.default.orders",
                 "quality_score": 0.95,
                 "rules_evaluated": 10,
                 "rules_passed": 9,
                 "rules_failed": 1,
             })
-            # Currently 200 (ungated) — should be 403 after fix
+            assert resp.status_code == 403
+
+    def test_record_metrics_admin_succeeds(self, admin_client):
+        """Admin can record DQ metrics."""
+        with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = admin_client.post("/api/dq-rules/record-metrics", json={
+                "table_fqn": "main.default.orders",
+                "quality_score": 0.95,
+                "rules_evaluated": 10,
+                "rules_passed": 9,
+                "rules_failed": 1,
+            })
             assert resp.status_code == 200
 
 

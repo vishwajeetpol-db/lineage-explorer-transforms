@@ -36,7 +36,7 @@ class TestCacheGetFallback:
     def test_get_returns_none_on_sql_error(self):
         from backend.cache_service import get_cache_service
         svc = get_cache_service()
-        with patch.object(svc, "_execute_sql", side_effect=RuntimeError("no warehouse")):
+        with patch.object(svc, "_sql", side_effect=RuntimeError("no warehouse")):
             result = svc.get("test_key", namespace="lineage")
             assert result is None
 
@@ -52,7 +52,7 @@ class TestCacheGetFallback:
         """C8: SQL timeout should not propagate."""
         from backend.cache_service import get_cache_service
         svc = get_cache_service()
-        with patch.object(svc, "_execute_sql", side_effect=TimeoutError("50s exceeded")):
+        with patch.object(svc, "_sql", side_effect=TimeoutError("50s exceeded")):
             result = svc.get("timeout_key", namespace="lineage")
             assert result is None
 
@@ -63,7 +63,7 @@ class TestCacheSetFallback:
     def test_set_does_not_raise_on_error(self):
         from backend.cache_service import get_cache_service
         svc = get_cache_service()
-        with patch.object(svc, "_execute_sql", side_effect=RuntimeError("no warehouse")):
+        with patch.object(svc, "_sql", side_effect=RuntimeError("no warehouse")):
             # Should not raise
             svc.set("test_key", {"data": "value"}, namespace="lineage", ttl_seconds=3600)
 
@@ -71,7 +71,7 @@ class TestCacheSetFallback:
         from backend.cache_service import get_cache_service, MAX_VALUE_BYTES
         svc = get_cache_service()
         oversized = "x" * (MAX_VALUE_BYTES + 1)
-        with patch.object(svc, "_execute_sql") as mock_sql:
+        with patch.object(svc, "_sql") as mock_sql:
             svc.set("big_key", oversized, namespace="test", ttl_seconds=3600)
             # Should either not call SQL (skip) or handle gracefully
 
@@ -159,7 +159,7 @@ class TestColdCacheRestart:
         """C14: After invalidate_cache, all gets return None."""
         from backend.cache_service import get_cache_service
         svc = get_cache_service()
-        with patch.object(svc, "_execute_sql", return_value=[]):
+        with patch.object(svc, "_sql", return_value=[]):
             # Post-invalidation: nothing cached
             result = svc.get("previously_cached_key", namespace="lineage")
             assert result is None

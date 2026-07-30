@@ -25,28 +25,18 @@ class TestOLBridgeRegister:
         resp = app_client.post("/api/external/ol-bridge/register")
         assert resp.status_code == 422
 
-    def test_register_ungated_vulnerability(self, app_client):
-        """A15/A2 BUG: Any user can register — no admin check.
-        After fix, this should return 403 for non-admin."""
+    def test_register_now_admin_gated(self, app_client):
+        """A15/A2 FIX: Registration is now admin-gated — a non-admin request
+        is rejected with 403 (a leaked source_id = lineage injection, so the
+        trust anchor must be admin-only)."""
         with patch("backend.routes.external_sources._execute_sql") as mock_sql:
             mock_sql.return_value = []
             resp = app_client.post("/api/external/ol-bridge/register", json={
                 "platform": "snowflake",
-                "display_name": "Snowflake Prod",
+                "name": "Snowflake Prod",
                 "description": "Snowflake Horizon lineage",
             })
-            # BUG: Currently 200 (ungated) — should be 403 after fix
-            assert resp.status_code in (200, 201, 403)
-            if resp.status_code in (200, 201):
-                data = resp.json()
-                # A15: source_id is the ONLY auth for ingest — leaked = lineage injection
-                assert "source_id" in data
-                # Verify it's a UUID (predictable format)
-                import uuid
-                try:
-                    uuid.UUID(data["source_id"])
-                except ValueError:
-                    pass  # Non-UUID is slightly better
+            assert resp.status_code == 403
 
     def test_register_with_admin_succeeds(self, admin_client):
         """Admin can register external sources."""
@@ -54,12 +44,16 @@ class TestOLBridgeRegister:
             mock_sql.return_value = []
             resp = admin_client.post("/api/external/ol-bridge/register", json={
                 "platform": "dbt",
-                "display_name": "dbt Cloud",
+                "name": "dbt Cloud",
                 "description": "dbt lineage events",
             })
             assert resp.status_code in (200, 201)
             data = resp.json()
+            # A15: source_id is the ONLY auth for ingest — leaked = lineage injection.
             assert "source_id" in data
+            # Verify it's a UUID (predictable format — documents the weakness).
+            import uuid
+            uuid.UUID(data["source_id"])
 
 
 class TestOLBridgeIngest:
@@ -69,10 +63,17 @@ class TestOLBridgeIngest:
     No HMAC, no secret, no token rotation. Leaked/guessed UUID = fake lineage.
     """
 
+    # A valid UUID that also passes the ingest route's _UUID_RE check.
+    _VALID_UUID = "12345678-1234-1234-1234-123456789abc"
+
     def test_ingest_valid_event(self, app_client):
+        """Ingest succeeds only for a well-formed UUID that maps to a known,
+        active source. Mock the source-existence SELECT to return a row."""
         with patch("backend.routes.external_sources._execute_sql") as mock_sql:
-            mock_sql.return_value = []
-            resp = app_client.post("/api/external/ol-bridge/ingest/test-source-123", json={
+            # First meaningful call is the source lookup — return an active row
+            # so ingest proceeds (CREATE/INSERT/UPDATE ignore the return value).
+            mock_sql.return_value = [{"platform": "snowflake", "name": "Snowflake Prod"}]
+            resp = app_client.post(f"/api/external/ol-bridge/ingest/{self._VALID_UUID}", json={
                 "eventType": "COMPLETE",
                 "eventTime": "2026-07-20T12:00:00Z",
                 "run": {"runId": "run-1"},
@@ -82,11 +83,13 @@ class TestOLBridgeIngest:
             })
             assert resp.status_code == 200
 
-    def test_ingest_with_guessed_uuid(self, app_client):
-        """A15 BUG: Any UUID in the path is accepted — no source_id validation.
-        After fix, non-existent source_id should return 404."""
+    def test_ingest_with_guessed_uuid_rejected(self, app_client):
+        """A15 FIX: A well-formed but unregistered UUID is rejected. The source
+        lookup returns no row, so ingest fails with 403 (not 200) — a guessed
+        UUID can no longer inject lineage. The 403 (not 404) also avoids
+        confirming whether the UUID exists (enumeration protection)."""
         with patch("backend.routes.external_sources._execute_sql") as mock_sql:
-            mock_sql.return_value = []
+            mock_sql.return_value = []  # source not found
             resp = app_client.post("/api/external/ol-bridge/ingest/00000000-0000-0000-0000-000000000000", json={
                 "eventType": "COMPLETE",
                 "eventTime": "2026-07-20T12:00:00Z",
@@ -95,16 +98,16 @@ class TestOLBridgeIngest:
                 "inputs": [{"namespace": "attacker", "name": "poisoned_data"}],
                 "outputs": [{"namespace": "victim", "name": "prod.gold.revenue"}],
             })
-            # BUG: Currently 200 (accepts any UUID) — should be 404 after fix
-            assert resp.status_code in (200, 404)
+            assert resp.status_code == 403
 
-    def test_ingest_no_hmac_validation(self, app_client):
-        """A15 BUG: No HMAC or secret verification on ingest payload.
-        Attacker knowing source_id can inject arbitrary lineage events."""
+    def test_ingest_no_hmac_still_only_uuid_auth(self, app_client):
+        """A15: Ingest auth is still ONLY the path UUID — there is no HMAC or
+        payload signature. A caller that KNOWS a valid, registered source_id can
+        inject arbitrary lineage. Documents the remaining weakness: with a
+        known-good source row, the malicious payload is accepted (200)."""
         with patch("backend.routes.external_sources._execute_sql") as mock_sql:
-            mock_sql.return_value = []
-            # Inject fake lineage claiming prod table comes from attacker namespace
-            resp = app_client.post("/api/external/ol-bridge/ingest/leaked-source-id", json={
+            mock_sql.return_value = [{"platform": "databricks", "name": "leaked"}]
+            resp = app_client.post(f"/api/external/ol-bridge/ingest/{self._VALID_UUID}", json={
                 "eventType": "COMPLETE",
                 "eventTime": "2026-07-20T12:00:00Z",
                 "run": {"runId": "injected-run"},
@@ -112,23 +115,27 @@ class TestOLBridgeIngest:
                 "inputs": [{"namespace": "malicious", "name": "compromised.source"}],
                 "outputs": [{"namespace": "databricks", "name": "prod.gold.revenue"}],
             })
-            # Accepted without verification
-            assert resp.status_code in (200, 401, 403)
+            # No HMAC check — a known source_id is sufficient to inject.
+            assert resp.status_code == 200
 
     def test_ingest_batch_events(self, app_client):
         with patch("backend.routes.external_sources._execute_sql") as mock_sql:
-            mock_sql.return_value = []
-            events = [
-                {"eventType": "COMPLETE", "eventTime": "2026-07-20T12:00:00Z",
-                 "run": {"runId": f"run-{i}"}, "job": {"namespace": "dbt", "name": f"model_{i}"},
-                 "inputs": [], "outputs": []}
-                for i in range(5)
-            ]
-            resp = app_client.post("/api/external/ol-bridge/ingest/test-source-123", json=events)
+            mock_sql.return_value = [{"platform": "dbt", "name": "dbt Cloud"}]
+            events = {
+                "events": [
+                    {"eventType": "COMPLETE", "eventTime": "2026-07-20T12:00:00Z",
+                     "run": {"runId": f"run-{i}"}, "job": {"namespace": "dbt", "name": f"model_{i}"},
+                     "inputs": [], "outputs": []}
+                    for i in range(5)
+                ]
+            }
+            resp = app_client.post(f"/api/external/ol-bridge/ingest/{self._VALID_UUID}", json=events)
             assert resp.status_code == 200
 
     def test_ingest_sql_injection_in_source_id(self, app_client):
-        """A1: source_id in URL path may be interpolated into SQL."""
+        """A1/A15: A source_id that isn't a well-formed UUID (including an
+        injection payload) is rejected up front by _UUID_RE with 400 — it never
+        reaches SQL interpolation."""
         with patch("backend.routes.external_sources._execute_sql") as mock_sql:
             mock_sql.return_value = []
             resp = app_client.post(
@@ -137,8 +144,7 @@ class TestOLBridgeIngest:
                       "run": {"runId": "r"}, "job": {"namespace": "x", "name": "y"},
                       "inputs": [], "outputs": []}
             )
-            # Should be 400 after validation; currently may pass
-            assert resp.status_code in (200, 400, 422)
+            assert resp.status_code in (400, 422)
 
 
 class TestOLBridgeSources:
@@ -154,7 +160,9 @@ class TestOLBridgeSources:
             resp = app_client.get("/api/external/ol-bridge/sources")
             assert resp.status_code == 200
             data = resp.json()
-            assert isinstance(data, list)
+            # Sources are wrapped under a "sources" key with a "count".
+            assert isinstance(data, dict)
+            assert isinstance(data["sources"], list)
 
     def test_source_ids_exposed_to_all_users(self, app_client):
         """A15 BUG: Source listing exposes source_ids (auth tokens) to all users.
@@ -168,9 +176,10 @@ class TestOLBridgeSources:
             resp = app_client.get("/api/external/ol-bridge/sources")
             assert resp.status_code == 200
             data = resp.json()
+            sources = data["sources"]
             # BUG: source_id is exposed — this IS the auth credential
-            if data:
-                assert "source_id" in data[0]  # Documents the vulnerability
+            if sources:
+                assert "source_id" in sources[0]  # Documents the vulnerability
 
     def test_empty_sources(self, app_client):
         with patch("backend.routes.external_sources._execute_sql") as mock_sql:

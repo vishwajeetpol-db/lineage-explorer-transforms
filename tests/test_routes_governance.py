@@ -74,7 +74,10 @@ class TestGovernancePropagation:
                 "catalog": "main", "schema": "default", "table": "orders"
             })
             assert resp.status_code == 200
-            assert isinstance(resp.json(), list)
+            # Endpoint wraps the list under a "propagation" key.
+            data = resp.json()
+            assert isinstance(data, dict)
+            assert isinstance(data["propagation"], list)
 
     def test_propagation_cross_catalog_boundary(self, app_client):
         """C2: Propagation may be silently truncated at catalog boundaries
@@ -102,7 +105,10 @@ class TestGovernanceConfig:
             mock_rules.return_value = []
             resp = app_client.get("/api/governance/config")
             assert resp.status_code == 200
-            assert isinstance(resp.json(), list)
+            # Endpoint wraps the rules list under a "rules" key.
+            data = resp.json()
+            assert isinstance(data, dict)
+            assert isinstance(data["rules"], list)
 
     def test_upsert_requires_body(self, admin_client):
         resp = admin_client.post("/api/governance/config")

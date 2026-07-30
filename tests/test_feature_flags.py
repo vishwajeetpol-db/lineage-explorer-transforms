@@ -83,13 +83,13 @@ class TestSetFlagState:
         """Setting an unknown flag_id should raise ValueError."""
         from backend.feature_flags import set_flag_state
         with pytest.raises((ValueError, KeyError)):
-            set_flag_state("unknown.flag", True, user="admin@test.com")
+            set_flag_state("unknown.flag", True, actor="admin@test.com")
 
     def test_valid_flag_calls_sql(self, mock_feature_flags_sql):
         """Setting a valid flag should attempt SQL execution."""
         from backend.feature_flags import set_flag_state
         try:
-            set_flag_state("lineage_tracking.plan_capture", True, user="admin@test.com")
+            set_flag_state("lineage_tracking.plan_capture", True, actor="admin@test.com")
         except Exception:
             pass  # May fail due to mocked SQL, but should not raise ValueError
 
@@ -149,14 +149,23 @@ class TestLocalDevAdminEscalation:
             from unittest.mock import MagicMock
             request = MagicMock()
             request.headers = {"x-forwarded-access-token": "some-token"}
-            # Should attempt SDK call, not use LOCAL_DEV_ADMIN_EMAIL
-            with patch("backend.main._get_client") as mock_client:
-                mock_client.return_value = MagicMock()
-                # Will fail on SDK call but shouldn't return local dev email
+            # Should take the token path (SDK lookup), NOT use LOCAL_DEV_ADMIN_EMAIL.
+            # Mock both _get_client (host) and WorkspaceClient so no real
+            # control-plane call is made (which would hang offline).
+            with patch("backend.main._get_client") as mock_client, \
+                 patch("databricks.sdk.core.Config") as mock_cfg, \
+                 patch("backend.main.WorkspaceClient") as mock_ws:
+                mock_client.return_value.config.host = "https://example.databricks.com"
+                mock_cfg.return_value = MagicMock()
+                me = MagicMock()
+                me.user_name = "real-user@databricks.com"
+                me.groups = []
+                mock_ws.return_value.current_user.me.return_value = me
                 email, is_admin = _get_user_info(request)
-                # Token path was taken (not local dev override)
-                # May be None if SDK call fails, but not dev@test.com
-                # unless token lookup returns it
+                # Token path was taken (not the local dev override)
+                assert email == "real-user@databricks.com"
+                assert email != "dev@test.com"
+                assert is_admin is False
 
 
 class TestFlagAccessRequirements:
@@ -165,5 +174,7 @@ class TestFlagAccessRequirements:
     def test_check_access_returns_structure(self, mock_feature_flags_sql):
         """check_access_requirements should return grant requirements."""
         from backend.feature_flags import check_access_requirements
-        result = check_access_requirements()
+        # check_access_requirements takes a flag_id and returns a list of
+        # per-requirement dicts (each with a 'satisfied' verdict).
+        result = check_access_requirements("lineage_tracking.plan_capture")
         assert isinstance(result, (list, dict))
