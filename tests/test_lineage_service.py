@@ -274,8 +274,12 @@ class TestTraceAndColumns:
             resp = ls._fetch_lineage_trace("main.s.seed")
         assert hasattr(resp, "nodes")
 
-    def test_trace_query_failure_raises(self):
+    def test_trace_query_failure_propagates(self):
+        # Both parallel walks fail on the first hop. The trace must surface the
+        # error (not silently return a partial graph). run_parallel re-raises the
+        # first worker exception via future.result().
         with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_maybe_refresh_cost_cache"), \
              patch.object(ls, "_execute_sql", side_effect=RuntimeError("no system.access")):
             with pytest.raises(Exception):
                 ls._fetch_lineage_trace("main.s.seed")
