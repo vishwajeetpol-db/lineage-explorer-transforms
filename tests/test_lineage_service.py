@@ -260,6 +260,58 @@ class TestPublicLineage:
         assert isinstance(out, dict)
 
 
+class TestSharingAndDiagnostics:
+    def test_sharing_overview_aggregates(self):
+        # Return empty rows for every sub-query — exercises the aggregation path
+        # without needing every query's exact column set.
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", return_value=[]):
+            out = ls.get_sharing_overview()
+        assert isinstance(out, dict)
+
+    def test_sharing_overview_degrades_on_error(self):
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", side_effect=RuntimeError("no privs")):
+            out = ls.get_sharing_overview()
+        assert isinstance(out, dict)  # empty but well-formed
+
+    def test_sharing_overlay_ok(self):
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", return_value=[]):
+            resp = ls.get_sharing_overlay("main", "default")
+        assert resp is not None  # returns a SharingOverlay model
+
+    def test_federated_overlay_ok(self):
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", return_value=[]):
+            out = ls.get_federated_source_overlay()
+        assert isinstance(out, dict)
+
+    def test_run_diagnostics_shape(self):
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", return_value=[{"1": 1}]):
+            out = ls.run_diagnostics()
+        assert isinstance(out, dict) and "checks" in out
+
+
+class TestFetchTableLineage:
+    def test_empty_tables_returns_empty_graph(self):
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", return_value=[]), \
+             patch.object(ls, "_maybe_refresh_cost_cache"):
+            resp, truncated = ls._fetch_table_lineage("main", "default", "ck")
+        assert hasattr(resp, "nodes")
+
+    def test_catalog_wide_oversize_raises(self):
+        big = [{"table_schema": "s", "table_name": f"t{i}", "table_type": "MANAGED",
+                "table_owner": None, "comment": None, "created": None, "last_altered": None}
+               for i in range(ls.LINEAGE_MAX_NODES + 1)]
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", return_value=big):
+            with pytest.raises(Exception):
+                ls._fetch_table_lineage("main", None, "ck")  # schema=None => catalog-wide
+
+
 def _importable_entities():
     try:
         import backend.server.entities  # noqa
