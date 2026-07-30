@@ -161,6 +161,78 @@ class TestGraphBuild:
         f = ls._internal_lineage_filter()
         assert isinstance(f, str)
 
+    def test_build_graph_table_to_table_direct(self):
+        client = MagicMock()
+        rows = [{
+            "source_table_full_name": "main.s.a", "source_type": "TABLE",
+            "target_table_full_name": "main.s.b", "target_type": "TABLE",
+            "entity_type": None, "entity_id": None,
+        }]
+        with patch.object(ls, "_execute_sql", return_value=[]), \
+             patch.object(ls, "_maybe_refresh_cost_cache"):
+            resp = ls._build_graph_from_rows(client, rows)
+        ids = {n.id for n in resp.nodes}
+        assert {"main.s.a", "main.s.b"} <= ids
+        assert any(e.source == "main.s.a" and e.target == "main.s.b" for e in resp.edges)
+
+    def test_build_graph_with_entity_node_and_edges(self):
+        client = MagicMock()
+        rows = [{
+            "source_table_full_name": "main.s.src", "source_type": "TABLE",
+            "target_table_full_name": "main.s.out", "target_type": "TABLE",
+            "entity_type": "PIPELINE", "entity_id": "p1",
+            "event_time": "2026-07-01T00:00:00Z", "created_by": "me@x.com",
+        }]
+        with patch.object(ls, "_execute_sql", return_value=[]), \
+             patch.object(ls, "_entity_cost", return_value=1.25), \
+             patch.object(ls, "_maybe_refresh_cost_cache"):
+            resp = ls._build_graph_from_rows(client, rows)
+        ent = [n for n in resp.nodes if getattr(n, "node_type", None) == "entity"]
+        assert ent and ent[0].entity_id == "p1"
+        assert ent[0].cost_usd == 1.25
+        # src -> entity and entity -> out
+        pairs = {(e.source, e.target) for e in resp.edges}
+        assert ("main.s.src", "entity:PIPELINE:p1") in pairs
+        assert ("entity:PIPELINE:p1", "main.s.out") in pairs
+
+    def test_build_graph_read_after_write_no_back_edge(self):
+        """A table the entity WRITES then reads back becomes a direct table edge."""
+        client = MagicMock()
+        rows = [
+            {"source_table_full_name": "main.s.raw", "target_table_full_name": "main.s.mid",
+             "entity_type": "PIPELINE", "entity_id": "p1"},
+            {"source_table_full_name": "main.s.mid", "target_table_full_name": "main.s.final",
+             "entity_type": "PIPELINE", "entity_id": "p1"},
+        ]
+        with patch.object(ls, "_execute_sql", return_value=[]), \
+             patch.object(ls, "_entity_cost", return_value=None), \
+             patch.object(ls, "_maybe_refresh_cost_cache"):
+            resp = ls._build_graph_from_rows(client, rows)
+        pairs = {(e.source, e.target) for e in resp.edges}
+        # mid is written by p1, so its read-back is a direct mid->final edge,
+        # not a back-edge mid->entity.
+        assert ("main.s.mid", "entity:PIPELINE:p1") not in pairs
+        assert ("main.s.mid", "main.s.final") in pairs
+
+    def test_build_graph_populates_columns(self):
+        client = MagicMock()
+        rows = [{"source_table_full_name": "main.s.a", "target_table_full_name": "main.s.b"}]
+        colrows = [
+            {"table_schema": "s", "table_name": "a", "column_name": "id",
+             "data_type": "int", "is_nullable": "NO", "ordinal_position": 1},
+        ]
+        with patch.object(ls, "_execute_sql", return_value=colrows), \
+             patch.object(ls, "_maybe_refresh_cost_cache"):
+            resp = ls._build_graph_from_rows(client, rows)
+        a = next(n for n in resp.nodes if n.id == "main.s.a")
+        assert any(c["name"] == "id" for c in a.columns)
+
+    def test_parse_lineage_ref_table_and_path(self):
+        ref, t = ls._parse_lineage_ref("main.s.t", None, "TABLE")
+        assert ref == "main.s.t" and t == "TABLE"
+        ref2, t2 = ls._parse_lineage_ref(None, "s3://bucket/x", "PATH")
+        assert ref2 is not None
+
 
 # ---------------------------------------------------------------------------
 # Public lineage entry points (thin wrappers over cached fetchers)
