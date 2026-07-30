@@ -90,8 +90,8 @@ class TestCapabilityCacheEviction:
         svc = get_capability_cache()
         with patch.object(svc, "_ensure_table"), patch.object(svc, "_sql", return_value=[]) as mock_sql:
             assert svc.evict("cat.sch.tbl", "access") is True
-            sent = mock_sql.call_args[0][0].upper()
-            assert "DELETE FROM" in sent and "ACCESS" in mock_sql.call_args[0][0]
+            sent = mock_sql.call_args[0][0]
+            assert "DELETE FROM" in sent.upper() and "access" in sent
 
     def test_evict_table_returns_count(self):
         from backend.server.capability_cache import get_capability_cache

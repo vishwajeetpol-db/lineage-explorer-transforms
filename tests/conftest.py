@@ -25,6 +25,51 @@ os.environ.setdefault("ADMIN_GROUP_NAME", "admins")
 os.environ.pop("LOCAL_DEV_ADMIN_EMAIL", None)
 
 
+@pytest.fixture(autouse=True)
+def _reset_global_state():
+    """Reset module-level singletons/caches between tests.
+
+    The FastAPI `app` and several module globals are process-wide singletons
+    shared by every TestClient. Without a reset, state leaks across test files:
+      * the RateLimitMiddleware's per-user request buckets accumulate — after
+        RATE_LIMIT_MAX_REQUESTS (60) anonymous requests every later test gets a
+        spurious 429 (this was the main cause of order-dependent failures);
+      * a stale `_user_info_cache` entry can make requests resolve to the wrong
+        identity.
+    Clearing these keeps each test hermetic regardless of file order.
+    Best-effort: any missing attribute is ignored.
+    """
+    yield
+    # Clear the rate-limiter's request buckets on the middleware instance.
+    try:
+        import backend.main as _m
+        app = _m.app
+        mw = getattr(app, "user_middleware", [])
+        for m in mw:
+            inst = getattr(m, "cls", None)
+        # Starlette builds middleware lazily; reach the built stack instead.
+        stack = getattr(app, "middleware_stack", None)
+        node = stack
+        while node is not None:
+            reqs = getattr(node, "requests", None)
+            if isinstance(reqs, dict):
+                reqs.clear()
+            node = getattr(node, "app", None)
+    except Exception:
+        pass
+    try:
+        import backend.main as _m
+        if hasattr(_m, "_user_info_cache"):
+            _m._user_info_cache.clear()
+    except Exception:
+        pass
+    try:
+        from backend.lineage_service import invalidate_cache
+        invalidate_cache()
+    except Exception:
+        pass
+
+
 @pytest.fixture
 def mock_workspace_client():
     """Mock WorkspaceClient for all tests that need SDK access."""

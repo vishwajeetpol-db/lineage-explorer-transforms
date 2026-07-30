@@ -22,7 +22,8 @@ class TestTerms:
 
     def test_upsert_term_ok(self, app_client):
         with patch("backend.routes.glossary._execute_sql", return_value=[]):
-            resp = app_client.post("/api/glossary/terms", json={"name": "Revenue"})
+            resp = app_client.post("/api/glossary/terms", json={
+                "name": "Revenue", "definition": "Total income"})
         assert resp.status_code in (200, 201)
 
     def test_delete_term_ok(self, app_client):
@@ -49,7 +50,8 @@ class TestDomainsAndKpis:
 
     def test_upsert_kpi_ok(self, app_client):
         with patch("backend.routes.glossary._execute_sql", return_value=[]):
-            resp = app_client.post("/api/glossary/kpis", json={"name": "MRR"})
+            resp = app_client.post("/api/glossary/kpis", json={
+                "name": "MRR", "definition": "Monthly recurring revenue"})
         assert resp.status_code in (200, 201)
 
 

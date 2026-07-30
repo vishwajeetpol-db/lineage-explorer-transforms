@@ -41,9 +41,13 @@ class TestAnalyzeProducer:
         body = resp.json()
         assert "models" in body and "default" in body
 
-    def test_history_ok(self, app_client):
+    def test_history_requires_admin(self, non_admin_client):
+        resp = non_admin_client.get("/api/analyze-producer/history")
+        assert resp.status_code == 403
+
+    def test_history_admin_ok(self, admin_client):
         with patch("backend.routes.lineage.list_analyses", return_value=[]):
-            resp = app_client.get("/api/analyze-producer/history")
+            resp = admin_client.get("/api/analyze-producer/history")
         assert resp.status_code == 200
 
 

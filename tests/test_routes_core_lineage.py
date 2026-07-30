@@ -10,6 +10,12 @@ from unittest.mock import patch
 import pytest
 
 
+def _empty_lineage():
+    """A real LineageResponse the route can .nodes/.edges + model_dump on."""
+    from backend.models import LineageResponse
+    return LineageResponse(nodes=[], edges=[])
+
+
 class TestListingRoutes:
     def test_tables(self, app_client):
         with patch("backend.main.list_all_tables", return_value=[{"full_name": "c.s.t"}]):
@@ -44,7 +50,7 @@ class TestLineageGraph:
         assert resp.status_code == 422
 
     def test_lineage_ok(self, app_client):
-        with patch("backend.main.get_table_lineage", return_value={"nodes": [], "edges": []}):
+        with patch("backend.main.get_table_lineage", return_value=_empty_lineage()):
             resp = app_client.get("/api/lineage", params={"catalog": "main", "schema": "default"})
         assert resp.status_code == 200
         assert "nodes" in resp.json()
@@ -70,7 +76,7 @@ class TestLineageTrace:
         assert resp.status_code == 400
 
     def test_trace_ok(self, app_client):
-        with patch("backend.main.get_lineage_trace", return_value={"nodes": [], "edges": []}):
+        with patch("backend.main.get_lineage_trace", return_value=_empty_lineage()):
             resp = app_client.get("/api/lineage/trace", params={"table": "main.default.orders"})
         assert resp.status_code == 200
         assert "edges" in resp.json()
