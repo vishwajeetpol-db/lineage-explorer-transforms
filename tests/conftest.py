@@ -39,35 +39,42 @@ def _reset_global_state():
     Clearing these keeps each test hermetic regardless of file order.
     Best-effort: any missing attribute is ignored.
     """
+    def _reset():
+        # Rate-limiter request buckets on the (lazily built) middleware stack.
+        try:
+            import backend.main as _m
+            node = getattr(_m.app, "middleware_stack", None)
+            while node is not None:
+                reqs = getattr(node, "requests", None)
+                if isinstance(reqs, dict):
+                    reqs.clear()
+                node = getattr(node, "app", None)
+        except Exception:
+            pass
+        # User-info auth cache.
+        try:
+            import backend.main as _m
+            if hasattr(_m, "_user_info_cache"):
+                _m._user_info_cache.clear()
+        except Exception:
+            pass
+        # Lineage LRU + cost globals — leaking these makes later tests' fetch
+        # paths serve from cache (not execute), deflating that module's coverage.
+        try:
+            import backend.lineage_service as _ls
+            _ls.invalidate_cache()
+            for attr in ("_cost_by_job_id", "_cost_by_pipeline_id"):
+                d = getattr(_ls, attr, None)
+                if isinstance(d, dict):
+                    d.clear()
+            if hasattr(_ls, "_cost_cache_fetched_at"):
+                _ls._cost_cache_fetched_at = 0.0
+        except Exception:
+            pass
+
+    _reset()   # before the test
     yield
-    # Clear the rate-limiter's request buckets on the middleware instance.
-    try:
-        import backend.main as _m
-        app = _m.app
-        mw = getattr(app, "user_middleware", [])
-        for m in mw:
-            inst = getattr(m, "cls", None)
-        # Starlette builds middleware lazily; reach the built stack instead.
-        stack = getattr(app, "middleware_stack", None)
-        node = stack
-        while node is not None:
-            reqs = getattr(node, "requests", None)
-            if isinstance(reqs, dict):
-                reqs.clear()
-            node = getattr(node, "app", None)
-    except Exception:
-        pass
-    try:
-        import backend.main as _m
-        if hasattr(_m, "_user_info_cache"):
-            _m._user_info_cache.clear()
-    except Exception:
-        pass
-    try:
-        from backend.lineage_service import invalidate_cache
-        invalidate_cache()
-    except Exception:
-        pass
+    _reset()   # and after
 
 
 @pytest.fixture
