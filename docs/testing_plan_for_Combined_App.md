@@ -123,6 +123,20 @@ A coverage audit found ~41% of endpoints had tests; the following files were add
 
 Run the whole backend suite with `pytest tests/ -m "not integration"`.
 
+## 1d. Backend coverage gate (>=90%)
+
+The backend test suite meets a **90% line+branch coverage gate** (currently **90.6%**, 1415 tests, 0 failing). Config in `.coveragerc` (`fail_under = 90`, scoped to `backend/`, omitting the standalone offline pipeline `transformation_lineage/` + `backend/plan_capture/` capture-cell wheel + `startup.py`/`perf_patches.py` bootstrap).
+
+Run the gate (Python 3.11 venv with `requirements-dev.txt` + `pytest-cov`):
+
+```bash
+pytest tests/ -m "not integration" --cov=backend --cov-fail-under=90 --cov-report=term-missing
+```
+
+Notes for maintainers:
+- Tests are hermetic: `conftest.py` has an autouse fixture that resets the FastAPI app's rate-limiter buckets, the user-info auth cache, and the `lineage_service` LRU + cost globals before/after each test (prevents order-dependent 429s and cache-served fetch paths that would otherwise deflate coverage).
+- Everything is mocked (`_get_client`, per-module `_execute_sql`/`_sql`, service functions) — no live workspace, no network.
+
 ## 2. Frontend checks
 
 * `useFeatureFlagStore` — `updateFlagEnabled` only mutates the targeted flag's
