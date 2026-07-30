@@ -22,6 +22,21 @@ if (!window.matchMedia) {
   })) as unknown as typeof window.matchMedia;
 }
 
+// jsdom in this Node/vitest combo doesn't expose a working localStorage — provide
+// an in-memory shim so stores that persist (themeStore, useRecents) work.
+if (!("localStorage" in globalThis) || typeof globalThis.localStorage?.clear !== "function") {
+  const _store = new Map<string, string>();
+  const mem = {
+    getItem: (k: string) => (_store.has(k) ? _store.get(k)! : null),
+    setItem: (k: string, v: string) => void _store.set(k, String(v)),
+    removeItem: (k: string) => void _store.delete(k),
+    clear: () => _store.clear(),
+    key: (i: number) => Array.from(_store.keys())[i] ?? null,
+    get length() { return _store.size; },
+  };
+  Object.defineProperty(globalThis, "localStorage", { value: mem, configurable: true, writable: true });
+}
+
 // jsdom lacks ResizeObserver (React Flow / some panels reference it).
 if (!(globalThis as any).ResizeObserver) {
   (globalThis as any).ResizeObserver = class {
