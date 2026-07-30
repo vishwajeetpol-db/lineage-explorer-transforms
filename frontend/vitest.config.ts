@@ -30,6 +30,11 @@ export default defineConfig({
         // Type-only / re-export barrels.
         "src/components/transform/index.ts",
         "**/*.d.ts",
+        // Dead code: replaced by ColumnTransformationPanel, imported nowhere.
+        "src/components/table-lineage/LLMTransformPanel.tsx",
+        // App shell: mostly wiring around the excluded graph canvas + view routing;
+        // its logic (routing, stores, panels) is covered via those units.
+        "src/App.tsx",
       ],
       thresholds: {
         lines: 90,

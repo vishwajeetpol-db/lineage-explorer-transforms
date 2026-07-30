@@ -37,6 +37,15 @@ if (!("localStorage" in globalThis) || typeof globalThis.localStorage?.clear !==
   Object.defineProperty(globalThis, "localStorage", { value: mem, configurable: true, writable: true });
 }
 
+// jsdom doesn't implement pointer capture (used by DraggablePanel drag handlers).
+if (typeof Element !== "undefined") {
+  if (!Element.prototype.setPointerCapture) Element.prototype.setPointerCapture = () => {};
+  if (!Element.prototype.releasePointerCapture) Element.prototype.releasePointerCapture = () => {};
+  if (!Element.prototype.hasPointerCapture) Element.prototype.hasPointerCapture = () => false;
+  // jsdom lacks scrollIntoView (some list/tree components call it).
+  if (!Element.prototype.scrollIntoView) Element.prototype.scrollIntoView = () => {};
+}
+
 // jsdom lacks ResizeObserver (React Flow / some panels reference it).
 if (!(globalThis as any).ResizeObserver) {
   (globalThis as any).ResizeObserver = class {
