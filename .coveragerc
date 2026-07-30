@@ -1,0 +1,41 @@
+# Coverage configuration for BrickTrace.
+# Scopes measurement to the app backend and excludes code that is either
+# non-logic, environment-bound, or the standalone offline pipeline.
+[run]
+source = backend
+branch = True
+omit =
+    # Tests themselves
+    tests/*
+    backend/*/tests/*
+    # The standalone offline lineage-capture pipeline (not imported by the app
+    # backend at runtime; it runs as a separate Databricks job/wheel).
+    transformation_lineage/*
+    plan_capture/*
+    # Package markers
+    backend/__init__.py
+    backend/*/__init__.py
+    # Process bootstrap / perf monkeypatching — exercised only in a live app
+    # process, not unit-testable without a running server.
+    backend/startup.py
+    backend/perf_patches.py
+
+[report]
+# Fail the gate below 90%.
+fail_under = 90
+show_missing = True
+skip_covered = False
+precision = 1
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    if TYPE_CHECKING:
+    \.\.\.
+    # Defensive / unreachable fallbacks
+    except ImportError:
+    raise AssertionError
+
+[html]
+directory = htmlcov
