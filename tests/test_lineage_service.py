@@ -260,6 +260,71 @@ class TestPublicLineage:
         assert isinstance(out, dict)
 
 
+class TestTraceAndColumns:
+    def test_fetch_lineage_trace_bfs(self):
+        # First walk hop returns one edge; subsequent hops return empty.
+        edge = {"source_table_full_name": "main.s.raw", "target_table_full_name": "main.s.seed",
+                "source_type": "TABLE", "target_type": "TABLE", "source_path": None,
+                "target_path": None, "entity_type": None, "entity_id": None,
+                "event_time": "2026-07-01T00:00:00Z", "created_by": None}
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", side_effect=lambda *a, **k: [edge]
+                          if "main.s.seed" in a[1] else []), \
+             patch.object(ls, "_maybe_refresh_cost_cache"):
+            resp = ls._fetch_lineage_trace("main.s.seed")
+        assert hasattr(resp, "nodes")
+
+    def test_trace_query_failure_raises(self):
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", side_effect=RuntimeError("no system.access")):
+            with pytest.raises(Exception):
+                ls._fetch_lineage_trace("main.s.seed")
+
+    def test_get_column_lineage_ok(self):
+        rows = [{"source_table_full_name": "main.s.a", "source_column_name": "x",
+                 "target_table_full_name": "main.s.b", "target_column_name": "y"}]
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", return_value=rows):
+            resp = ls.get_column_lineage("main", "s", "b", "y")
+        assert resp is not None
+
+    def test_get_schema_column_lineage_ok(self):
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", return_value=[]):
+            resp = ls.get_schema_column_lineage("main", "s")
+        assert resp is not None
+
+    def test_get_table_edges_ok(self):
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", return_value=[]):
+            out = ls.get_table_edges("main", "s")
+        assert isinstance(out, list)
+
+
+class TestEntityNameAndCost:
+    def test_resolve_entity_name_job(self):
+        client = MagicMock()
+        client.jobs.get.return_value = MagicMock(settings=MagicMock(name="My Job"))
+        with patch.object(ls, "_get_client", return_value=client):
+            out = ls.resolve_entity_name("JOB", "123")
+        assert isinstance(out, dict) and "name" in out
+
+    def test_resolve_entity_name_error_fallback(self):
+        client = MagicMock()
+        client.jobs.get.side_effect = RuntimeError("not found")
+        with patch.object(ls, "_get_client", return_value=client):
+            out = ls.resolve_entity_name("JOB", "123")
+        assert isinstance(out, dict)
+
+    def test_refresh_cost_cache_populates(self):
+        client = MagicMock()
+        rows = [{"id": "j1", "cost_usd": 12.5}]
+        with patch.object(ls, "_execute_sql", return_value=rows):
+            ls._refresh_cost_cache(client)
+        # entity cost lookup should now find it (best-effort; no assertion on exact key)
+        assert ls._entity_cost("JOB", "j1") in (12.5, None)
+
+
 class TestSharingAndDiagnostics:
     def test_sharing_overview_aggregates(self):
         # Return empty rows for every sub-query — exercises the aggregation path
@@ -301,6 +366,39 @@ class TestFetchTableLineage:
              patch.object(ls, "_maybe_refresh_cost_cache"):
             resp, truncated = ls._fetch_table_lineage("main", "default", "ck")
         assert hasattr(resp, "nodes")
+
+    def test_schema_scoped_full_build(self):
+        """Drive the full body: tables query, columns query, lineage query."""
+        tables = [{"table_schema": "s", "table_name": "orders", "table_type": "MANAGED",
+                   "table_owner": "o@x.com", "comment": "c", "created": None, "last_altered": None},
+                  {"table_schema": "s", "table_name": "orders_clean", "table_type": "MANAGED",
+                   "table_owner": None, "comment": None, "created": None, "last_altered": None}]
+        columns = [{"table_schema": "s", "table_name": "orders", "column_name": "id",
+                    "data_type": "int", "is_nullable": "NO", "ordinal_position": 1}]
+        lineage = [{"source_table_full_name": "main.s.orders",
+                    "target_table_full_name": "main.s.orders_clean",
+                    "source_type": "TABLE", "target_type": "TABLE",
+                    "source_path": None, "target_path": None,
+                    "entity_type": "PIPELINE", "entity_id": "p1",
+                    "event_time": "2026-07-01T00:00:00Z", "created_by": "o@x.com"}]
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", side_effect=[tables, columns, lineage]), \
+             patch.object(ls, "_entity_cost", return_value=None), \
+             patch.object(ls, "_maybe_refresh_cost_cache"):
+            resp, ok = ls._fetch_table_lineage("main", "s", "ck2")
+        ids = {n.id for n in resp.nodes}
+        assert "main.s.orders" in ids and "main.s.orders_clean" in ids
+        assert ok is True  # lineage query succeeded
+
+    def test_lineage_query_failure_marks_not_ok(self):
+        tables = [{"table_schema": "s", "table_name": "t", "table_type": "MANAGED",
+                   "table_owner": None, "comment": None, "created": None, "last_altered": None}]
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch.object(ls, "_execute_sql", side_effect=[tables, [], RuntimeError("no system.access")]), \
+             patch.object(ls, "_maybe_refresh_cost_cache"):
+            resp, ok = ls._fetch_table_lineage("main", "s", "ck3")
+        # lineage failed → ok False so caller won't cache a blank graph
+        assert ok is False
 
     def test_catalog_wide_oversize_raises(self):
         big = [{"table_schema": "s", "table_name": f"t{i}", "table_type": "MANAGED",

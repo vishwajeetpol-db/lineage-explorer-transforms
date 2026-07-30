@@ -12,6 +12,10 @@ omit =
     # backend at runtime; it runs as a separate Databricks job/wheel).
     transformation_lineage/*
     plan_capture/*
+    # The plan-capture wheel code that is injected into and runs inside the
+    # customer's pipeline (df.explain parsing), not in the app process. The
+    # app-facing reader (plan_capture_service.py) IS covered.
+    backend/plan_capture/*
     # Package markers
     backend/__init__.py
     backend/*/__init__.py
