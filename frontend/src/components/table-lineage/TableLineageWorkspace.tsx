@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ReactFlowProvider } from "reactflow";
 import {
   ArrowLeft, GitBranch, ShieldAlert, Stethoscope, ScrollText,
-  KeyRound, Boxes, Sparkles, Loader2, ArrowUpFromLine, ArrowDownToLine, Columns3, Clock,
+  KeyRound, Boxes, Sparkles, Loader2, ArrowUpFromLine, ArrowDownToLine, Columns3, Clock, X,
 } from "lucide-react";
 import LineageCanvas from "../graph/LineageCanvas";
 import { useLineageStore } from "../../store/lineageStore";
@@ -20,13 +20,22 @@ import RootCausePanel from "./RootCausePanel";
 
 type TabKey = "impact" | "rootCause" | "governance" | "access" | "ml" | "llm";
 
-const TABS: { key: TabKey; label: string; icon: typeof GitBranch; accent: string }[] = [
-  { key: "impact", label: "Impact", icon: ShieldAlert, accent: "text-rose-400" },
-  { key: "rootCause", label: "Root Cause", icon: Stethoscope, accent: "text-amber-400" },
-  { key: "governance", label: "Governance", icon: ScrollText, accent: "text-emerald-400" },
-  { key: "access", label: "Access", icon: KeyRound, accent: "text-sky-400" },
-  { key: "ml", label: "ML Models", icon: Boxes, accent: "text-cyan-400" },
-  { key: "llm", label: "Column Transformation", icon: Sparkles, accent: "text-violet-400" },
+/** Per-capability color identity. `accent` = icon text color; `edge`/`header`
+ *  = Tailwind `from-*` gradient stops the panel uses for its top-edge strip and
+ *  tinted title bar; `chip` = the icon chip background. Literal class strings so
+ *  Tailwind's content scanner keeps them. Semantics: rose = impact/blast radius,
+ *  amber = diagnosis, emerald = compliance, sky = security, cyan = models,
+ *  violet = AI/transforms. */
+const TABS: {
+  key: TabKey; label: string; icon: typeof GitBranch;
+  accent: string; edge: string; header: string; chip: string;
+}[] = [
+  { key: "impact", label: "Impact", icon: ShieldAlert, accent: "text-rose-400", edge: "from-rose-500/70", header: "from-rose-500/10", chip: "bg-rose-500/15" },
+  { key: "rootCause", label: "Root Cause", icon: Stethoscope, accent: "text-amber-400", edge: "from-amber-500/70", header: "from-amber-500/10", chip: "bg-amber-500/15" },
+  { key: "governance", label: "Governance", icon: ScrollText, accent: "text-emerald-400", edge: "from-emerald-500/70", header: "from-emerald-500/10", chip: "bg-emerald-500/15" },
+  { key: "access", label: "Access", icon: KeyRound, accent: "text-sky-400", edge: "from-sky-500/70", header: "from-sky-500/10", chip: "bg-sky-500/15" },
+  { key: "ml", label: "ML Models", icon: Boxes, accent: "text-cyan-400", edge: "from-cyan-500/70", header: "from-cyan-500/10", chip: "bg-cyan-500/15" },
+  { key: "llm", label: "Column Transformation", icon: Sparkles, accent: "text-violet-400", edge: "from-violet-500/70", header: "from-violet-500/10", chip: "bg-violet-500/15" },
 ];
 
 const PANEL_TITLE: Record<TabKey, string> = {
@@ -65,6 +74,10 @@ export default function TableLineageWorkspace({ initialTable }: { initialTable?:
   const [selected, setSelected] = useState<string | null>(initialTable ?? null);
   // Open draggable panels (in stacking order — last is on top).
   const [openPanels, setOpenPanels] = useState<TabKey[]>([]);
+  // Panels docked to the bottom bar (still "open", just not floating).
+  const [minimized, setMinimized] = useState<TabKey[]>([]);
+  // Collapse the left catalog rail to reclaim horizontal space for the graph.
+  const [treeCollapsed, setTreeCollapsed] = useState(false);
   const loading = useLineageStore((s) => s.loading);
   const nodes = useLineageStore((s) => s.nodes);
   const abortRef = useRef<AbortController | null>(null);
@@ -141,8 +154,17 @@ export default function TableLineageWorkspace({ initialTable }: { initialTable?:
     goTableLineage(fqn);
   };
 
+  const bringToFront = (key: TabKey) =>
+    setOpenPanels((cur) => (cur[cur.length - 1] === key ? cur : [...cur.filter((k) => k !== key), key]));
+
   // Toggle a panel open/closed; opening (or re-clicking) brings it to the front.
+  // A minimized panel is restored (un-docked) instead of toggled.
   const togglePanel = (key: TabKey) => {
+    if (minimized.includes(key)) {
+      setMinimized((cur) => cur.filter((k) => k !== key));
+      bringToFront(key);
+      return;
+    }
     setOpenPanels((cur) => {
       if (cur.includes(key)) {
         // Already open → if it's already on top, close it; else bring to front.
@@ -152,9 +174,19 @@ export default function TableLineageWorkspace({ initialTable }: { initialTable?:
       return [...cur, key];
     });
   };
-  const bringToFront = (key: TabKey) =>
-    setOpenPanels((cur) => (cur[cur.length - 1] === key ? cur : [...cur.filter((k) => k !== key), key]));
-  const closePanel = (key: TabKey) => setOpenPanels((cur) => cur.filter((k) => k !== key));
+  const minimizePanel = (key: TabKey) =>
+    setMinimized((cur) => (cur.includes(key) ? cur : [...cur, key]));
+  const restorePanel = (key: TabKey) => {
+    setMinimized((cur) => cur.filter((k) => k !== key));
+    bringToFront(key);
+  };
+  const closePanel = (key: TabKey) => {
+    setOpenPanels((cur) => cur.filter((k) => k !== key));
+    setMinimized((cur) => cur.filter((k) => k !== key));
+  };
+
+  // Floating panels = open and not docked.
+  const visiblePanels = openPanels.filter((k) => !minimized.includes(k));
 
   return (
     <div className="h-screen w-screen flex flex-col bg-surface overflow-hidden">
@@ -175,9 +207,14 @@ export default function TableLineageWorkspace({ initialTable }: { initialTable?:
 
       {/* Body: left tree + right (summary bar over graph) */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Left: catalog tree */}
-        <div className="w-[260px] shrink-0 border-r border-white/[0.06] bg-surface-50/40">
-          <CatalogTreePanel selected={selected} onSelect={handleSelect} />
+        {/* Left: catalog tree (collapsible maroon rail) */}
+        <div className={`shrink-0 border-r border-white/[0.06] transition-[width] duration-300 ease-out ${treeCollapsed ? "w-[56px]" : "w-[260px]"}`}>
+          <CatalogTreePanel
+            selected={selected}
+            onSelect={handleSelect}
+            collapsed={treeCollapsed}
+            onToggleCollapse={() => setTreeCollapsed((v) => !v)}
+          />
         </div>
 
         {/* Right column: summary bar + graph */}
@@ -249,25 +286,71 @@ export default function TableLineageWorkspace({ initialTable }: { initialTable?:
         </div>
       </div>
 
-      {/* Draggable capability panels */}
-      {openPanels.map((key, idx) => (
-        <DraggablePanel
-          key={key}
-          title={
-            <span className="flex items-center gap-2">
-              {(() => { const T = TABS.find((t) => t.key === key)!; const I = T.icon; return <I size={14} className={T.accent} />; })()}
-              {PANEL_TITLE[key]}
-            </span>
-          }
-          subtitle={selected || undefined}
-          initial={{ x: window.innerWidth - 380 - 32 - idx * 28, y: 120 + idx * 28 }}
-          z={40 + idx}
-          onFocus={() => bringToFront(key)}
-          onClose={() => closePanel(key)}
-        >
-          {renderPanelBody(key, selected)}
-        </DraggablePanel>
-      ))}
+      {/* Draggable capability panels (floating — excludes docked ones) */}
+      {visiblePanels.map((key, idx) => {
+        const T = TABS.find((t) => t.key === key)!;
+        const I = T.icon;
+        return (
+          <DraggablePanel
+            key={key}
+            title={
+              <span className="flex items-center gap-2">
+                <span className={`w-6 h-6 rounded-lg grid place-items-center shrink-0 ${T.chip}`}>
+                  <I size={13} className={T.accent} />
+                </span>
+                {PANEL_TITLE[key]}
+              </span>
+            }
+            subtitle={selected || undefined}
+            accentEdge={T.edge}
+            accentHeader={T.header}
+            initial={{ x: window.innerWidth - 380 - 32 - idx * 28, y: 120 + idx * 28 }}
+            z={40 + idx}
+            onFocus={() => bringToFront(key)}
+            onMinimize={() => minimizePanel(key)}
+            onClose={() => closePanel(key)}
+          >
+            {renderPanelBody(key, selected)}
+          </DraggablePanel>
+        );
+      })}
+
+      {/* Minimized panel dock — a taskbar of chips pinned to the bottom. */}
+      {minimized.length > 0 && (
+        <div className="fixed bottom-3 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 flex-wrap justify-center max-w-[90vw]">
+          {minimized.map((key) => {
+            const T = TABS.find((t) => t.key === key)!;
+            const I = T.icon;
+            return (
+              <div
+                key={key}
+                className="flex items-center rounded-xl bg-surface-50/95 border border-white/[0.1] backdrop-blur-md shadow-[0_8px_28px_rgba(0,0,0,0.35)] overflow-hidden"
+              >
+                <span className={`w-0.5 self-stretch ${T.chip}`} />
+                <button
+                  onClick={() => restorePanel(key)}
+                  aria-label={`Restore ${PANEL_TITLE[key]}`}
+                  title={`Restore ${PANEL_TITLE[key]}`}
+                  className="flex items-center gap-2 pl-2.5 pr-3 py-1.5 hover:bg-white/[0.06] transition-colors"
+                >
+                  <span className={`w-5 h-5 rounded-md grid place-items-center shrink-0 ${T.chip}`}>
+                    <I size={12} className={T.accent} />
+                  </span>
+                  <span className="text-[11px] font-medium text-slate-200 whitespace-nowrap">{PANEL_TITLE[key]}</span>
+                </button>
+                <button
+                  onClick={() => closePanel(key)}
+                  aria-label={`Close ${PANEL_TITLE[key]}`}
+                  title="Close"
+                  className="px-1.5 self-stretch flex items-center text-slate-500 hover:text-slate-200 hover:bg-white/10 border-l border-white/[0.06] transition-colors"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

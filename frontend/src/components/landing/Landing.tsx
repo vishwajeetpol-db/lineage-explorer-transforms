@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import {
   Search, FolderOpen, ChevronRight, Loader2, RefreshCw, Layers, FolderTree, GitBranch,
   Home, GitBranchPlus, Network, ShieldCheck, ScrollText, FileBarChart, Settings as SettingsIcon,
-  Bell, HelpCircle, Sun, Moon, Database, ChevronDown, ChevronRight as ChevronR,
+  Bell, HelpCircle, Sun, Moon, Database, ChevronDown, ChevronRight as ChevronR, ChevronLeft,
   Activity, TableProperties, Workflow, AlertTriangle, FilePenLine, ArrowRight, Shield,
 } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
@@ -65,9 +65,9 @@ function timeAgo(iso?: string): string {
 }
 
 function Tile({
-  icon: Icon, iconColor, gradient, title, subtitle, cta, ctaColor, delay, onClick,
+  icon: Icon, iconColor, gradient, edge, title, subtitle, cta, ctaColor, delay, onClick,
 }: {
-  icon: typeof FolderOpen; iconColor: string; gradient: string; title: string;
+  icon: typeof FolderOpen; iconColor: string; gradient: string; edge: string; title: string;
   subtitle: string; cta: string; ctaColor: string; delay: number; onClick: () => void;
 }) {
   return (
@@ -77,8 +77,10 @@ function Tile({
       transition={{ delay }}
       whileHover={{ y: -3 }}
       onClick={onClick}
-      className="group flex flex-col items-center text-center gap-4 px-6 py-8 bg-surface-50/50 hover:bg-surface-50/80 border border-white/[0.06] hover:border-white/[0.12] rounded-2xl transition-all duration-200"
+      className="group relative overflow-hidden flex flex-col items-center text-center gap-4 px-6 py-8 bg-surface-50/50 hover:bg-surface-50/80 border border-white/[0.06] hover:border-white/[0.12] rounded-2xl transition-all duration-200"
     >
+      {/* Colored top edge — gives each tile its own identity (mirrors the panels). */}
+      <span className={`absolute top-0 inset-x-0 h-1 bg-gradient-to-r to-transparent ${edge}`} />
       <div className={`w-16 h-16 rounded-full flex items-center justify-center bg-gradient-to-br ${gradient}`}>
         <Icon size={26} className={iconColor} />
       </div>
@@ -101,6 +103,7 @@ function Landing({ onSelectTable }: Props) {
   const theme = useThemeStore((s) => s.theme);
   const toggleTheme = useThemeStore((s) => s.toggleTheme);
   const [pickerMode, setPickerMode] = useState<"schema" | "catalog" | null>(null);
+  const [navCollapsed, setNavCollapsed] = useState(false);
   const [activity, setActivity] = useState<Notif[]>([]);
   const [unread, setUnread] = useState(0);
   const [userEmail, setUserEmail] = useState<string | null>(null);
@@ -125,32 +128,37 @@ function Landing({ onSelectTable }: Props) {
 
   return (
     <div className="h-screen w-screen flex bg-surface overflow-hidden">
-      {/* ---- Sidebar ---- */}
-      <aside className="w-[248px] shrink-0 flex flex-col border-r border-white/[0.06] bg-surface-50/40">
+      {/* ---- Sidebar (maroon collapsible rail) ---- */}
+      {/* Fixed hex text colors (not the theme-tokenized text-white / text-rose-*
+          utilities) so the rail stays legible on maroon in BOTH light + dark. */}
+      <aside className={`shrink-0 flex flex-col border-r border-white/10 bg-gradient-to-b from-[#4a0d17] to-[#29070f] text-[#fff1f2] transition-[width] duration-300 ease-out ${navCollapsed ? "w-[68px]" : "w-[248px]"}`}>
         {/* Logo */}
-        <div className="flex items-center gap-2.5 px-5 h-[68px] shrink-0">
+        <div className={`flex items-center gap-2.5 h-[68px] shrink-0 ${navCollapsed ? "justify-center px-0" : "px-5"}`}>
           <img src="/bricktrace-logo.png" alt="" className="w-10 h-10 object-contain shrink-0" />
-          <span className="text-[19px] font-bold tracking-tight">
-            <span className="text-slate-100">Brick</span><span className="text-[#FF4520]">Trace</span>
-          </span>
+          {!navCollapsed && (
+            <span className="text-[19px] font-bold tracking-tight whitespace-nowrap">
+              <span className="text-[#fff1f2]">Brick</span><span className="text-[#FF8A66]">Trace</span>
+            </span>
+          )}
         </div>
 
         {/* Nav */}
-        <nav className="flex-1 px-3 py-2 space-y-1 overflow-y-auto">
+        <nav className="flex-1 px-3 py-2 space-y-1 overflow-y-auto overflow-x-hidden">
           {NAV.filter((item) => !item.adminOnly || isAdmin).map((item) => {
             const Icon = item.icon;
             return (
               <button
                 key={item.label}
                 onClick={item.action}
-                className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-[13px] font-medium transition-all ${
+                title={navCollapsed ? item.label : undefined}
+                className={`w-full flex items-center gap-3 py-2.5 rounded-xl text-[13px] font-medium transition-all whitespace-nowrap ${navCollapsed ? "justify-center px-0" : "px-4"} ${
                   item.active
-                    ? "bg-accent/15 text-accent-light border border-accent/25"
-                    : "text-slate-400 hover:text-slate-200 hover:bg-white/[0.04] border border-transparent"
+                    ? "bg-rose-500/30 text-[#fff1f2] border border-rose-300/50 shadow-[inset_0_0_16px_rgba(244,63,94,0.25)]"
+                    : "text-[#ffe4e6]/75 hover:text-[#fff1f2] hover:bg-white/[0.07] border border-transparent"
                 }`}
               >
-                <Icon size={17} className={item.active ? "text-accent-light" : ""} />
-                {item.label}
+                <Icon size={17} className="shrink-0" />
+                {!navCollapsed && item.label}
               </button>
             );
           })}
@@ -158,29 +166,52 @@ function Landing({ onSelectTable }: Props) {
 
         {/* Workspace selector */}
         <div className="px-3 pb-3">
-          <div className="rounded-xl border border-white/[0.08] bg-surface-100/40 px-3 py-2.5">
-            <div className="text-[9px] uppercase tracking-wider text-slate-500 font-medium mb-1">Workspace</div>
-            <div className="flex items-center gap-2">
-              <Database size={14} className="text-slate-400" />
-              <span className="text-[12px] text-slate-200 flex-1 truncate">All Workspaces</span>
-              <ChevronDown size={14} className="text-slate-500" />
+          {navCollapsed ? (
+            <div className="flex justify-center py-2 text-[#fecdd3]/75" title="All Workspaces">
+              <Database size={16} />
             </div>
-          </div>
+          ) : (
+            <div className="rounded-xl border border-white/10 bg-black/25 px-3 py-2.5">
+              <div className="text-[9px] uppercase tracking-wider text-[#fecdd3]/55 font-medium mb-1">Workspace</div>
+              <div className="flex items-center gap-2">
+                <Database size={14} className="text-[#fecdd3]/75" />
+                <span className="text-[12px] text-[#fff1f2] flex-1 truncate">All Workspaces</span>
+                <ChevronDown size={14} className="text-[#fecdd3]/65" />
+              </div>
+            </div>
+          )}
         </div>
 
         {/* User */}
-        <div className="px-3 pb-4 border-t border-white/[0.06] pt-3">
-          <button className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-xl hover:bg-white/[0.04] transition-colors">
-            <span className="w-9 h-9 rounded-full bg-gradient-to-br from-orange-500 to-rose-600 flex items-center justify-center text-[12px] font-bold text-white shrink-0">
+        <div className="px-3 pb-2 border-t border-white/10 pt-3">
+          <button
+            title={navCollapsed ? (userEmail || "User") : undefined}
+            className={`w-full flex items-center gap-2.5 py-1.5 rounded-xl hover:bg-white/[0.07] transition-colors ${navCollapsed ? "justify-center px-0" : "px-2"}`}
+          >
+            <span className="w-9 h-9 rounded-full bg-gradient-to-br from-orange-500 to-rose-600 flex items-center justify-center text-[12px] font-bold text-[#fff1f2] shrink-0">
               {initials}
             </span>
-            <div className="text-left flex-1 min-w-0">
-              <div className="text-[12px] font-semibold text-slate-100 truncate">{userEmail ? userEmail.split("@")[0] : "User"}</div>
-              <div className="text-[10px] text-slate-500 truncate">{userEmail || "—"}</div>
-            </div>
-            <ChevronR size={14} className="text-slate-500 shrink-0" />
+            {!navCollapsed && (
+              <>
+                <div className="text-left flex-1 min-w-0">
+                  <div className="text-[12px] font-semibold text-[#fff1f2] truncate">{userEmail ? userEmail.split("@")[0] : "User"}</div>
+                  <div className="text-[10px] text-[#fecdd3]/65 truncate">{userEmail || "—"}</div>
+                </div>
+                <ChevronR size={14} className="text-[#fecdd3]/65 shrink-0" />
+              </>
+            )}
           </button>
         </div>
+
+        {/* Collapse toggle — pinned to the bottom, matching the workspace rail. */}
+        <button
+          onClick={() => setNavCollapsed((v) => !v)}
+          aria-label={navCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          className={`flex items-center gap-2.5 py-3 border-t border-white/10 bg-black/20 text-[#fecdd3]/75 hover:text-[#fff1f2] text-[12px] transition-colors ${navCollapsed ? "justify-center px-0" : "px-5"}`}
+        >
+          <ChevronLeft size={15} className={`shrink-0 transition-transform ${navCollapsed ? "rotate-180" : ""}`} />
+          {!navCollapsed && <span>Collapse</span>}
+        </button>
       </aside>
 
       {/* ---- Main ---- */}
@@ -236,16 +267,16 @@ function Landing({ onSelectTable }: Props) {
             <>
               {/* Tiles */}
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 w-full max-w-[1100px]">
-                <Tile icon={FolderOpen} iconColor="text-violet-400" gradient="from-violet-500/20 to-purple-500/10"
+                <Tile icon={FolderOpen} iconColor="text-violet-400" gradient="from-violet-500/20 to-purple-500/10" edge="from-violet-500/70"
                   title="Browse" subtitle={`${catalogCount} catalog${catalogCount !== 1 ? "s" : ""} · ${allTables.length.toLocaleString()} tables`}
                   cta="Explore" ctaColor="text-violet-400" delay={0.05} onClick={goCatalogs} />
-                <Tile icon={Layers} iconColor="text-sky-400" gradient="from-sky-500/20 to-cyan-500/10"
+                <Tile icon={Layers} iconColor="text-sky-400" gradient="from-sky-500/20 to-cyan-500/10" edge="from-sky-500/70"
                   title="Schema lineage" subtitle="Map every table in a schema"
                   cta="Choose schema" ctaColor="text-sky-400" delay={0.1} onClick={() => setPickerMode("schema")} />
-                <Tile icon={FolderTree} iconColor="text-fuchsia-400" gradient="from-fuchsia-500/20 to-purple-500/10"
+                <Tile icon={FolderTree} iconColor="text-fuchsia-400" gradient="from-fuchsia-500/20 to-purple-500/10" edge="from-fuchsia-500/70"
                   title="Catalog lineage" subtitle="Map every table in a catalog"
                   cta="Choose catalog" ctaColor="text-fuchsia-400" delay={0.15} onClick={() => setPickerMode("catalog")} />
-                <Tile icon={GitBranch} iconColor="text-orange-400" gradient="from-rose-500/20 to-orange-500/10"
+                <Tile icon={GitBranch} iconColor="text-orange-400" gradient="from-rose-500/20 to-orange-500/10" edge="from-orange-500/70"
                   title="Table Lineage" subtitle="Impact, governance, access & more"
                   cta="Open suite" ctaColor="text-orange-400" delay={0.2} onClick={() => goTableLineage()} />
               </div>

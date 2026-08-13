@@ -44,9 +44,11 @@
   --slate-200: 30 41 59;
   --slate-300: 51 65 85;
   --slate-400: 71 85 105;
-  --slate-500: 100 116 139;
-  --slate-600: 120 133 153;
-  --slate-700: 160 170 185;
+  /* Muted/label text — darkened from the naive inversion so small mono FQNs and
+     section labels clear ~4.7:1 on white instead of washing out. */
+  --slate-500: 82 95 115;         /* #525F73 (was #64748B) */
+  --slate-600: 100 114 133;       /* #647285 (was #788599) */
+  --slate-700: 130 143 161;       /* #828FA1 (was #A0AAB9) */
   --slate-800: 226 232 240;
   --slate-900: 241 245 249;
   --app-bg: #F5F7FA;
@@ -56,6 +58,35 @@
   --node-from: #FFFFFF;
   --node-to: #F1F5F9;
 }
+
+/* ---- Light-mode legibility for accent text ----
+   The semantic accent utilities (text-<hue>-300) are literal Tailwind colors,
+   not CSS-variable tokens, so they don't remap with the theme. The -300 shades
+   are tuned for bright text on dark tinted chips; on a white surface they drop
+   well below AA. These scoped overrides (higher specificity than the single-
+   class utility, light-mode only) swap them for ~-700 shades — dark mode keeps
+   the original bright shades untouched. */
+.light .text-amber-300,   .light .text-amber-200   { color: #b45309; }
+.light .text-rose-300,    .light .text-rose-200    { color: #be123c; }
+.light .text-emerald-300, .light .text-emerald-200 { color: #047857; }
+.light .text-sky-300,     .light .text-sky-200     { color: #0369a1; }
+.light .text-cyan-300,    .light .text-cyan-200    { color: #0e7490; }
+.light .text-violet-300,  .light .text-violet-200, .light .text-purple-200 { color: #6d28d9; }
+.light .text-fuchsia-300, .light .text-fuchsia-200 { color: #a21caf; }
+.light .text-orange-300  { color: #c2410c; }
+.light .text-indigo-300  { color: #4338ca; }
+
+/* Accent icons / CTAs / lineage refs (-400) are mid-tones that read fine on a
+   dark chip but drop below AA on white — nudge them to ~-600 in light mode. */
+.light .text-amber-400   { color: #b45309; }
+.light .text-rose-400    { color: #e11d48; }
+.light .text-emerald-400 { color: #059669; }
+.light .text-sky-400     { color: #0284c7; }
+.light .text-cyan-400    { color: #0891b2; }
+.light .text-violet-400  { color: #7c3aed; }
+.light .text-fuchsia-400 { color: #c026d3; }
+.light .text-orange-400  { color: #ea580c; }
+.light .text-indigo-400  { color: #4f46e5; }
 
 @layer base {
   * {

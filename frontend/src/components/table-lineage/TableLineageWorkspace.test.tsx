@@ -27,10 +27,11 @@ vi.mock("./CatalogTreePanel", () => ({
   ),
 }));
 vi.mock("./DraggablePanel", () => ({
-  default: ({ title, children, onClose, onFocus }: any) => (
+  default: ({ title, children, onClose, onFocus, onMinimize }: any) => (
     <div data-testid="draggable-panel">
       <div>{title}</div>
       <button aria-label="focus-panel" onClick={onFocus}>focus</button>
+      <button aria-label="minimize-panel" onClick={onMinimize}>min</button>
       <button aria-label="close-panel" onClick={onClose}>close</button>
       {children}
     </div>
@@ -131,6 +132,36 @@ describe("TableLineageWorkspace", () => {
     const closeButtons = screen.getAllByLabelText("close-panel");
     fireEvent.click(closeButtons[0]);
     await waitFor(() => expect(screen.getAllByTestId("draggable-panel").length).toBe(1));
+  });
+
+  it("minimizes a panel to the dock and restores it", async () => {
+    render(<TableLineageWorkspace initialTable={TABLE} />);
+    await waitFor(() => expect(api.getLineageTrace).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: /Impact/ }));
+    expect(await screen.findByTestId("impact-panel")).toBeInTheDocument();
+
+    // minimize → panel leaves the floating layer, a dock chip appears
+    fireEvent.click(screen.getByLabelText("minimize-panel"));
+    await waitFor(() => expect(screen.queryByTestId("draggable-panel")).not.toBeInTheDocument());
+    const chip = screen.getByRole("button", { name: /Restore Impact analysis/ });
+    expect(chip).toBeInTheDocument();
+
+    // restore → floats again, dock chip gone
+    fireEvent.click(chip);
+    await waitFor(() => expect(screen.getByTestId("draggable-panel")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: /Restore Impact analysis/ })).not.toBeInTheDocument();
+  });
+
+  it("closes a minimized panel from its dock chip", async () => {
+    render(<TableLineageWorkspace initialTable={TABLE} />);
+    await waitFor(() => expect(api.getLineageTrace).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: /Impact/ }));
+    await screen.findByTestId("impact-panel");
+    fireEvent.click(screen.getByLabelText("minimize-panel"));
+    const closeChip = await screen.findByRole("button", { name: /Close Impact analysis/ });
+    fireEvent.click(closeChip);
+    await waitFor(() => expect(screen.queryByRole("button", { name: /Restore Impact analysis/ })).not.toBeInTheDocument());
+    expect(screen.queryByTestId("draggable-panel")).not.toBeInTheDocument();
   });
 
   it("clicking an open tab that is on top closes it", async () => {

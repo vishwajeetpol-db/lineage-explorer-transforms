@@ -46,4 +46,34 @@ describe("CatalogTreePanel", () => {
     // catalogs list is empty — component renders its empty hint (no catalog rows)
     expect(screen.queryByText("main")).not.toBeInTheDocument();
   });
+
+  it("toggles the rail via the Collapse control", async () => {
+    const onToggleCollapse = vi.fn();
+    const user = userEvent.setup();
+    render(<CatalogTreePanel selected={null} onSelect={() => {}} collapsed={false} onToggleCollapse={onToggleCollapse} />);
+    await user.click(screen.getByRole("button", { name: /Collapse sidebar/ }));
+    expect(onToggleCollapse).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides the tree when collapsed and expands on click", async () => {
+    const onToggleCollapse = vi.fn();
+    const user = userEvent.setup();
+    render(<CatalogTreePanel selected={null} onSelect={() => {}} collapsed onToggleCollapse={onToggleCollapse} />);
+    // collapsed: no filter box, no catalog rows
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    expect(screen.queryByText("main")).not.toBeInTheDocument();
+    // the slim rail's expand affordance and the bottom toggle both expand it
+    await user.click(screen.getByRole("button", { name: /Expand catalog/ }));
+    await user.click(screen.getByRole("button", { name: /Expand sidebar/ }));
+    expect(onToggleCollapse).toHaveBeenCalledTimes(2);
+  });
+
+  it("marks the selected table as active", async () => {
+    const user = userEvent.setup();
+    render(<CatalogTreePanel selected="main.sales.orders" onSelect={() => {}} />);
+    await user.click(screen.getByText("main"));
+    await user.click(screen.getByText("sales"));
+    // the selected row renders with the active (white) label styling
+    expect(screen.getByText("orders")).toBeInTheDocument();
+  });
 });

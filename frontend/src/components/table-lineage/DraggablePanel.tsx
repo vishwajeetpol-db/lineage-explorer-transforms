@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { X } from "lucide-react";
+import { X, Minus } from "lucide-react";
 
 /** A floating, draggable panel — grabbed by its title bar. Matches the POC's
  *  detail popups: opens near the top-right, can be dragged anywhere, closes via
@@ -8,10 +8,18 @@ import { X } from "lucide-react";
 interface Props {
   title: React.ReactNode;
   subtitle?: string;
-  accent?: string; // tailwind text color for the title icon/dot
+  /** Accent color-coding: a Tailwind `from-*` gradient stop for the top edge
+   *  strip, and a `from-*` stop for the tinted title-bar wash. Each capability
+   *  panel passes its own (rose/amber/emerald/sky/cyan/violet) so panels are
+   *  distinguishable at a glance; the body stays neutral for readability. */
+  accentEdge?: string;
+  accentHeader?: string;
   initial?: { x: number; y: number };
   width?: number;
   onClose: () => void;
+  /** When provided, a minimize button appears that docks the panel to the
+   *  bottom bar instead of closing it. */
+  onMinimize?: () => void;
   children: React.ReactNode;
   /** Stacking helpers so the focused panel comes forward. */
   z?: number;
@@ -19,7 +27,7 @@ interface Props {
 }
 
 export default function DraggablePanel({
-  title, subtitle, initial, width = 380, onClose, children, z = 40, onFocus,
+  title, subtitle, accentEdge, accentHeader, initial, width = 380, onClose, onMinimize, children, z = 40, onFocus,
 }: Props) {
   const [pos, setPos] = useState(initial ?? { x: window.innerWidth - width - 32, y: 96 });
   const drag = useRef<{ dx: number; dy: number } | null>(null);
@@ -57,27 +65,44 @@ export default function DraggablePanel({
 
   return (
     <div
-      className="fixed rounded-2xl border border-white/[0.1] bg-surface-50/95 backdrop-blur-md shadow-[0_16px_50px_rgba(0,0,0,0.35)] flex flex-col max-h-[80vh]"
+      className="fixed rounded-2xl border border-white/[0.1] bg-surface-50/95 backdrop-blur-md shadow-[0_16px_50px_rgba(0,0,0,0.35)] flex flex-col max-h-[80vh] overflow-hidden"
       style={{ left: pos.x, top: pos.y, width, zIndex: z }}
       onMouseDown={onFocus}
     >
+      {/* Accent edge — color-codes the panel by capability. */}
+      <div className={`h-[3px] shrink-0 bg-gradient-to-r to-transparent ${accentEdge ?? "from-white/20"}`} />
       {/* Title bar (drag handle) */}
       <div
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
-        className="flex items-center gap-2 px-3.5 py-2.5 border-b border-white/[0.06] cursor-move select-none rounded-t-2xl"
+        className={`flex items-center gap-2 px-3.5 py-2.5 border-b border-white/[0.06] cursor-move select-none bg-gradient-to-b to-transparent ${accentHeader ?? ""}`}
       >
         <div className="flex items-center gap-2 flex-1 min-w-0">
           <span className="text-[13px] font-semibold text-slate-100 truncate">{title}</span>
         </div>
-        <button
-          onClick={onClose}
-          onPointerDown={(e) => e.stopPropagation()}
-          className="text-slate-500 hover:text-slate-200 transition-colors shrink-0"
-        >
-          <X size={15} />
-        </button>
+        <div className="flex items-center gap-0.5 shrink-0">
+          {onMinimize && (
+            <button
+              onClick={onMinimize}
+              onPointerDown={(e) => e.stopPropagation()}
+              aria-label="Minimize panel"
+              title="Minimize to bottom"
+              className="p-0.5 rounded text-slate-500 hover:text-slate-200 hover:bg-white/10 transition-colors"
+            >
+              <Minus size={15} />
+            </button>
+          )}
+          <button
+            onClick={onClose}
+            onPointerDown={(e) => e.stopPropagation()}
+            aria-label="Close panel"
+            title="Close"
+            className="p-0.5 rounded text-slate-500 hover:text-slate-200 hover:bg-white/10 transition-colors"
+          >
+            <X size={15} />
+          </button>
+        </div>
       </div>
       {subtitle && (
         <div className="px-3.5 pt-2 font-mono text-[10px] text-slate-500 truncate">{subtitle}</div>
