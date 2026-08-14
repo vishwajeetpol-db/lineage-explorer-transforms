@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   GitFork, Play, Loader2, RefreshCw, GitCompare, AlertTriangle, History,
   Cpu, Sparkles, Layers, ArrowRight, CheckCircle2, ShieldAlert, Copy, Check, Columns3,
+  Search, Info,
 } from "lucide-react";
 import {
   api,
@@ -13,7 +14,7 @@ import {
   type ProducerCompare,
 } from "../../api/client";
 import { useLineageStore } from "../../store/lineageStore";
-import { NoTable, SectionTitle, parseFqn } from "./panelShared";
+import { NoTable, parseFqn } from "./panelShared";
 
 const ENTITY_TYPES = ["NOTEBOOK", "JOB", "PIPELINE", "QUERY"];
 
@@ -238,9 +239,14 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
   const [viewLoading, setViewLoading] = useState<string | null>(null);
 
   // Multi-producer comparison (only when the table has 2+ producers).
-  const [showProducerCompare, setShowProducerCompare] = useState(false);
   const [producerCmp, setProducerCmp] = useState<ProducerCompare | null>(null);
   const [pcLoading, setPcLoading] = useState(false);
+
+  // Panel structure: which tab is active, and a filter for the columns list.
+  type Tab = "columns" | "analyze" | "history" | "producers";
+  const [activeTab, setActiveTab] = useState<Tab>("columns");
+  const [columnFilter, setColumnFilter] = useState("");
+  const [showLegend, setShowLegend] = useState(false);
 
   const parts = parseFqn(table);
 
@@ -313,7 +319,7 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
     } finally { setLoading(false); }
   }, [table, entityType, entityId, model, loadVersions]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => { setData(null); setError(null); setEntityId(""); setCompareData(null); setAllVersions([]); setViewingVersion(null); setShowProducerCompare(false); setProducerCmp(null); }, [table]);
+  useEffect(() => { setData(null); setError(null); setEntityId(""); setCompareData(null); setAllVersions([]); setViewingVersion(null); setProducerCmp(null); setActiveTab("columns"); setColumnFilter(""); setShowLegend(false); }, [table]);
   // Kick off an initial resolve (captured plan / stored) whenever the table changes.
   useEffect(() => { if (parts) resolve(); }, [table]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -345,282 +351,338 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
   const SrcIcon = meta.icon;
   const isLLM = src === "stored" || src === "llm";
   const canReanalyze = isLLM || (data?.source === "none" && !!entityId);
+  const hasProducers = producerNodes.length >= 2;
+
+  // Columns filtered by the search box (target column or a source column).
+  const q = columnFilter.trim().toLowerCase();
+  const filteredColumns = (data?.columns ?? []).filter((c) => {
+    if (!q) return true;
+    const name = (c.target_column || c.column || "").toLowerCase();
+    const srcs = (c.source_columns || []).join(" ").toLowerCase();
+    return name.includes(q) || srcs.includes(q);
+  });
+
+  const tabs: { key: Tab; label: string; count?: number }[] = [
+    { key: "columns", label: "Columns", count: data?.columns.length || undefined },
+    { key: "analyze", label: "Analyze" },
+    { key: "history", label: "History", count: allVersions.length || undefined },
+    ...(hasProducers ? [{ key: "producers" as Tab, label: "Producers", count: producerNodes.length }] : []),
+  ];
+  // Guard: if the active tab vanished (e.g. producers on a new table), fall back.
+  const effectiveTab: Tab = activeTab === "producers" && !hasProducers ? "columns" : activeTab;
+
+  const goTab = (t: Tab) => {
+    setActiveTab(t);
+    if (t === "producers" && !producerCmp && !pcLoading) runProducerCompare(false);
+  };
 
   return (
-    <div className="space-y-4">
-      {/* Intro / precedence explainer */}
-      <div className="rounded-xl bg-gradient-to-br from-violet-500/[0.08] to-emerald-500/[0.05] border border-white/[0.08] px-4 py-3">
-        <div className="flex items-center gap-2 text-[12px] font-semibold text-slate-100">
-          <GitFork size={14} className="text-violet-400 rotate-90" /> Column Transformation Lineage
-        </div>
-        <p className="text-[11px] text-slate-500 mt-1">
-          How each column was derived — resolved best-source-first:
-        </p>
-        <div className="flex items-center gap-1 mt-2 flex-wrap text-[9px]">
-          <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">Captured plan</span>
-          <ArrowRight size={9} className="text-slate-600" />
-          <span className="px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/25">CDC spec</span>
-          <ArrowRight size={9} className="text-slate-600" />
-          <span className="px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-300 border border-violet-500/25">Stored LLM</span>
-          <ArrowRight size={9} className="text-slate-600" />
-          <span className="px-1.5 py-0.5 rounded bg-fuchsia-500/15 text-fuchsia-300 border border-fuchsia-500/25">Fresh LLM</span>
-        </div>
-      </div>
-
-      {/* Multi-producer comparison — only when this table has 2+ producers. */}
-      {producerNodes.length >= 2 && (
-        <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.06] px-3.5 py-3">
-          <div className="flex items-center gap-2">
-            <Columns3 size={14} className="text-amber-400 shrink-0" />
-            <span className="text-[12px] font-semibold text-amber-100">
-              {producerNodes.length} producers write this table
-            </span>
-            <button
-              onClick={() => {
-                const next = !showProducerCompare;
-                setShowProducerCompare(next);
-                if (next && !producerCmp) runProducerCompare(false);
-              }}
-              className="ml-auto text-[11px] px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-100 font-medium transition-colors"
-            >
-              {showProducerCompare ? "Hide comparison" : "Compare side-by-side"}
-            </button>
-          </div>
-          <p className="text-[10px] text-amber-200/80 mt-1">
-            Each may compute the same column differently — compare to catch divergent logic.
-          </p>
-
-          {showProducerCompare && (
-            <div className="mt-3">
-              {pcLoading && (
-                <div className="flex items-center justify-center gap-2 py-6 text-slate-400">
-                  <Loader2 size={15} className="animate-spin text-accent" />
-                  <span className="text-[11px]">Resolving {producerNodes.length} producers…</span>
-                </div>
-              )}
-              {!pcLoading && producerCmp && (
-                <ProducerCompareMatrix cmp={producerCmp} onRefresh={() => runProducerCompare(true)} />
-              )}
-            </div>
-          )}
-        </div>
-      )}
-
-      {loading && (
-        <div className="flex items-center justify-center gap-2 py-10 text-slate-500">
-          <Loader2 size={18} className="animate-spin text-accent" /> <span className="text-[12px]">Resolving…</span>
-        </div>
-      )}
-
-      {error && (
-        <div className="text-[11px] text-rose-300 bg-rose-500/10 border border-rose-500/25 rounded-lg px-3 py-2 break-words">{error}</div>
-      )}
-
-      {/* Source-of-truth banner */}
-      {data && !loading && (
-        <div className={`rounded-xl border px-3.5 py-3 ${
+    <div className="space-y-3">
+      {/* Compact source-of-truth header (persistent across tabs). */}
+      {data && (
+        <div className={`rounded-xl border px-3 py-2 ${
           src === "plan_capture" ? "bg-emerald-500/[0.07] border-emerald-500/25"
           : src === "cdc_spec" ? "bg-sky-500/[0.07] border-sky-500/25"
           : isLLM ? "bg-violet-500/[0.07] border-violet-500/25"
           : "bg-surface-100/50 border-white/[0.08]"
         }`}>
           <div className="flex items-center gap-2">
-            <SrcIcon size={15} className={meta.color} />
-            <span className="text-[12px] font-semibold text-slate-100">{data.source_label || meta.label}</span>
-            {src === "plan_capture" && <CheckCircle2 size={13} className="text-emerald-400 ml-auto" />}
-            {data.version != null && <span className="text-[10px] text-slate-500 ml-auto">v{data.version}</span>}
+            <SrcIcon size={14} className={`${meta.color} shrink-0`} />
+            <span className="text-[12px] font-semibold text-slate-100 truncate">{data.source_label || meta.label}</span>
+            {data.version != null && <span className="text-[10px] text-slate-500 shrink-0">v{data.version}</span>}
+            {data.columns.length > 0 && <span className="text-[10px] text-slate-500 shrink-0">· {data.columns.length} cols</span>}
+            {src === "plan_capture" && <CheckCircle2 size={12} className="text-emerald-400 shrink-0" />}
+            <button onClick={() => setShowLegend((v) => !v)} title="How lineage is resolved"
+              className="ml-auto shrink-0 text-slate-500 hover:text-accent-light transition-colors">
+              <Info size={13} />
+            </button>
           </div>
-          {meta.blurb && <p className="text-[10px] text-slate-500 mt-1">{meta.blurb}</p>}
-          {(data.captured_at || data.analyzed_at) && (
-            <p className="text-[10px] text-slate-600 mt-0.5">{(data.captured_at || data.analyzed_at || "").slice(0, 19).replace("T", " ")}</p>
-          )}
           {data.stale && (
             <div className="flex items-center gap-1.5 text-[10px] text-amber-200 bg-amber-500/10 border border-amber-500/25 rounded-lg px-2 py-1 mt-2">
               <AlertTriangle size={11} /> Producer source changed since this analysis — re-analyze to refresh.
             </div>
           )}
-        </div>
-      )}
-
-      {/* CDC spec detail */}
-      {data?.source === "cdc_spec" && data.cdc_spec && (
-        <div className="rounded-xl border border-white/[0.06] bg-surface-100/40 px-3 py-2.5 text-[11px] text-slate-300 space-y-1">
-          <div><span className="text-slate-500">Source:</span> <span className="font-mono">{data.cdc_spec.source || "—"}</span></div>
-          <div><span className="text-slate-500">Keys:</span> <span className="font-mono">{JSON.stringify(data.cdc_spec.keys)}</span></div>
-          <div><span className="text-slate-500">Sequence by:</span> <span className="font-mono">{data.cdc_spec.sequence_by || "—"}</span> · <span className="text-slate-500">SCD</span> {String(data.cdc_spec.scd_type)}</div>
-        </div>
-      )}
-
-      {/* Columns */}
-      {data && data.columns.length > 0 && (
-        <div>
-          <SectionTitle>Columns ({data.columns.length})</SectionTitle>
-          <div className="rounded-xl border border-white/[0.06] overflow-hidden divide-y divide-white/[0.04]">
-            {data.columns.map((c, i) => <ColumnCard key={i} c={c} />)}
-          </div>
-        </div>
-      )}
-
-      {data && data.columns.length === 0 && !loading && data.source !== "cdc_spec" && (
-        data.reason_code === "access_denied"
-          ? <AccessDeniedNotice data={data} />
-          : (
-            <div className="text-[11px] text-slate-500 py-2">
-              {data.detail || "No column transformations resolved. Pick a producer below to run LLM analysis."}
+          {/* Precedence legend (on demand) */}
+          {showLegend && (
+            <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-1.5">
+              <p className="text-[10px] text-slate-500">Each column is resolved best-source-first:</p>
+              <div className="flex items-center gap-1 flex-wrap text-[9px]">
+                <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">Captured plan</span>
+                <ArrowRight size={9} className="text-slate-600" />
+                <span className="px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/25">CDC spec</span>
+                <ArrowRight size={9} className="text-slate-600" />
+                <span className="px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-300 border border-violet-500/25">Stored LLM</span>
+                <ArrowRight size={9} className="text-slate-600" />
+                <span className="px-1.5 py-0.5 rounded bg-fuchsia-500/15 text-fuchsia-300 border border-fuchsia-500/25">Fresh LLM</span>
+              </div>
+              {meta.blurb && <p className="text-[10px] text-slate-500">{meta.blurb}</p>}
+              {(data.captured_at || data.analyzed_at) && (
+                <p className="text-[10px] text-slate-600">{(data.captured_at || data.analyzed_at || "").slice(0, 19).replace("T", " ")}</p>
+              )}
             </div>
-          )
+          )}
+        </div>
       )}
 
-      {/* Producer + model — only needed for the LLM path */}
-      <div className="rounded-xl bg-surface-100/40 border border-white/[0.06] px-3 py-3 space-y-2.5">
-        <div className="text-[11px] font-medium text-slate-300 flex items-center gap-1.5">
-          <Sparkles size={12} className="text-violet-400" /> LLM analysis (fallback / refresh)
-        </div>
-        {entityNodes.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
-            {entityNodes.map((e) => (
-              <button key={e.id} onClick={() => pickProducer(e.entity_type || "PIPELINE", e.entity_id)}
-                className={`text-[11px] px-2 py-1 rounded-lg border transition-colors ${
-                  entityId === e.entity_id ? "bg-violet-500/20 border-violet-500/40 text-violet-200"
-                  : "bg-surface-100/60 border-white/[0.06] text-slate-300 hover:border-violet-500/30"
-                }`}>
-                {e.display_name || `${e.entity_type} ${e.entity_id}`}
-              </button>
-            ))}
-          </div>
-        )}
-        <div className="flex gap-1.5">
-          <select value={entityType} onChange={(e) => setEntityType(e.target.value)}
-            className="px-2 py-1.5 bg-surface-100 border border-white/[0.08] rounded-lg text-[11px] text-slate-200 outline-none focus:border-accent/50">
-            {ENTITY_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
-          </select>
-          <input value={entityId} onChange={(e) => setEntityId(e.target.value)} placeholder="entity id"
-            className="flex-1 min-w-0 px-2.5 py-1.5 bg-surface-100 border border-white/[0.08] rounded-lg text-[11px] text-slate-200 font-mono placeholder:text-slate-600 outline-none focus:border-accent/50" />
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] uppercase tracking-wider text-slate-500 shrink-0">Model</span>
-          <select value={model} onChange={(e) => setModel(e.target.value)}
-            className="flex-1 min-w-0 px-2 py-1.5 bg-surface-100 border border-white/[0.08] rounded-lg text-[11px] text-slate-200 font-mono outline-none focus:border-accent/50">
-            {models.map((m) => <option key={m} value={m}>{m}</option>)}
-          </select>
-        </div>
-        <button onClick={() => resolve({ et: entityType, eid: entityId, force: true })}
-          disabled={loading || !entityId.trim()}
-          className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-violet-500/15 hover:bg-violet-500/25 border border-violet-500/30 text-violet-200 text-[12px] font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed">
-          {loading ? <Loader2 size={13} className="animate-spin" /> : canReanalyze ? <RefreshCw size={13} /> : <Play size={13} />}
-          {loading ? "Working…" : canReanalyze ? "Re-analyze with LLM (new version)" : "Analyze with LLM"}
-        </button>
+      {/* Tabs */}
+      <div role="tablist" className="flex items-center gap-1 border-b border-white/[0.06]">
+        {tabs.map((t) => (
+          <button key={t.key} role="tab" aria-selected={effectiveTab === t.key} onClick={() => goTab(t.key)}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-medium border-b-2 -mb-px transition-colors ${
+              effectiveTab === t.key
+                ? "border-violet-400 text-slate-100"
+                : "border-transparent text-slate-500 hover:text-slate-300"
+            }`}>
+            {t.label}
+            {t.count != null && (
+              <span className={`text-[9px] px-1 rounded ${effectiveTab === t.key ? "bg-violet-500/20 text-violet-200" : "bg-surface-200 text-slate-500"}`}>{t.count}</span>
+            )}
+          </button>
+        ))}
       </div>
 
-      {/* Unified version history + cross-source compare */}
-      {allVersions.length > 0 && (
-        <div className="rounded-xl bg-surface-100/40 border border-white/[0.06] px-3 py-3 space-y-2.5">
-          <div className="flex items-center gap-1.5 text-[11px] text-slate-300">
-            <History size={13} className="text-cyan-400" /> Version history ({allVersions.length})
-          </div>
+      {/* Top-level error (any tab) */}
+      {error && (
+        <div className="text-[11px] text-rose-300 bg-rose-500/10 border border-rose-500/25 rounded-lg px-3 py-2 break-words">{error}</div>
+      )}
 
-          {/* All versions, source-tagged — click to view that version's columns */}
-          <div className="rounded-lg border border-white/[0.06] overflow-hidden divide-y divide-white/[0.04] max-h-40 overflow-y-auto">
-            {allVersions.map((v) => {
-              const isPlan = v.source === "plan_capture";
-              const active = viewingVersion?.ref === v.ref;
-              return (
-                <button key={v.ref} onClick={() => viewVersion(v.ref)}
-                  className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-left transition-colors ${
-                    active ? "bg-accent/15" : "bg-surface-100/40 hover:bg-white/[0.04]"}`}>
-                  <span className={`text-[8px] px-1.5 py-0.5 rounded border uppercase tracking-wide shrink-0 ${
-                    isPlan ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/25"
-                           : "bg-violet-500/15 text-violet-300 border-violet-500/25"}`}>
-                    {isPlan ? "plan" : "llm"}
-                  </span>
-                  <span className={`text-[11px] truncate flex-1 ${active ? "text-accent-light" : "text-slate-200"}`}>{v.label}</span>
-                  {viewLoading === v.ref && <Loader2 size={11} className="animate-spin text-accent shrink-0" />}
-                  {v.analyzed_at && <span className="text-[9px] text-slate-600 shrink-0">{v.analyzed_at.slice(0, 10)}</span>}
-                </button>
-              );
-            })}
-          </div>
-
-          {/* Viewing a specific version's columns */}
-          {viewingVersion && (
-            <div className="rounded-lg border border-accent/25 bg-accent/[0.04] overflow-hidden">
-              <div className="flex items-center gap-2 px-2.5 py-1.5 border-b border-white/[0.06]">
-                <History size={12} className="text-accent-light" />
-                <span className="text-[11px] font-medium text-slate-100">{viewingVersion.label}</span>
-                <span className="text-[9px] text-slate-500">{viewingVersion.columns.length} cols</span>
-                <button onClick={() => setViewingVersion(null)} className="ml-auto text-[10px] text-slate-500 hover:text-accent-light">
-                  ✕ back to current
-                </button>
-              </div>
-              <div className="divide-y divide-white/[0.04] max-h-72 overflow-y-auto">
-                {viewingVersion.columns.length === 0 && (
-                  <div className="px-2.5 py-2 text-[10px] text-slate-600">This version has no per-column detail.</div>
-                )}
-                {viewingVersion.columns.map((c, i) => <ColumnCard key={i} c={c} />)}
-              </div>
+      {/* ---- Columns tab ---- */}
+      {effectiveTab === "columns" && (
+        <div className="space-y-2">
+          {loading && !data && (
+            <div className="flex items-center justify-center gap-2 py-10 text-slate-500">
+              <Loader2 size={18} className="animate-spin text-accent" /> <span className="text-[12px]">Resolving…</span>
             </div>
           )}
 
-          {/* Cross-source compare (only meaningful with 2+ versions) */}
-          {allVersions.length > 1 && (
+          {/* CDC spec detail */}
+          {data?.source === "cdc_spec" && data.cdc_spec && (
+            <div className="rounded-xl border border-white/[0.06] bg-surface-100/40 px-3 py-2.5 text-[11px] text-slate-300 space-y-1">
+              <div><span className="text-slate-500">Source:</span> <span className="font-mono">{data.cdc_spec.source || "—"}</span></div>
+              <div><span className="text-slate-500">Keys:</span> <span className="font-mono">{JSON.stringify(data.cdc_spec.keys)}</span></div>
+              <div><span className="text-slate-500">Sequence by:</span> <span className="font-mono">{data.cdc_spec.sequence_by || "—"}</span> · <span className="text-slate-500">SCD</span> {String(data.cdc_spec.scd_type)}</div>
+            </div>
+          )}
+
+          {data && data.columns.length > 0 && (
             <>
-              <div className="flex items-center gap-1.5 text-[10px] text-slate-500 pt-1">
-                <GitCompare size={12} className="text-cyan-400" /> Compare any two — including captured plan vs LLM
-              </div>
-              <div className="flex items-center gap-2">
-                <select value={compareFrom} onChange={(e) => setCompareFrom(e.target.value)}
-                  className="flex-1 min-w-0 px-2 py-1.5 bg-surface-100 border border-white/[0.08] rounded-lg text-[11px] text-slate-200 outline-none focus:border-accent/50">
-                  <option value="">from…</option>
-                  {allVersions.map((v) => <option key={v.ref} value={v.ref}>{v.label}</option>)}
-                </select>
-                <span className="text-slate-600">→</span>
-                <select value={compareTo} onChange={(e) => setCompareTo(e.target.value)}
-                  className="flex-1 min-w-0 px-2 py-1.5 bg-surface-100 border border-white/[0.08] rounded-lg text-[11px] text-slate-200 outline-none focus:border-accent/50">
-                  <option value="">to…</option>
-                  {allVersions.map((v) => <option key={v.ref} value={v.ref}>{v.label}</option>)}
-                </select>
-                <button onClick={runCompare} disabled={comparing || !compareFrom || !compareTo || compareFrom === compareTo}
-                  className="px-2.5 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 text-cyan-200 text-[11px] font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed shrink-0">
-                  {comparing ? <Loader2 size={12} className="animate-spin" /> : "Diff"}
-                </button>
+              {data.columns.length > 6 && (
+                <div className="flex items-center gap-2 px-2.5 py-1.5 bg-surface-100/60 border border-white/[0.08] rounded-lg focus-within:border-accent/40">
+                  <Search size={12} className="text-slate-500 shrink-0" />
+                  <input value={columnFilter} onChange={(e) => setColumnFilter(e.target.value)} placeholder="Filter columns…"
+                    className="bg-transparent text-[11px] text-slate-200 placeholder:text-slate-600 outline-none flex-1 min-w-0" />
+                </div>
+              )}
+              <div className="rounded-xl border border-white/[0.06] overflow-hidden divide-y divide-white/[0.04]">
+                {filteredColumns.map((c, i) => <ColumnCard key={i} c={c} />)}
+                {filteredColumns.length === 0 && (
+                  <div className="px-3 py-3 text-[10px] text-slate-600">No columns match “{columnFilter}”.</div>
+                )}
               </div>
             </>
           )}
 
-          {compareData && (
-            <div className="space-y-2 pt-1">
-              <div className="flex items-center gap-2 text-[10px]">
-                <span className="text-slate-500">{compareData.from.label}</span>
-                <ArrowRight size={10} className="text-slate-600" />
-                <span className="text-slate-500">{compareData.to.label}</span>
-                {compareData.cross_source && (
-                  <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/25 uppercase tracking-wide">cross-source</span>
-                )}
-                <span className="text-slate-500 ml-auto">{compareData.changed_count} change{compareData.changed_count !== 1 && "s"}</span>
-              </div>
-              <div className="rounded-lg border border-white/[0.06] overflow-hidden divide-y divide-white/[0.04]">
-                {compareData.column_diffs.filter((d) => d.status !== "unchanged").length === 0 && (
-                  <div className="px-2.5 py-2 text-[10px] text-slate-600">No differences between these versions.</div>
-                )}
-                {compareData.column_diffs.filter((d) => d.status !== "unchanged").map((d) => (
-                  <div key={d.column} className="px-2.5 py-1.5 bg-surface-100/40">
-                    <div className="flex items-center gap-2">
-                      <span className={`text-[9px] px-1.5 py-0.5 rounded uppercase ${
-                        d.status === "added" ? "bg-emerald-500/15 text-emerald-300"
-                        : d.status === "removed" ? "bg-rose-500/15 text-rose-300"
-                        : "bg-amber-500/15 text-amber-300"}`}>{d.status}</span>
-                      <span className="font-mono text-[11px] text-slate-200">{d.column}</span>
-                    </div>
-                    {d.status === "changed" && (
-                      <div className="mt-1 space-y-0.5 font-mono text-[10px]">
-                        <div className="text-rose-300/80 break-words">- {d.from?.expression || d.from?.transformation || "(none)"}</div>
-                        <div className="text-emerald-300/80 break-words">+ {d.to?.expression || d.to?.transformation || "(none)"}</div>
-                      </div>
-                    )}
-                  </div>
+          {data && data.columns.length === 0 && !loading && data.source !== "cdc_spec" && (
+            data.reason_code === "access_denied"
+              ? <AccessDeniedNotice data={data} />
+              : (
+                <div className="text-[11px] text-slate-500 py-2 space-y-2">
+                  <p>{data.detail || "No column transformations resolved yet."}</p>
+                  <button onClick={() => setActiveTab("analyze")}
+                    className="flex items-center gap-1.5 text-[11px] px-2.5 py-1.5 rounded-lg bg-violet-500/15 hover:bg-violet-500/25 border border-violet-500/30 text-violet-200 font-medium transition-colors">
+                    <Sparkles size={12} /> Run LLM analysis
+                  </button>
+                </div>
+              )
+          )}
+        </div>
+      )}
+
+      {/* ---- Analyze tab ---- */}
+      {effectiveTab === "analyze" && (
+        <div className="space-y-2.5">
+          <p className="text-[11px] text-slate-500 flex items-center gap-1.5">
+            <Sparkles size={12} className="text-violet-400 shrink-0" />
+            Infer column lineage from a producer&apos;s source code when no captured plan exists — or refresh a stale one.
+          </p>
+          {data?.reason_code === "access_denied" && <AccessDeniedNotice data={data} />}
+          {producerNodes.length > 0 && (
+            <div className="space-y-1">
+              <div className="text-[10px] uppercase tracking-wider text-slate-500">Producers of this table</div>
+              <div className="flex flex-wrap gap-1.5">
+                {producerNodes.map((e) => (
+                  <button key={e.id} onClick={() => pickProducer(e.entity_type || "PIPELINE", e.entity_id)}
+                    className={`text-[11px] px-2 py-1 rounded-lg border transition-colors ${
+                      entityId === e.entity_id ? "bg-violet-500/20 border-violet-500/40 text-violet-200"
+                      : "bg-surface-100/60 border-white/[0.06] text-slate-300 hover:border-violet-500/30"
+                    }`}>
+                    {e.display_name || `${e.entity_type} ${e.entity_id}`}
+                  </button>
                 ))}
               </div>
             </div>
+          )}
+          <div className="flex gap-1.5">
+            <select value={entityType} onChange={(e) => setEntityType(e.target.value)}
+              className="px-2 py-1.5 bg-surface-100 border border-white/[0.08] rounded-lg text-[11px] text-slate-200 outline-none focus:border-accent/50">
+              {ENTITY_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>
+            <input value={entityId} onChange={(e) => setEntityId(e.target.value)} placeholder="entity id"
+              className="flex-1 min-w-0 px-2.5 py-1.5 bg-surface-100 border border-white/[0.08] rounded-lg text-[11px] text-slate-200 font-mono placeholder:text-slate-600 outline-none focus:border-accent/50" />
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] uppercase tracking-wider text-slate-500 shrink-0">Model</span>
+            <select value={model} onChange={(e) => setModel(e.target.value)}
+              className="flex-1 min-w-0 px-2 py-1.5 bg-surface-100 border border-white/[0.08] rounded-lg text-[11px] text-slate-200 font-mono outline-none focus:border-accent/50">
+              {models.map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </div>
+          <button onClick={() => resolve({ et: entityType, eid: entityId, force: true })}
+            disabled={loading || !entityId.trim()}
+            className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-violet-500/15 hover:bg-violet-500/25 border border-violet-500/30 text-violet-200 text-[12px] font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed">
+            {loading ? <Loader2 size={13} className="animate-spin" /> : canReanalyze ? <RefreshCw size={13} /> : <Play size={13} />}
+            {loading ? "Working…" : canReanalyze ? "Re-analyze with LLM (new version)" : "Analyze with LLM"}
+          </button>
+        </div>
+      )}
+
+      {/* ---- History tab ---- */}
+      {effectiveTab === "history" && (
+        allVersions.length === 0 ? (
+          <div className="text-[11px] text-slate-500 py-6 text-center">No analysis versions yet. Run an LLM analysis or capture a plan to build history.</div>
+        ) : (
+          <div className="space-y-2.5">
+            {/* All versions, source-tagged — click to view that version's columns */}
+            <div className="rounded-lg border border-white/[0.06] overflow-hidden divide-y divide-white/[0.04] max-h-40 overflow-y-auto">
+              {allVersions.map((v) => {
+                const isPlan = v.source === "plan_capture";
+                const active = viewingVersion?.ref === v.ref;
+                return (
+                  <button key={v.ref} onClick={() => viewVersion(v.ref)}
+                    className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-left transition-colors ${
+                      active ? "bg-accent/15" : "bg-surface-100/40 hover:bg-white/[0.04]"}`}>
+                    <span className={`text-[8px] px-1.5 py-0.5 rounded border uppercase tracking-wide shrink-0 ${
+                      isPlan ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/25"
+                             : "bg-violet-500/15 text-violet-300 border-violet-500/25"}`}>
+                      {isPlan ? "plan" : "llm"}
+                    </span>
+                    <span className={`text-[11px] truncate flex-1 ${active ? "text-accent-light" : "text-slate-200"}`}>{v.label}</span>
+                    {viewLoading === v.ref && <Loader2 size={11} className="animate-spin text-accent shrink-0" />}
+                    {v.analyzed_at && <span className="text-[9px] text-slate-600 shrink-0">{v.analyzed_at.slice(0, 10)}</span>}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Viewing a specific version's columns */}
+            {viewingVersion && (
+              <div className="rounded-lg border border-accent/25 bg-accent/[0.04] overflow-hidden">
+                <div className="flex items-center gap-2 px-2.5 py-1.5 border-b border-white/[0.06]">
+                  <History size={12} className="text-accent-light" />
+                  <span className="text-[11px] font-medium text-slate-100">{viewingVersion.label}</span>
+                  <span className="text-[9px] text-slate-500">{viewingVersion.columns.length} cols</span>
+                  <button onClick={() => setViewingVersion(null)} className="ml-auto text-[10px] text-slate-500 hover:text-accent-light">
+                    ✕ back to current
+                  </button>
+                </div>
+                <div className="divide-y divide-white/[0.04] max-h-72 overflow-y-auto">
+                  {viewingVersion.columns.length === 0 && (
+                    <div className="px-2.5 py-2 text-[10px] text-slate-600">This version has no per-column detail.</div>
+                  )}
+                  {viewingVersion.columns.map((c, i) => <ColumnCard key={i} c={c} />)}
+                </div>
+              </div>
+            )}
+
+            {/* Cross-source compare (only meaningful with 2+ versions) */}
+            {allVersions.length > 1 && (
+              <>
+                <div className="flex items-center gap-1.5 text-[10px] text-slate-500 pt-1">
+                  <GitCompare size={12} className="text-cyan-400" /> Compare any two — including captured plan vs LLM
+                </div>
+                <div className="flex items-center gap-2">
+                  <select value={compareFrom} onChange={(e) => setCompareFrom(e.target.value)}
+                    className="flex-1 min-w-0 px-2 py-1.5 bg-surface-100 border border-white/[0.08] rounded-lg text-[11px] text-slate-200 outline-none focus:border-accent/50">
+                    <option value="">from…</option>
+                    {allVersions.map((v) => <option key={v.ref} value={v.ref}>{v.label}</option>)}
+                  </select>
+                  <span className="text-slate-600">→</span>
+                  <select value={compareTo} onChange={(e) => setCompareTo(e.target.value)}
+                    className="flex-1 min-w-0 px-2 py-1.5 bg-surface-100 border border-white/[0.08] rounded-lg text-[11px] text-slate-200 outline-none focus:border-accent/50">
+                    <option value="">to…</option>
+                    {allVersions.map((v) => <option key={v.ref} value={v.ref}>{v.label}</option>)}
+                  </select>
+                  <button onClick={runCompare} disabled={comparing || !compareFrom || !compareTo || compareFrom === compareTo}
+                    className="px-2.5 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 text-cyan-200 text-[11px] font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed shrink-0">
+                    {comparing ? <Loader2 size={12} className="animate-spin" /> : "Diff"}
+                  </button>
+                </div>
+              </>
+            )}
+
+            {compareData && (
+              <div className="space-y-2 pt-1">
+                <div className="flex items-center gap-2 text-[10px]">
+                  <span className="text-slate-500">{compareData.from.label}</span>
+                  <ArrowRight size={10} className="text-slate-600" />
+                  <span className="text-slate-500">{compareData.to.label}</span>
+                  {compareData.cross_source && (
+                    <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/25 uppercase tracking-wide">cross-source</span>
+                  )}
+                  <span className="text-slate-500 ml-auto">{compareData.changed_count} change{compareData.changed_count !== 1 && "s"}</span>
+                </div>
+                <div className="rounded-lg border border-white/[0.06] overflow-hidden divide-y divide-white/[0.04]">
+                  {compareData.column_diffs.filter((d) => d.status !== "unchanged").length === 0 && (
+                    <div className="px-2.5 py-2 text-[10px] text-slate-600">No differences between these versions.</div>
+                  )}
+                  {compareData.column_diffs.filter((d) => d.status !== "unchanged").map((d) => (
+                    <div key={d.column} className="px-2.5 py-1.5 bg-surface-100/40">
+                      <div className="flex items-center gap-2">
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded uppercase ${
+                          d.status === "added" ? "bg-emerald-500/15 text-emerald-300"
+                          : d.status === "removed" ? "bg-rose-500/15 text-rose-300"
+                          : "bg-amber-500/15 text-amber-300"}`}>{d.status}</span>
+                        <span className="font-mono text-[11px] text-slate-200">{d.column}</span>
+                      </div>
+                      {d.status === "changed" && (
+                        <div className="mt-1 space-y-0.5 font-mono text-[10px]">
+                          <div className="text-rose-300/80 break-words">- {d.from?.expression || d.from?.transformation || "(none)"}</div>
+                          <div className="text-emerald-300/80 break-words">+ {d.to?.expression || d.to?.transformation || "(none)"}</div>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )
+      )}
+
+      {/* ---- Producers tab (only when 2+ producers) ---- */}
+      {effectiveTab === "producers" && hasProducers && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 text-[12px] font-semibold text-slate-100">
+            <Columns3 size={14} className="text-amber-400 shrink-0" />
+            {producerNodes.length} producers write this table
+          </div>
+          <p className="text-[10px] text-slate-500">
+            Each may compute the same column differently — compare to catch divergent logic.
+          </p>
+          {pcLoading && (
+            <div className="flex items-center justify-center gap-2 py-6 text-slate-400">
+              <Loader2 size={15} className="animate-spin text-accent" />
+              <span className="text-[11px]">Resolving {producerNodes.length} producers…</span>
+            </div>
+          )}
+          {!pcLoading && producerCmp && (
+            <ProducerCompareMatrix cmp={producerCmp} onRefresh={() => runProducerCompare(true)} />
+          )}
+          {!pcLoading && !producerCmp && (
+            <button onClick={() => runProducerCompare(false)}
+              className="flex items-center gap-1.5 text-[11px] px-2.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-100 font-medium transition-colors">
+              <Columns3 size={12} /> Compare side-by-side
+            </button>
           )}
         </div>
       )}

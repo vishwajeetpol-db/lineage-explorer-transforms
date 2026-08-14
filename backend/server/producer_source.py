@@ -664,8 +664,6 @@ def compare_transformation_versions(
     """Diff two transformation versions from ANY source (captured plan or LLM),
     per-column. Lets you compare, e.g., the exact captured-plan lineage against
     an LLM deduction to see where the model differs from ground truth."""
-    import json as _json
-
     a = _columns_for_ref(catalog, schema, table, ref_from, entity_type, entity_id)
     b = _columns_for_ref(catalog, schema, table, ref_to, entity_type, entity_id)
     if a is None or b is None:
@@ -675,12 +673,14 @@ def compare_transformation_versions(
         return c.get("target_column") or c.get("column")
 
     def _cmp(c: dict) -> str:
-        # Compare on the meaningful fields only (expression + source columns),
-        # so cross-source cosmetic differences (category naming) don't dominate.
-        return _json.dumps({
-            "expr": c.get("expression") or c.get("transformation") or "",
-            "src": sorted(c.get("source_columns") or []),
-        }, sort_keys=True)
+        # Compare on the normalized expression only — that's the authoritative
+        # "how the column is computed" and exactly what the diff UI renders.
+        # `source_columns` is DERIVED from the expression and, for captured Spark
+        # plans, the parser can emit cosmetically different source-column sets for
+        # two captures of the SAME plan (identical expression). Keying on it made
+        # every column show as "changed" against an identical expression — a false
+        # diff. Whitespace is stripped so re-captures don't diff on formatting.
+        return (c.get("expression") or c.get("transformation") or "").strip()
 
     ma = {_key(c): c for c in a["columns"] if _key(c)}
     mb = {_key(c): c for c in b["columns"] if _key(c)}

@@ -28,14 +28,14 @@ type TabKey = "impact" | "rootCause" | "governance" | "access" | "ml" | "llm";
  *  violet = AI/transforms. */
 const TABS: {
   key: TabKey; label: string; icon: typeof GitBranch;
-  accent: string; edge: string; header: string; chip: string;
+  accent: string; edge: string; header: string; chip: string; width?: number;
 }[] = [
   { key: "impact", label: "Impact", icon: ShieldAlert, accent: "text-rose-400", edge: "from-rose-500/70", header: "from-rose-500/10", chip: "bg-rose-500/15" },
   { key: "rootCause", label: "Root Cause", icon: Stethoscope, accent: "text-amber-400", edge: "from-amber-500/70", header: "from-amber-500/10", chip: "bg-amber-500/15" },
   { key: "governance", label: "Governance", icon: ScrollText, accent: "text-emerald-400", edge: "from-emerald-500/70", header: "from-emerald-500/10", chip: "bg-emerald-500/15" },
   { key: "access", label: "Access", icon: KeyRound, accent: "text-sky-400", edge: "from-sky-500/70", header: "from-sky-500/10", chip: "bg-sky-500/15" },
   { key: "ml", label: "ML Models", icon: Boxes, accent: "text-cyan-400", edge: "from-cyan-500/70", header: "from-cyan-500/10", chip: "bg-cyan-500/15" },
-  { key: "llm", label: "Column Transformation", icon: Sparkles, accent: "text-violet-400", edge: "from-violet-500/70", header: "from-violet-500/10", chip: "bg-violet-500/15" },
+  { key: "llm", label: "Column Transformation", icon: Sparkles, accent: "text-violet-400", edge: "from-violet-500/70", header: "from-violet-500/10", chip: "bg-violet-500/15", width: 460 },
 ];
 
 const PANEL_TITLE: Record<TabKey, string> = {
@@ -290,6 +290,7 @@ export default function TableLineageWorkspace({ initialTable }: { initialTable?:
       {visiblePanels.map((key, idx) => {
         const T = TABS.find((t) => t.key === key)!;
         const I = T.icon;
+        const w = T.width ?? 380;
         return (
           <DraggablePanel
             key={key}
@@ -304,7 +305,8 @@ export default function TableLineageWorkspace({ initialTable }: { initialTable?:
             subtitle={selected || undefined}
             accentEdge={T.edge}
             accentHeader={T.header}
-            initial={{ x: window.innerWidth - 380 - 32 - idx * 28, y: 120 + idx * 28 }}
+            width={w}
+            initial={{ x: window.innerWidth - w - 32 - idx * 28, y: 120 + idx * 28 }}
             z={40 + idx}
             onFocus={() => bringToFront(key)}
             onMinimize={() => minimizePanel(key)}

@@ -67,7 +67,7 @@ describe("ColumnTransformationPanel", () => {
     expect(screen.getByText("/Workspace/x/nb")).toBeInTheDocument();
   });
 
-  it("shows the multi-producer banner and runs the comparison", async () => {
+  it("shows the Producers tab and runs the comparison", async () => {
     seedProducers();
     (api.compareProducers as any).mockResolvedValue({
       table_full_name: TABLE,
@@ -85,8 +85,10 @@ describe("ColumnTransformationPanel", () => {
     });
     const user = userEvent.setup();
     render(<ColumnTransformationPanel table={TABLE} />);
+    await waitFor(() => expect(api.resolveColumnTransformations).toHaveBeenCalled());
+    // Open the Producers tab — this auto-runs the comparison.
+    await user.click(screen.getByRole("tab", { name: /Producers/i }));
     expect(await screen.findByText(/2 producers write this table/i)).toBeInTheDocument();
-    await user.click(screen.getByText(/compare side-by-side/i));
     await waitFor(() => expect(api.compareProducers).toHaveBeenCalled());
     // The matrix renders producer_a's divergent expression (unique to the matrix).
     expect(await screen.findByText("amount*fx")).toBeInTheDocument();
@@ -113,9 +115,9 @@ describe("ColumnTransformationPanel", () => {
     });
     const user = userEvent.setup();
     render(<ColumnTransformationPanel table={TABLE} />);
-    // "Version history (2)" header confirms the list rendered.
-    expect(await screen.findByText(/version history/i)).toBeInTheDocument();
-    // Click the history-row entry (first "LLM v2" occurrence) to view it.
+    await waitFor(() => expect(api.listColumnTransformationVersions).toHaveBeenCalled());
+    // Open the History tab, then click a version row to view it.
+    await user.click(screen.getByRole("tab", { name: /History/i }));
     await user.click((await screen.findAllByText("LLM v2"))[0]);
     await waitFor(() => expect(api.getTransformationVersion).toHaveBeenCalled());
   });
@@ -127,12 +129,14 @@ describe("ColumnTransformationPanel", () => {
         { ref: "plan_capture:1", source: "plan_capture", label: "Captured plan v1", analyzed_at: "2026-07-01T00:00:00Z" },
       ],
     });
+    const user = userEvent.setup();
     render(<ColumnTransformationPanel table={TABLE} />);
-    // Version history + the compare "from…/to…" dropdowns render (allVersions>1 branch).
-    expect(await screen.findByText(/version history/i)).toBeInTheDocument();
-    const selects = screen.getAllByRole("combobox");
-    // model dropdown + 2 compare selects
-    expect(selects.length).toBeGreaterThanOrEqual(3);
+    await waitFor(() => expect(api.listColumnTransformationVersions).toHaveBeenCalled());
+    // The compare "from…/to…" dropdowns live on the History tab (allVersions>1 branch).
+    await user.click(screen.getByRole("tab", { name: /History/i }));
+    const selects = await screen.findAllByRole("combobox");
+    // 2 compare selects on the History tab (model dropdown is on the Analyze tab)
+    expect(selects.length).toBe(2);
     expect(screen.getByText(/diff/i)).toBeInTheDocument();
   });
 
@@ -140,7 +144,8 @@ describe("ColumnTransformationPanel", () => {
     const user = userEvent.setup();
     render(<ColumnTransformationPanel table={TABLE} />);
     await screen.findAllByText("amount_usd");
-    // type an entity id then click the analyze button
+    // Analyze controls live on the Analyze tab.
+    await user.click(screen.getByRole("tab", { name: /Analyze/i }));
     const idInput = screen.getByPlaceholderText(/entity id/i);
     await user.type(idInput, "job-123");
     const btn = screen.getByRole("button", { name: /analyze with llm|re-analyze/i });
