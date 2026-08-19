@@ -432,12 +432,53 @@ export interface ColumnTransformResult {
   llm_model: string | null;
   captured_at?: string;
   analyzed_at?: string;
+  // Plain fallback label for the producer this lineage came from (set when the
+  // panel opens without a producer picked and surfaces an existing analysis).
+  producer_label?: string | null;
   cdc_spec?: { keys?: unknown; sequence_by?: string; scd_type?: unknown; source?: string; version?: number };
   detail?: string | null;
   // Actionable failure metadata (present when producer source couldn't be read).
-  reason_code?: "access_denied" | "entity_missing" | "no_source" | null;
+  reason_code?: "access_denied" | "entity_missing" | "no_source" | "no_columns" | "llm_error" | "llm_not_configured" | null;
   denied_paths?: string[] | null;
   app_service_principal?: string | null;
+}
+
+/** Streaming events from the metadata-driven-framework deep analysis. */
+export interface DeepAnalyzeStep {
+  type: "step";
+  step: string;
+  status: "running" | "ok" | "warn" | "error";
+  message: string;
+  config_tables?: string[];
+  parameters?: Record<string, unknown>;
+}
+export interface DeepAnalyzeResultEvent {
+  type: "result";
+  derived: boolean;
+  columns: AnalyzeProducerColumn[];
+  version?: number | null;
+  detail?: string;
+  derived_via?: string;
+  config_tables?: string[];
+}
+export interface DeepAnalyzeErrorEvent { type: "error"; message: string }
+export type DeepAnalyzeEvent = DeepAnalyzeStep | DeepAnalyzeResultEvent | DeepAnalyzeErrorEvent;
+
+/** A column enriched with a plain-English LLM explanation (keeps source_columns/
+ *  expression/category so the UI can draw the source→transform→target graphic). */
+export interface OverviewColumn extends AnalyzeProducerColumn {
+  explanation?: string;
+}
+
+export interface ColumnOverviewResult {
+  table_full_name: string;
+  source: ColumnTransformResult["source"];
+  source_label: string | null;
+  version: number | null;
+  summary: string;
+  columns: OverviewColumn[];
+  error?: string | null;
+  _cache?: CacheMeta | null;
 }
 
 export interface AnalysisVersion {
@@ -610,6 +651,54 @@ export const api = {
     });
     if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
     return res.json() as Promise<ColumnTransformResult>;
+  },
+
+  // Plain-English LLM overview (summary + per-column explanation), cached per
+  // table. `refresh` re-runs the LLM.
+  getColumnTransformationOverview: async (body: {
+    catalog: string; schema_name: string; table: string;
+    entity_type?: string; entity_id?: string; refresh?: boolean; model?: string;
+  }) => {
+    const res = await fetch(`${BASE}/column-transformations/overview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+    return res.json() as Promise<ColumnOverviewResult>;
+  },
+
+  // Deep framework fallback — streams NDJSON commentary events; `onEvent` is
+  // called for each. Resolves when the stream ends.
+  deepAnalyzeColumnTransformations: async (
+    body: { catalog: string; schema_name: string; table: string; entity_type: string; entity_id: string; model?: string },
+    onEvent: (ev: DeepAnalyzeEvent) => void,
+  ) => {
+    const res = await fetch(`${BASE}/column-transformations/deep-analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok || !res.body) throw new Error(`API error ${res.status}: ${await res.text().catch(() => "")}`);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    const flush = (line: string) => {
+      const s = line.trim();
+      if (!s) return;
+      try { onEvent(JSON.parse(s) as DeepAnalyzeEvent); } catch { /* ignore partial/garbage */ }
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        flush(buf.slice(0, idx));
+        buf = buf.slice(idx + 1);
+      }
+    }
+    flush(buf);
   },
 
   // Available LLM serving endpoints for the model dropdown.

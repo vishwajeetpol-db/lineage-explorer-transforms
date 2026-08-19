@@ -451,4 +451,63 @@ describe("api/client", () => {
       await expect(api.evictCapabilityCache("table", "c.s.t")).rejects.toThrow("API error 500: e");
     });
   });
+
+  describe("deepAnalyzeColumnTransformations (NDJSON streaming)", () => {
+    function streamFetch(lines: string[], { ok = true }: { ok?: boolean } = {}) {
+      return vi.fn(async () => ({
+        ok,
+        status: ok ? 200 : 500,
+        text: async () => "boom",
+        body: new ReadableStream({
+          start(controller) {
+            const enc = new TextEncoder();
+            const blob = lines.join("");
+            // Split mid-stream to exercise buffering across newline boundaries.
+            const mid = Math.max(1, Math.floor(blob.length / 2));
+            controller.enqueue(enc.encode(blob.slice(0, mid)));
+            controller.enqueue(enc.encode(blob.slice(mid)));
+            controller.close();
+          },
+        }),
+      }));
+    }
+
+    it("parses each NDJSON line (incl. a newline-less tail) into onEvent", async () => {
+      const lines = [
+        JSON.stringify({ type: "step", step: "start", status: "running", message: "a" }) + "\n",
+        JSON.stringify({ type: "step", step: "detect", status: "ok", message: "b" }) + "\n",
+        JSON.stringify({ type: "result", derived: true, columns: [] }), // no trailing newline → tail flush
+      ];
+      vi.stubGlobal("fetch", streamFetch(lines));
+      const events: any[] = [];
+      await api.deepAnalyzeColumnTransformations(
+        { catalog: "c", schema_name: "s", table: "t", entity_type: "PIPELINE", entity_id: "p1" },
+        (ev) => events.push(ev),
+      );
+      expect(events).toHaveLength(3);
+      expect(events[0].message).toBe("a");
+      expect(events[2].type).toBe("result");
+    });
+
+    it("ignores malformed lines without throwing", async () => {
+      vi.stubGlobal("fetch", streamFetch(["not-json\n", JSON.stringify({ type: "step", status: "ok", step: "x", message: "ok" }) + "\n"]));
+      const events: any[] = [];
+      await api.deepAnalyzeColumnTransformations(
+        { catalog: "c", schema_name: "s", table: "t", entity_type: "PIPELINE", entity_id: "p1" },
+        (ev) => events.push(ev),
+      );
+      expect(events).toHaveLength(1);
+      expect(events[0].message).toBe("ok");
+    });
+
+    it("throws when the response is not ok", async () => {
+      vi.stubGlobal("fetch", streamFetch([], { ok: false }));
+      await expect(
+        api.deepAnalyzeColumnTransformations(
+          { catalog: "c", schema_name: "s", table: "t", entity_type: "PIPELINE", entity_id: "p1" },
+          () => {},
+        ),
+      ).rejects.toThrow(/API error/);
+    });
+  });
 });

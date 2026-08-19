@@ -210,6 +210,16 @@
   100% { background-position: 200% 0; }
 }
 
+/* ---- AI action glow (the "AI Overview" button) ---- */
+@keyframes aiGlow {
+  0%, 100% { box-shadow: 0 0 5px rgba(167,139,250,0.45), 0 0 0 1px rgba(167,139,250,0.35); }
+  50%      { box-shadow: 0 0 16px rgba(167,139,250,0.85), 0 0 0 1px rgba(167,139,250,0.6); }
+}
+.ai-glow { animation: aiGlow 2.2s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .ai-glow { animation: none; box-shadow: 0 0 8px rgba(167,139,250,0.5); }
+}
+
 /* ---- Selection States ---- */
 
 .column-highlighted {

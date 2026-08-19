@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   GitFork, Play, Loader2, RefreshCw, GitCompare, AlertTriangle, History,
   Cpu, Sparkles, Layers, ArrowRight, CheckCircle2, ShieldAlert, Copy, Check, Columns3,
-  Search, Info,
+  Search, Info, Wand2,
 } from "lucide-react";
 import {
   api,
@@ -12,9 +12,11 @@ import {
   type TransformVersionDetail,
   type CrossSourceCompare,
   type ProducerCompare,
+  type DeepAnalyzeStep,
 } from "../../api/client";
 import { useLineageStore } from "../../store/lineageStore";
 import { NoTable, parseFqn } from "./panelShared";
+import ColumnOverviewModal from "./ColumnOverviewModal";
 
 const ENTITY_TYPES = ["NOTEBOOK", "JOB", "PIPELINE", "QUERY"];
 
@@ -93,7 +95,7 @@ function AccessDeniedNotice({ data }: { data: ColumnTransformResult }) {
     <div className="rounded-xl border border-amber-500/30 bg-amber-500/[0.07] px-3.5 py-3 space-y-2">
       <div className="flex items-center gap-2">
         <ShieldAlert size={15} className="text-amber-400 shrink-0" />
-        <span className="text-[12px] font-semibold text-amber-100">Access to producer code required</span>
+        <span className="text-[12px] font-semibold text-amber-900 dark:text-amber-100">Access to producer code required</span>
       </div>
       <p className="text-[11px] text-amber-200/90 leading-relaxed">
         The producer&apos;s source code exists, but this app can&apos;t read it — so the LLM
@@ -110,19 +112,19 @@ function AccessDeniedNotice({ data }: { data: ColumnTransformResult }) {
         <div className="rounded-lg bg-black/25 border border-amber-500/15 px-2.5 py-1.5 space-y-1">
           <div className="text-[9px] uppercase tracking-wider text-amber-300/60">Denied</div>
           {paths.slice(0, 5).map((p, i) => (
-            <div key={i} className="font-mono text-[10px] text-amber-100/90 break-all">{p}</div>
+            <div key={i} className="font-mono text-[10px] text-amber-900 dark:text-amber-100/90 break-all">{p}</div>
           ))}
         </div>
       )}
       <div className="text-[10px] text-amber-200/70 leading-relaxed">
-        Grant <span className="font-mono text-amber-100">CAN_VIEW</span> /{" "}
-        <span className="font-mono text-amber-100">CAN_READ</span> on the producing
+        Grant <span className="font-mono text-amber-900 dark:text-amber-100">CAN_VIEW</span> /{" "}
+        <span className="font-mono text-amber-900 dark:text-amber-100">CAN_READ</span> on the producing
         pipeline/notebook and the workspace files above (in the Databricks UI:
         the entity&apos;s <span className="italic">Permissions</span> dialog).
       </div>
       {grantCmd && (
         <button onClick={copy}
-          className="flex items-center gap-1.5 text-[10px] px-2 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-100 transition-colors">
+          className="flex items-center gap-1.5 text-[10px] px-2 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-900 dark:text-amber-100 transition-colors">
           {copied ? <Check size={11} /> : <Copy size={11} />}
           {copied ? "Copied" : "Copy details"}
         </button>
@@ -204,6 +206,31 @@ function ProducerCompareMatrix({ cmp, onRefresh }: { cmp: ProducerCompare; onRef
   );
 }
 
+/** Live commentary log for the deep framework analysis. */
+function DeepLog({ steps, running }: { steps: DeepAnalyzeStep[]; running: boolean }) {
+  const icon = (s: DeepAnalyzeStep["status"]) =>
+    s === "ok" ? <CheckCircle2 size={11} className="text-emerald-400 shrink-0 mt-px" />
+      : s === "warn" ? <AlertTriangle size={11} className="text-amber-400 shrink-0 mt-px" />
+        : s === "error" ? <AlertTriangle size={11} className="text-rose-400 shrink-0 mt-px" />
+          : <Loader2 size={11} className="text-violet-400 shrink-0 mt-px animate-spin" />;
+  const color = (s: DeepAnalyzeStep["status"]) =>
+    s === "ok" ? "text-slate-300" : s === "warn" ? "text-amber-200/90" : s === "error" ? "text-rose-300" : "text-slate-400";
+  return (
+    <div className="rounded-lg border border-white/[0.08] bg-black/30 p-2.5 max-h-56 overflow-y-auto space-y-1">
+      {steps.map((s, i) => (
+        <div key={i} className="flex items-start gap-1.5 text-[10px] font-mono leading-snug">
+          {icon(s.status)}<span className={color(s.status)}>{s.message}</span>
+        </div>
+      ))}
+      {running && (
+        <div className="flex items-center gap-1.5 text-[10px] text-slate-500 font-mono">
+          <Loader2 size={10} className="animate-spin" /> working…
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ColumnTransformationPanel({ table }: { table: string | null }) {
   const nodes = useLineageStore((s) => s.nodes);
   const edges = useLineageStore((s) => s.edges);
@@ -247,6 +274,10 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
   const [activeTab, setActiveTab] = useState<Tab>("columns");
   const [columnFilter, setColumnFilter] = useState("");
   const [showLegend, setShowLegend] = useState(false);
+  const [overviewOpen, setOverviewOpen] = useState(false);
+  // Deep framework fallback (metadata-driven producers): live commentary log.
+  const [deepRunning, setDeepRunning] = useState(false);
+  const [deepLog, setDeepLog] = useState<DeepAnalyzeStep[]>([]);
 
   const parts = parseFqn(table);
 
@@ -313,13 +344,23 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
         model: opts?.force ? (model || undefined) : undefined,
       });
       setData(r);
-      loadVersions(opts?.et ?? (entityId ? entityType : undefined), opts?.eid ?? (entityId || undefined));
+      // If the resolver surfaced an existing analysis for one of this table's
+      // producers (no producer was explicitly picked), adopt it so the Analyze
+      // tab pre-selects that producer and Re-analyze / Deep analysis target it.
+      if (r.entity_type && r.entity_id && !opts?.eid && !entityId) {
+        setEntityType(r.entity_type);
+        setEntityId(r.entity_id);
+      }
+      loadVersions(
+        opts?.et ?? (r.entity_type || (entityId ? entityType : undefined)),
+        opts?.eid ?? (r.entity_id || entityId || undefined),
+      );
     } catch (e: any) {
       setError(e.message || "Failed to resolve column transformations");
     } finally { setLoading(false); }
   }, [table, entityType, entityId, model, loadVersions]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => { setData(null); setError(null); setEntityId(""); setCompareData(null); setAllVersions([]); setViewingVersion(null); setProducerCmp(null); setActiveTab("columns"); setColumnFilter(""); setShowLegend(false); }, [table]);
+  useEffect(() => { setData(null); setError(null); setEntityId(""); setCompareData(null); setAllVersions([]); setViewingVersion(null); setProducerCmp(null); setActiveTab("columns"); setColumnFilter(""); setShowLegend(false); setOverviewOpen(false); setDeepLog([]); setDeepRunning(false); }, [table]);
   // Kick off an initial resolve (captured plan / stored) whenever the table changes.
   useEffect(() => { if (parts) resolve(); }, [table]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -344,6 +385,39 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
     } finally { setComparing(false); }
   };
 
+  // Deep framework fallback: stream the agentic analysis, appending each step to
+  // the live commentary log; on a derived result, refresh the panel's columns.
+  const runDeep = async () => {
+    if (!parts) return;
+    const et = (data?.entity_type || entityType || "").toUpperCase();
+    const eid = data?.entity_id || entityId;
+    if (!et || !eid) { setError("Pick a producer first, then run deep analysis."); return; }
+    setDeepRunning(true); setDeepLog([]); setError(null);
+    try {
+      await api.deepAnalyzeColumnTransformations(
+        { catalog: parts.catalog, schema_name: parts.schema, table: parts.table, entity_type: et, entity_id: eid, model: model || undefined },
+        (ev) => {
+          if (ev.type === "step") {
+            setDeepLog((l) => [...l, ev]);
+          } else if (ev.type === "error") {
+            setDeepLog((l) => [...l, { type: "step", step: "error", status: "error", message: ev.message }]);
+          } else if (ev.type === "result") {
+            setDeepLog((l) => [...l, {
+              type: "step", step: "done",
+              status: ev.derived ? "ok" : "warn",
+              message: ev.derived
+                ? `Done — derived ${ev.columns.length} column(s)${ev.version ? ` (v${ev.version})` : ""}. See the Columns tab.`
+                : (ev.detail || "No columns could be derived."),
+            }]);
+            if (ev.derived) resolve({ et, eid }); // pull in the newly-saved version
+          }
+        },
+      );
+    } catch (e: any) {
+      setError(e?.message || "Deep analysis failed");
+    } finally { setDeepRunning(false); }
+  };
+
   if (!table) return <NoTable />;
 
   const src = data?.source || "none";
@@ -352,6 +426,31 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
   const isLLM = src === "stored" || src === "llm";
   const canReanalyze = isLLM || (data?.source === "none" && !!entityId);
   const hasProducers = producerNodes.length >= 2;
+
+  // "unavailable" is a catch-all; surface the ACTUAL reason (usually the producer
+  // source couldn't be read) instead of the misleading "LLM unavailable".
+  const unavailReason = src === "unavailable"
+    ? (data?.reason_code === "access_denied" ? "Source access denied"
+      : data?.reason_code === "entity_missing" ? "Producer not found"
+      : data?.reason_code === "no_source" ? "No readable source code"
+      : data?.reason_code === "no_columns" ? "No column logic in source"
+      : data?.reason_code === "llm_not_configured" ? "LLM not configured"
+      : data?.reason_code === "llm_error" ? "LLM analysis error"
+      : "LLM unavailable")
+    : null;
+  const headerLabel = unavailReason || data?.source_label || meta.label;
+  // Which producer is this lineage from? Prefer the graph node's friendly name,
+  // falling back to the backend's plain label / TYPE+id. Shown as a chip so the
+  // user always knows whose logic is on screen (esp. when it was auto-surfaced
+  // across producers on open).
+  const producerName = isLLM && data && data.entity_id
+    ? (producerNodes.find((n) => n.entity_id === data.entity_id)?.display_name
+        || data.producer_label
+        || `${data.entity_type || ""} ${data.entity_id}`.trim())
+    : null;
+  // Show the reason text when unavailable for a reason other than access-denied
+  // (access-denied has its own richer notice).
+  const showUnavailDetail = src === "unavailable" && data?.reason_code !== "access_denied" && !!data?.detail;
 
   // Columns filtered by the search box (target column or a source column).
   const q = columnFilter.trim().toLowerCase();
@@ -388,7 +487,7 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
         }`}>
           <div className="flex items-center gap-2">
             <SrcIcon size={14} className={`${meta.color} shrink-0`} />
-            <span className="text-[12px] font-semibold text-slate-100 truncate">{data.source_label || meta.label}</span>
+            <span className="text-[12px] font-semibold text-slate-100 truncate">{headerLabel}</span>
             {data.version != null && <span className="text-[10px] text-slate-500 shrink-0">v{data.version}</span>}
             {data.columns.length > 0 && <span className="text-[10px] text-slate-500 shrink-0">· {data.columns.length} cols</span>}
             {src === "plan_capture" && <CheckCircle2 size={12} className="text-emerald-400 shrink-0" />}
@@ -397,6 +496,16 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
               <Info size={13} />
             </button>
           </div>
+          {producerName && (
+            <div className="flex items-center gap-1.5 mt-1.5 text-[10px] text-slate-400">
+              <GitFork size={10} className="text-violet-400 shrink-0 rotate-90" />
+              <span className="shrink-0 text-slate-500">Producer:</span>
+              <span className="font-mono text-violet-300 truncate" title={`${data?.entity_type || ""} ${data?.entity_id || ""}`}>{producerName}</span>
+              {hasProducers && (
+                <span className="shrink-0 text-slate-600">· latest of {producerNodes.length} — compare in Producers tab</span>
+              )}
+            </div>
+          )}
           {data.stale && (
             <div className="flex items-center gap-1.5 text-[10px] text-amber-200 bg-amber-500/10 border border-amber-500/25 rounded-lg px-2 py-1 mt-2">
               <AlertTriangle size={11} /> Producer source changed since this analysis — re-analyze to refresh.
@@ -466,6 +575,11 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
 
           {data && data.columns.length > 0 && (
             <>
+              {/* Glowing AI overview trigger — opens the wide LLM overview modal. */}
+              <button onClick={() => setOverviewOpen(true)} title="Plain-English AI overview of every column"
+                className="ai-glow w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-gradient-to-r from-violet-500/25 to-fuchsia-500/20 hover:from-violet-500/35 hover:to-fuchsia-500/30 border border-violet-400/40 text-violet-900 dark:text-violet-100 text-[12px] font-semibold transition-colors">
+                <Sparkles size={13} className="text-violet-600 dark:text-violet-300" /> AI overview of all columns
+              </button>
               {data.columns.length > 6 && (
                 <div className="flex items-center gap-2 px-2.5 py-1.5 bg-surface-100/60 border border-white/[0.08] rounded-lg focus-within:border-accent/40">
                   <Search size={12} className="text-slate-500 shrink-0" />
@@ -506,6 +620,35 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
             Infer column lineage from a producer&apos;s source code when no captured plan exists — or refresh a stale one.
           </p>
           {data?.reason_code === "access_denied" && <AccessDeniedNotice data={data} />}
+          {showUnavailDetail && data?.reason_code !== "no_columns" && (
+            <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/[0.07] px-3 py-2 text-[11px] text-amber-200/90">
+              <AlertTriangle size={13} className="text-amber-400 shrink-0 mt-0.5" />
+              <span>{data?.detail}</span>
+            </div>
+          )}
+
+          {/* Deep framework fallback — for metadata-driven producers whose column
+              logic lives in config tables/params rather than the code. */}
+          {(data?.reason_code === "no_columns" || deepRunning || deepLog.length > 0) && (
+            <div className="rounded-xl border border-fuchsia-500/30 bg-fuchsia-500/[0.06] px-3 py-3 space-y-2.5">
+              <div className="flex items-center gap-2">
+                <Wand2 size={14} className="text-fuchsia-400 shrink-0" />
+                <span className="text-[12px] font-semibold text-slate-100">Deep framework analysis</span>
+              </div>
+              <p className="text-[10px] text-slate-400 leading-relaxed">
+                This producer looks like a metadata-driven framework — no column logic in the code itself. Deep analysis
+                detects its config tables &amp; parameters, queries them, and derives the columns, narrating each step.
+              </p>
+              {!deepRunning && (
+                <button onClick={runDeep}
+                  className="ai-glow w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-gradient-to-r from-fuchsia-500/25 to-violet-500/20 hover:from-fuchsia-500/35 hover:to-violet-500/30 border border-fuchsia-400/40 text-fuchsia-900 dark:text-fuchsia-100 text-[12px] font-semibold transition-colors">
+                  <Wand2 size={13} className="text-fuchsia-600 dark:text-fuchsia-200" /> {deepLog.length ? "Re-run deep analysis" : "Run deep framework analysis"}
+                </button>
+              )}
+              {(deepRunning || deepLog.length > 0) && <DeepLog steps={deepLog} running={deepRunning} />}
+            </div>
+          )}
+
           {producerNodes.length > 0 && (
             <div className="space-y-1">
               <div className="text-[10px] uppercase tracking-wider text-slate-500">Producers of this table</div>
@@ -680,11 +823,21 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
           )}
           {!pcLoading && !producerCmp && (
             <button onClick={() => runProducerCompare(false)}
-              className="flex items-center gap-1.5 text-[11px] px-2.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-100 font-medium transition-colors">
+              className="flex items-center gap-1.5 text-[11px] px-2.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-900 dark:text-amber-100 font-medium transition-colors">
               <Columns3 size={12} /> Compare side-by-side
             </button>
           )}
         </div>
+      )}
+
+      {/* Wide AI overview modal */}
+      {overviewOpen && table && (
+        <ColumnOverviewModal
+          table={table}
+          entityType={entityId ? entityType : undefined}
+          entityId={entityId || undefined}
+          onClose={() => setOverviewOpen(false)}
+        />
       )}
     </div>
   );

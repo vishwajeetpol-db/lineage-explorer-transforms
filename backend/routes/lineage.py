@@ -17,6 +17,7 @@ from typing import Optional
 import asyncio
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
@@ -24,6 +25,7 @@ from backend.server.entities import resolve_entity, resolve_entities
 from backend.server.producer_source import (
     analyze_producer,
     resolve_column_transformations,
+    overview_column_transformations,
     list_all_versions,
     compare_transformation_versions,
     compare_producers,
@@ -347,6 +349,75 @@ async def column_transformations(request: Request, body: ColumnTransformIn):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class CTOverviewIn(BaseModel):
+    catalog: str
+    schema_name: str
+    table: str
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+    refresh: bool = False
+    model: Optional[str] = None
+
+
+@analyze_router.post("/api/column-transformations/overview")
+async def column_transformation_overview(request: Request, body: CTOverviewIn):
+    """Plain-English LLM overview of a table's column transformations — an overall
+    summary plus a per-column explanation, merged onto each column so the UI can
+    draw the source→transform→target graphic. Cached per table (refresh re-runs)."""
+    c = _validate(body.catalog, "catalog")
+    s = _validate(body.schema_name, "schema")
+    t = _validate(body.table, "table")
+    et = (body.entity_type or "").strip().upper() or None
+    eid = (body.entity_id or "").strip() or None
+    if eid and not _ENTITY_ID_RE.match(eid):
+        raise HTTPException(status_code=400, detail="Invalid entity_id")
+    from backend.main import _get_user_info
+    email, _ = _get_user_info(request)
+    try:
+        return overview_column_transformations(
+            catalog=c, schema=s, table=t, entity_type=et, entity_id=eid,
+            actor=email or "unknown", refresh=body.refresh, model=body.model,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class CTDeepAnalyzeIn(BaseModel):
+    catalog: str
+    schema_name: str
+    table: str
+    entity_type: str
+    entity_id: str
+    model: Optional[str] = None
+
+
+@analyze_router.post("/api/column-transformations/deep-analyze")
+async def column_transformation_deep_analyze(request: Request, body: CTDeepAnalyzeIn):
+    """Agentic fallback for metadata-driven frameworks: when normal analysis finds
+    no columns, detect the config mechanism, read params, query config tables, and
+    derive columns — streaming a step-by-step commentary as newline-delimited JSON."""
+    c = _validate(body.catalog, "catalog")
+    s = _validate(body.schema_name, "schema")
+    t = _validate(body.table, "table")
+    et = (body.entity_type or "").strip().upper()
+    eid = (body.entity_id or "").strip()
+    if not et or not eid or not _ENTITY_ID_RE.match(eid):
+        raise HTTPException(status_code=400, detail="entity_type and a valid entity_id are required")
+    from backend.main import _get_user_info
+    from backend.server.framework_analysis import deep_analyze_stream
+    email, _ = _get_user_info(request)
+    full = f"{c}.{s}.{t}"
+
+    def gen():
+        try:
+            for ev in deep_analyze_stream(et, eid, full, actor=email or "unknown", model=body.model):
+                yield json.dumps(ev) + "\n"
+        except Exception as e:  # never break the stream mid-flight
+            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 class CTVersionsIn(BaseModel):

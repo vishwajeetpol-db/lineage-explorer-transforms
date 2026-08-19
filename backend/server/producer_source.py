@@ -366,7 +366,8 @@ def analyze_producer(
             return result
 
     if not llm_client.is_llm_configured():
-        result["detail"] = "LLM not configured — no reachable serving endpoint."
+        result["reason_code"] = "llm_not_configured"
+        result["detail"] = "LLM not configured — no reachable serving endpoint for this app."
         return result
 
     # ---- Fresh analysis path ----
@@ -410,14 +411,34 @@ def analyze_producer(
         target_columns = _fetch_target_columns(target_table)
 
     used_model = model or llm_client.LLM_MODEL_NAME
-    analysis = llm_client.analyze_source_code(
-        source_code=source_code,
-        target_table=target_table,
-        target_columns=target_columns,
-        model=used_model,
-    )
-    if not analysis:
-        result["detail"] = "LLM returned no analysis."
+    try:
+        analysis = llm_client.analyze_source_code(
+            source_code=source_code,
+            target_table=target_table,
+            target_columns=target_columns,
+            model=used_model,
+        )
+    except Exception as e:
+        # A real LLM failure (endpoint error, bad request for the model, timeout,
+        # unparseable output) — surface the specific message, not a generic label.
+        result["reason_code"] = "llm_error"
+        result["llm_model"] = used_model
+        result["detail"] = f"LLM analysis failed on {used_model}: {str(e)[:400]}"
+        return result
+    # If NOTHING in the analysis carries real lineage (every column came back
+    # UNKNOWN/NULL), the source is a metadata-driven framework — signal the deep
+    # config-based fallback instead of saving a useless all-UNKNOWN version.
+    # NOTE: only the all-or-nothing case is rejected. When at least one column is
+    # meaningful we keep the FULL analysis, including complex/struct columns a
+    # model may label UNKNOWN (e.g. `_lineage`, `_dq`) — dropping those made valid
+    # columns disappear for some models.
+    if not any(_is_meaningful_column(c) for c in (analysis or [])):
+        result["reason_code"] = "no_columns"
+        result["detail"] = (
+            "The source was analysed but no concrete column logic was found (results "
+            "came back UNKNOWN) — this looks like a metadata-driven framework. Run deep "
+            "framework analysis to derive columns from its config tables and parameters."
+        )
         return result
 
     new_version = 1
@@ -446,6 +467,32 @@ def analyze_producer(
 # ---------------------------------------------------------------------------
 # Unified column-transformation resolver (POC-style precedence)
 # ---------------------------------------------------------------------------
+
+def _is_meaningful_column(c: dict) -> bool:
+    """True only if a column analysis carries REAL lineage — not an UNKNOWN/NULL
+    placeholder. Models handed generic (metadata-driven) framework code often
+    return an entry per output column with category UNKNOWN and no source/expr;
+    those must NOT count as a valid transformation (they'd otherwise mask the
+    deep config-based fallback)."""
+    cat = (c.get("category") or "").strip().upper()
+    if cat == "UNKNOWN":
+        return False
+    expr = (c.get("expression") or c.get("transformation") or "").strip().upper()
+    srcs = c.get("source_columns") or []
+    if not srcs and expr in ("", "UNKNOWN", "NULL", "NONE", "N/A", "?", "-"):
+        return False
+    return True
+
+
+def _producer_display(entity_type: Optional[str], entity_id: Optional[str]) -> str:
+    """A plain fallback label for a producer (e.g. 'PIPELINE 84ad1944…'). Cheap —
+    no API call; the frontend enriches this with the graph's display name when it
+    has one, so panel-open latency isn't spent resolving a friendly name here."""
+    et = (entity_type or "").upper()
+    eid = entity_id or ""
+    short = f"{eid[:8]}…" if len(eid) > 10 else eid
+    return f"{et} {short}".strip() if et or short else ""
+
 
 def _norm_plan_columns(cols: list[dict]) -> list[dict]:
     """Normalize captured-plan parser output to the panel's column shape."""
@@ -539,9 +586,37 @@ def resolve_column_transformations(
             }
 
     # 3 + 4 — stored / fresh LLM. When no producer entity is given we can't run
-    # the LLM (it needs a producer's source), so return whatever the offline
-    # path found plus a hint.
+    # the LLM (it needs a producer's source) — but a prior LLM analysis may
+    # already be stored for one of this table's producers. Surface the most
+    # recent one (labelled with the producer it came from) instead of a
+    # misleading "no lineage yet": opening the panel and then picking that same
+    # producer on the Analyze tab must not contradict each other.
     if not entity_id or not entity_type:
+        if not force_rerun:
+            prior = analysis_store.get_latest_for_table(full)
+            if prior and prior.get("columns"):
+                pet, peid = prior.get("entity_type"), prior.get("entity_id")
+                cur_hash = _current_source_hash(pet, peid) if pet and peid else None
+                return {
+                    **base,
+                    "entity_type": pet,
+                    "entity_id": peid,
+                    "columns": prior["columns"],
+                    "source": "stored",
+                    "source_label": (
+                        f"Stored LLM analysis · v{prior.get('version')} "
+                        f"({prior.get('llm_model') or 'llm'})"
+                    ),
+                    "producer_label": _producer_display(pet, peid),
+                    "version": prior.get("version"),
+                    "versions": analysis_store.list_versions(pet, peid, full),
+                    "llm_model": prior.get("llm_model"),
+                    "analyzed_at": prior.get("analyzed_at"),
+                    "stale": bool(
+                        cur_hash and prior.get("source_hash")
+                        and cur_hash != prior["source_hash"]
+                    ),
+                }
         return {**base, "source": "none",
                 "detail": "No captured lineage. Pick a producer entity to run LLM analysis."}
 
@@ -655,6 +730,46 @@ def _columns_for_ref(
             "source_hash": row.get("source_hash"),
         }
     return None
+
+
+def overview_column_transformations(
+    catalog: str, schema: str, table: str,
+    entity_type: Optional[str] = None, entity_id: Optional[str] = None,
+    actor: str = "", refresh: bool = False, model: Optional[str] = None,
+) -> dict:
+    """Plain-English LLM overview of a table's column transformations.
+
+    Resolves the columns best-source-first (captured plan / CDC / stored / LLM),
+    then asks the LLM for an overall `summary` plus a per-column `explanation`,
+    merged back onto each column (which keeps its source_columns/expression/
+    category so the UI can draw the source→transform→target graphic). Cached per
+    table in the shared capability cache; `refresh` re-runs the LLM."""
+    from backend.server import capability_cache as cc
+
+    full = f"{catalog}.{schema}.{table}"
+
+    def _compute() -> dict:
+        resolved = resolve_column_transformations(
+            catalog, schema, table, entity_type, entity_id, actor=actor,
+        )
+        cols = resolved.get("columns") or []
+        overview = llm_client.explain_transformations(cols, full, model=model)
+        expl = {e.get("column"): e.get("explanation", "") for e in (overview.get("columns") or [])}
+        out_cols = [
+            {**c, "explanation": expl.get(c.get("target_column") or c.get("column"), "")}
+            for c in cols
+        ]
+        return {
+            "table_full_name": full,
+            "source": resolved.get("source"),
+            "source_label": resolved.get("source_label"),
+            "version": resolved.get("version"),
+            "summary": overview.get("summary", ""),
+            "columns": out_cols,
+            "error": overview.get("error"),
+        }
+
+    return cc.serve_or_compute(full, "ct_overview", _compute, actor=actor, refresh=refresh)
 
 
 def compare_transformation_versions(

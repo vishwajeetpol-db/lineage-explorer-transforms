@@ -188,6 +188,28 @@ def get_latest_version(entity_type: str, entity_id: str, target_table: str) -> O
     return None
 
 
+def get_latest_for_table(target_table: str) -> Optional[dict]:
+    """Return the most recently analyzed stored version for a target table across
+    ANY producer (no entity key).
+
+    Used to surface already-existing LLM lineage when the Column Transformation
+    panel opens WITHOUT a producer explicitly selected — a table may have been
+    analyzed for one of its producers on a prior visit. Picks the newest by
+    analysis time (then version). None if nothing has ever been stored."""
+    try:
+        _ensure_table()
+        rows = _execute_sql(
+            f"SELECT {_FULL_COLS} FROM {ANALYSIS_TABLE} "
+            f"WHERE target_table = '{_sql_str(target_table)}' "
+            f"ORDER BY analyzed_at DESC, version DESC LIMIT 1"
+        )
+        if rows:
+            return _decode_row(rows[0])
+    except Exception as e:
+        logger.info(f"analysis_store: get_latest_for_table failed for {target_table}: {e}")
+    return None
+
+
 def get_version(entity_type: str, entity_id: str, target_table: str, version: int) -> Optional[dict]:
     """Return a specific stored version (full row incl. source snapshot)."""
     try:
