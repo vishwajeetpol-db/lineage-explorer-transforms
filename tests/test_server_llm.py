@@ -72,18 +72,144 @@ class TestAnalyzeSourceCode:
         assert "output columns" in user_msg
         assert "/serving-endpoints/mymodel/invocations" == client.api_client.do.call_args[0][1]
 
-    def test_exception_returns_empty(self):
+    def test_exception_propagates(self):
+        # A REAL invocation failure (endpoint down / bad request / timeout) now
+        # propagates so the caller can surface a specific error, instead of being
+        # swallowed to [] (which was indistinguishable from "no columns found").
         client = MagicMock()
         client.api_client.do.side_effect = RuntimeError("endpoint down")
         with patch("backend.lineage_service._get_client", return_value=client), \
              patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
-            assert llm.analyze_source_code("SELECT 1", "c.s.t") == []
+            with pytest.raises(RuntimeError, match="endpoint down"):
+                llm.analyze_source_code("SELECT 1", "c.s.t")
 
     def test_malformed_json_returns_empty(self):
         client = _client_returning("this is not json")
         with patch("backend.lineage_service._get_client", return_value=client), \
              patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
             assert llm.analyze_source_code("SELECT 1", "c.s.t") == []
+
+
+class TestInvokeChat:
+    def test_content_block_list_is_flattened(self):
+        # Anthropic/Claude-style endpoints return content as a list of blocks.
+        blocks = [{"type": "text", "text": "[]"}, {"type": "text", "text": ""}, "tail"]
+        client = MagicMock()
+        client.api_client.do.return_value = {"choices": [{"message": {"content": blocks}}]}
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            out = llm._invoke_chat([{"role": "user", "content": "hi"}])
+        assert out == "[]tail"
+
+    def test_temperature_retry_without_param(self):
+        # First call rejects `temperature`; retry (without it) succeeds.
+        client = MagicMock()
+        client.api_client.do.side_effect = [
+            RuntimeError("BAD_REQUEST: temperature is not supported"),
+            {"choices": [{"message": {"content": "ok"}}]},
+        ]
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            out = llm._invoke_chat([{"role": "user", "content": "hi"}], temperature=0.5)
+        assert out == "ok"
+        assert client.api_client.do.call_count == 2
+        # The retry payload dropped temperature.
+        retry_body = client.api_client.do.call_args_list[1].kwargs["body"]
+        assert "temperature" not in retry_body
+
+    def test_unrelated_error_reraises(self):
+        client = MagicMock()
+        client.api_client.do.side_effect = RuntimeError("gateway timeout")
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            with pytest.raises(RuntimeError, match="gateway timeout"):
+                llm._invoke_chat([{"role": "user", "content": "hi"}])
+
+
+class TestExplainTransformations:
+    def test_empty_columns_short_circuits(self):
+        assert llm.explain_transformations([], "c.s.t") == {"summary": "", "columns": []}
+
+    def test_happy_object(self):
+        content = '{"summary": "joins A and B", "columns": [{"column": "x", "explanation": "a+b"}]}'
+        client = _client_returning(content)
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            out = llm.explain_transformations([{"target_column": "x", "source_columns": ["a"]}], "c.s.t")
+        assert out["summary"] == "joins A and B"
+        assert out["columns"] == [{"column": "x", "explanation": "a+b"}]
+
+    def test_array_response_wrapped(self):
+        client = _client_returning('[{"column": "x", "explanation": "e"}]')
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            out = llm.explain_transformations([{"column": "x"}], "c.s.t")
+        assert out["summary"] == ""
+        assert out["columns"] == [{"column": "x", "explanation": "e"}]
+
+    def test_error_returns_error_key(self):
+        client = MagicMock()
+        client.api_client.do.side_effect = RuntimeError("endpoint down")
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            out = llm.explain_transformations([{"column": "x"}], "c.s.t")
+        assert out["columns"] == [] and "endpoint down" in out["error"]
+
+
+class TestDetectFrameworkConfig:
+    def test_empty_source_short_circuits(self):
+        out = llm.detect_framework_config("  ", "c.s.t")
+        assert out == {"config_tables": [], "parameters": [], "target_key_columns": [], "notes": ""}
+
+    def test_happy_parse(self):
+        content = ('{"config_tables": [{"name": "c.s.cfg", "certain": true}], '
+                   '"parameters": ["run_date"], "target_key_columns": ["tgt"], "notes": "n"}')
+        client = _client_returning(content)
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            out = llm.detect_framework_config("code", "c.s.t")
+        assert out["config_tables"] == [{"name": "c.s.cfg", "certain": True}]
+        assert out["parameters"] == ["run_date"]
+        assert out["notes"] == "n"
+
+    def test_non_dict_response_defaults(self):
+        client = _client_returning('[1, 2, 3]')
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            out = llm.detect_framework_config("code", "c.s.t")
+        assert out["config_tables"] == [] and out["notes"] == ""
+
+    def test_error_returns_error_key(self):
+        client = MagicMock()
+        client.api_client.do.side_effect = RuntimeError("boom")
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            out = llm.detect_framework_config("code", "c.s.t")
+        assert "boom" in out["error"]
+
+
+class TestDeriveColumnsFromConfig:
+    def test_happy_array(self):
+        client = _client_returning('[{"target_column": "x", "source_columns": ["a"]}]')
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            out = llm.derive_columns_from_config(
+                "code", "c.s.t", ["x"], {"p": 1}, [{"table": "c.s.cfg", "rows": []}])
+        assert out == [{"target_column": "x", "source_columns": ["a"]}]
+
+    def test_dict_envelope(self):
+        client = _client_returning('{"columns": [{"target_column": "y"}]}')
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            out = llm.derive_columns_from_config("code", "c.s.t", None, {}, [])
+        assert out == [{"target_column": "y"}]
+
+    def test_error_returns_empty(self):
+        client = MagicMock()
+        client.api_client.do.side_effect = RuntimeError("boom")
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            assert llm.derive_columns_from_config("code", "c.s.t", ["x"], {}, []) == []
 
 
 class TestIsLlmConfigured:

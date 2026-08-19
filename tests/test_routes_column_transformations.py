@@ -5,6 +5,7 @@ Covers the LLM producer-analysis and unified column-transformation endpoints:
 validation, entity-id injection guards, and happy paths with the service layer
 mocked. (compare-producers has its own coverage in test_producer_source.py.)
 """
+import json
 from unittest.mock import patch
 
 import pytest
@@ -77,6 +78,67 @@ class TestColumnTransformations:
                 "catalog": "c", "schema_name": "s", "table": "t"})
         assert resp.status_code == 200
         assert "versions" in resp.json()
+
+    # ---- overview ----
+    def test_overview_rejects_bad_catalog(self, app_client):
+        resp = app_client.post("/api/column-transformations/overview", json={
+            "catalog": "bad;", "schema_name": "s", "table": "t"})
+        assert resp.status_code == 400
+
+    def test_overview_rejects_bad_entity_id(self, app_client):
+        resp = app_client.post("/api/column-transformations/overview", json={
+            "catalog": "c", "schema_name": "s", "table": "t",
+            "entity_type": "JOB", "entity_id": "1'; DROP--"})
+        assert resp.status_code == 400
+
+    def test_overview_ok(self, app_client):
+        with patch("backend.routes.lineage.overview_column_transformations",
+                   return_value={"summary": "does joins", "columns": [], "source": "llm"}):
+            resp = app_client.post("/api/column-transformations/overview", json={
+                "catalog": "c", "schema_name": "s", "table": "t"})
+        assert resp.status_code == 200
+        assert resp.json()["summary"] == "does joins"
+
+    def test_overview_service_error_500(self, app_client):
+        with patch("backend.routes.lineage.overview_column_transformations",
+                   side_effect=RuntimeError("cache boom")):
+            resp = app_client.post("/api/column-transformations/overview", json={
+                "catalog": "c", "schema_name": "s", "table": "t"})
+        assert resp.status_code == 500
+
+    # ---- deep-analyze (streaming NDJSON) ----
+    def test_deep_analyze_requires_entity(self, app_client):
+        resp = app_client.post("/api/column-transformations/deep-analyze", json={
+            "catalog": "c", "schema_name": "s", "table": "t",
+            "entity_type": "", "entity_id": ""})
+        assert resp.status_code == 400
+
+    def test_deep_analyze_streams_ndjson(self, app_client):
+        events = [
+            {"type": "step", "step": "start", "status": "running", "message": "go"},
+            {"type": "result", "derived": True, "columns": [{"target_column": "x"}], "version": 3},
+        ]
+        with patch("backend.server.framework_analysis.deep_analyze_stream",
+                   return_value=iter(events)):
+            resp = app_client.post("/api/column-transformations/deep-analyze", json={
+                "catalog": "c", "schema_name": "s", "table": "t",
+                "entity_type": "JOB", "entity_id": "123"})
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("application/x-ndjson")
+        lines = [l for l in resp.text.splitlines() if l.strip()]
+        assert len(lines) == 2
+        assert json.loads(lines[-1])["derived"] is True
+
+    def test_deep_analyze_stream_error_is_emitted(self, app_client):
+        def boom(*a, **k):
+            raise RuntimeError("mid-flight")
+        with patch("backend.server.framework_analysis.deep_analyze_stream", side_effect=boom):
+            resp = app_client.post("/api/column-transformations/deep-analyze", json={
+                "catalog": "c", "schema_name": "s", "table": "t",
+                "entity_type": "JOB", "entity_id": "123"})
+        assert resp.status_code == 200
+        last = json.loads([l for l in resp.text.splitlines() if l.strip()][-1])
+        assert last["type"] == "error" and "mid-flight" in last["message"]
 
     def test_compare_rejects_bad_ref(self, app_client):
         resp = app_client.post("/api/column-transformations/compare", json={

@@ -10,6 +10,7 @@ Covers:
 - _producer_health (JOB/PIPELINE/other, failed/stale/healthy/no_history)
 - trace_root_cause_table (counts, prime suspect, failure path, source-table skip)
 """
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -249,8 +250,11 @@ class TestProducerHealth:
         assert out["status"] == "no_history"
 
     def test_pipeline_healthy_recent(self):
+        # Use a dynamically-recent timestamp (well within STALE_DAYS) so the test
+        # doesn't age into "stale" as wall-clock time passes.
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         h = {"total_updates": 2, "last_update_state": "COMPLETED",
-             "last_update_at": "2026-07-30T00:00:00Z", "success_rate": 1.0}
+             "last_update_at": recent, "success_rate": 1.0}
         with patch("backend.server.observability.get_pipeline_update_health", return_value=h):
             out = rc._producer_health("PIPELINE", "p1")
         assert out["status"] == "healthy"

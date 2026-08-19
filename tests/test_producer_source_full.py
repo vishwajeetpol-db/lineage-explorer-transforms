@@ -269,7 +269,9 @@ class TestAnalyzeProducerStoredAndFresh:
              patch.object(ps.llm_client, "is_llm_configured", return_value=True), \
              patch.object(ps, "_fetch_source", return_value="code"), \
              patch.object(ps.analysis_store, "_source_hash", return_value="H"), \
-             patch.object(ps.llm_client, "analyze_source_code", return_value=[{"target_column": "x"}]) as mock_llm, \
+             patch.object(ps.llm_client, "analyze_source_code",
+                          return_value=[{"target_column": "x", "source_columns": ["a"],
+                                         "expression": "a", "category": "PASS_THROUGH"}]) as mock_llm, \
              patch.object(ps.analysis_store, "save_analysis", return_value=1), \
              patch.object(ps.analysis_store, "list_versions", return_value=[]), \
              patch.object(ps, "_fetch_target_columns") as mock_tc:
@@ -291,8 +293,11 @@ class TestAnalyzeProducerStoredAndFresh:
              patch.object(ps.llm_client, "LLM_MODEL_NAME", "m"), \
              patch.object(ps.llm_client, "analyze_source_code", return_value=[]):
             out = ps.analyze_producer("JOB", "1", "c.s.t", force_rerun=True)
+        # Empty/all-UNKNOWN analysis now signals a metadata-driven framework and
+        # points the user at deep framework analysis (not a generic failure).
         assert out["source"] == "unavailable"
-        assert out["detail"] == "LLM returned no analysis."
+        assert out["reason_code"] == "no_columns"
+        assert "metadata-driven framework" in out["detail"]
 
     def test_save_analysis_error_still_returns_llm_result(self):
         with patch.object(ps.analysis_store, "get_latest_version", return_value=None), \
@@ -301,7 +306,9 @@ class TestAnalyzeProducerStoredAndFresh:
              patch.object(ps.analysis_store, "_source_hash", return_value="H"), \
              patch.object(ps, "_fetch_target_columns", return_value=[]), \
              patch.object(ps.llm_client, "LLM_MODEL_NAME", "m"), \
-             patch.object(ps.llm_client, "analyze_source_code", return_value=[{"target_column": "x"}]), \
+             patch.object(ps.llm_client, "analyze_source_code",
+                          return_value=[{"target_column": "x", "source_columns": ["a"],
+                                         "expression": "a", "category": "PASS_THROUGH"}]), \
              patch.object(ps.analysis_store, "save_analysis", side_effect=RuntimeError("write failed")), \
              patch.object(ps.analysis_store, "list_versions", return_value=[]):
             out = ps.analyze_producer("JOB", "1", "c.s.t", force_rerun=True)
