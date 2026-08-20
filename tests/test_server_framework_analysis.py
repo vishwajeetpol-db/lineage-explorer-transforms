@@ -218,6 +218,28 @@ class TestDeepAnalyzeStream:
         assert _steps(events, "derive")[-1]["status"] == "error"
         assert _result(events)["derived"] is False
 
+    def test_empty_config_table_gives_specific_reason(self):
+        # Config table identified but currently empty (total_rows == 0) → short-circuit
+        # with a specific config_empty reason, WITHOUT calling the derive LLM.
+        cfg = {"config_tables": [{"name": "c.s.cfg", "certain": True}],
+               "parameters": [], "target_key_columns": [], "notes": ""}
+        empty_res = {"table": "c.s.cfg", "columns": [], "rows": [], "total_rows": 0, "matched": False}
+        with patch.object(fa, "_fetch_source", return_value="framework code"), \
+             patch.object(fa.llm_client, "detect_framework_config", return_value=cfg), \
+             patch.object(fa, "_fetch_entity_parameters", return_value={}), \
+             patch.object(fa, "_query_config_table", return_value=empty_res), \
+             patch.object(fa.llm_client, "derive_columns_from_config") as mock_derive:
+            events = _events(fa.deep_analyze_stream("PIPELINE", "p1", "c.s.t"))
+        # the empty table is reported as a warn, not an "ok"
+        qc = _steps(events, "query_config")
+        assert any(e["status"] == "warn" and "empty" in e["message"] for e in qc)
+        r = _result(events)
+        assert r["derived"] is False
+        assert r["reason_code"] == "config_empty"
+        assert r["config_tables"] == ["c.s.cfg"]
+        assert "empty" in r["detail"]
+        mock_derive.assert_not_called()  # short-circuited before the derive LLM call
+
     def test_happy_path_with_config_table_and_save(self):
         cfg = {"config_tables": [{"name": "c.s.cfg", "certain": True}],
                "parameters": ["run_date"], "target_key_columns": ["target_table"], "notes": "maps cols"}

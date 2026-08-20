@@ -208,8 +208,7 @@ def deep_analyze_stream(
 
     # 4. Query config tables
     config_data: list[dict] = []
-    if not tables:
-        yield _ev("query_config", "warn", "No config tables were identified — deriving from source + parameters alone.")
+    empty_tables: list[str] = []   # identified config tables that are currently empty
     for t in tables:
         name = t.get("name")
         yield _ev("query_config", "running", f"Querying config table {name}…")
@@ -221,10 +220,34 @@ def deep_analyze_stream(
         if res is None:
             yield _ev("query_config", "warn", f"Config table {name} is invalid or unreadable — skipping.")
             continue
+        # An empty config table is a distinct, common case for frameworks that
+        # write their config per-run (or truncate between runs): there is simply
+        # nothing to derive from right now — call it out rather than proceeding to
+        # a generic "no columns" failure.
+        if res["total_rows"] == 0:
+            empty_tables.append(name)
+            yield _ev("query_config", "warn", f"Config table {name} is currently empty — no config rows to derive from.")
+            continue
         config_data.append(res)
         yield _ev("query_config", "ok",
                   f"{name}: {len(res['rows'])} relevant row(s)"
                   + (f" (filtered from {res['total_rows']} by target)" if res["matched"] else f" (sample of {res['total_rows']})") + ".")
+
+    # Short-circuit: config table(s) were identified but every one is empty, so
+    # there is provably nothing to derive. Give an actionable, specific reason
+    # (which the panel surfaces) instead of running the LLM and reporting a
+    # generic "no columns" failure.
+    if tables and not config_data and empty_tables:
+        names = ", ".join(empty_tables)
+        yield _ev("derive", "error", f"The config table(s) {names} are currently empty — nothing to derive from.")
+        yield {"type": "result", "columns": [], "derived": False, "reason_code": "config_empty",
+               "config_tables": empty_tables,
+               "detail": (f"The config table(s) {names} are currently empty. This framework writes its column "
+                          f"config per run, so run the producing {et.lower()} for this target, then re-analyze.")}
+        return
+
+    if not tables:
+        yield _ev("query_config", "warn", "No config tables were identified — deriving from source + parameters alone.")
 
     # 5. Derive columns
     yield _ev("derive", "running", "Deriving column transformations from the config + parameters…")

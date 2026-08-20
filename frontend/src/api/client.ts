@@ -464,6 +464,9 @@ export interface DeepAnalyzeResultEvent {
   detail?: string;
   derived_via?: string;
   config_tables?: string[];
+  // Set on a non-derived result to explain why (e.g. "config_empty" when the
+  // framework's config table has no rows to derive from right now).
+  reason_code?: string | null;
 }
 export interface DeepAnalyzeErrorEvent { type: "error"; message: string }
 export type DeepAnalyzeEvent = DeepAnalyzeStep | DeepAnalyzeResultEvent | DeepAnalyzeErrorEvent;
