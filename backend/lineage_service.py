@@ -671,7 +671,9 @@ def get_lineage_trace(seed_full_name: str, skip_cache: bool = False) -> LineageR
     another catalog → mart) — with the mediating pipeline/job entity nodes — from
     a single clicked table. Metastore-wide; no workspace/catalog scoping.
     """
-    cache_key = f"trace:{seed_full_name}"
+    # v2: response now carries `table_edges` — bumping the key ignores older
+    # cached traces that predate the field (which would force the UI's fallback).
+    cache_key = f"trace:v2:{seed_full_name}"
     if not skip_cache:
         cached = _cache_get(cache_key)
         if cached is not None:
@@ -910,9 +912,15 @@ def _build_graph_from_rows(client: WorkspaceClient, lineage_rows: list[dict], tr
         key: set(info["targets"]) for key, info in entity_map.items()
     }
     edge_set: set[tuple[str, str]] = set()
+    # Precise table→table pairs: every row IS a real (source_table → target_table)
+    # dependency, so distinct pairs here are the true dataset-level DAG — no
+    # cross-product needed when the UI hides the mediating entities.
+    table_pair_set: set[tuple[str, str]] = set()
     for r in lineage_rows:
         sref, _ = _parse_lineage_ref(r.get("source_table_full_name"), r.get("source_path"), r.get("source_type"))
         tref, _ = _parse_lineage_ref(r.get("target_table_full_name"), r.get("target_path"), r.get("target_type"))
+        if sref and tref and sref != tref:
+            table_pair_set.add((sref, tref))
         etype, eid = r.get("entity_type"), r.get("entity_id")
         if etype and eid:
             key = f"entity:{etype}:{eid}"
@@ -932,6 +940,7 @@ def _build_graph_from_rows(client: WorkspaceClient, lineage_rows: list[dict], tr
 
     return LineageResponse(nodes=list(nodes_map.values()),
                            edges=[LineageEdge(source=s, target=t) for s, t in edge_set],
+                           table_edges=[LineageEdge(source=s, target=t) for s, t in table_pair_set],
                            truncated=truncated)
 
 

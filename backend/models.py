@@ -44,6 +44,12 @@ class ColumnLineageEdge(BaseModel):
 class LineageResponse(BaseModel):
     nodes: list[Union[TableNode, EntityNode]]
     edges: list[LineageEdge]
+    # PRECISE table→table dependencies (one per real source→target pair from
+    # system.access.table_lineage), independent of the entity-routed `edges`.
+    # The UI uses these for a "datasets only" view so collapsing entity nodes
+    # doesn't have to cross-product an entity's inputs × outputs (which fabricates
+    # edges and produces a dense mesh for hub tables).
+    table_edges: list[LineageEdge] = []
     cached: bool = False
     cached_at: Optional[str] = None
     cache_expires_at: Optional[str] = None

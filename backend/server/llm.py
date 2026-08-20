@@ -177,6 +177,82 @@ def explain_transformations(
         return {"summary": "", "columns": [], "error": str(e)}
 
 
+_GRAPH_EXPLAIN_SYSTEM_PROMPT = textwrap.dedent("""\
+    You are a data analyst explaining a data-lineage diagram to a NON-TECHNICAL
+    business audience. You are given the nodes and connections of a lineage graph
+    for a focus dataset. Nodes are either datasets (tables/views/files) or
+    processing steps (jobs/pipelines/code). A connection "A -> B" means A feeds
+    into B.
+
+    Explain, in plain business English (no SQL, no jargon, no technical IDs):
+      - what the focus dataset is and where its data ultimately comes from,
+      - how the data flows and is transformed along the way,
+      - what the key processing steps do,
+      - what depends on / consumes the focus dataset.
+
+    Respond ONLY with a JSON object of this exact shape:
+      {
+        "summary": "<2-4 sentence plain-English overview of the whole flow>",
+        "steps": [
+          {"title": "<short stage label, e.g. 'Raw orders arrive'>",
+           "detail": "<1-2 sentence plain-English description of this stage>"}
+        ]
+      }
+    Order steps from data sources → processing → the focus dataset → consumers.
+    Keep it concise (at most 8 steps). Output JSON only — no markdown, no prose
+    outside the JSON.
+""")
+
+
+def explain_lineage_graph(
+    nodes: list[dict],
+    edges: list[dict],
+    focus_table: str,
+    detail: str = "data_and_processing",
+    model: Optional[str] = None,
+) -> dict:
+    """Plain-English narrative of a whole lineage graph for a business audience.
+
+    `nodes` are [{"id","label","type"}] and `edges` are [{"source","target"}]
+    referencing node ids. Returns {"summary": str, "steps": [{"title","detail"}]};
+    never raises — returns an `error` key on failure so the caller can surface it.
+    """
+    if not nodes:
+        return {"summary": "", "steps": []}
+
+    # Build an id-free, plain description so the LLM never sees technical ids.
+    id_to_label = {n.get("id"): n.get("label") for n in nodes}
+    node_lines = [f"- {n.get('label')} ({n.get('type')})" for n in nodes if n.get("label")]
+    edge_lines = []
+    for e in edges or []:
+        s = id_to_label.get(e.get("source"))
+        t = id_to_label.get(e.get("target"))
+        if s and t:
+            edge_lines.append(f"- {s} -> {t}")
+    view = "datasets and processing steps" if detail == "data_and_processing" else "datasets only"
+    user_message = (
+        f"Focus dataset: {focus_table}\n"
+        f"View: {view}\n\n"
+        f"NODES:\n" + "\n".join(node_lines[:200]) + "\n\n"
+        f"CONNECTIONS (feeds into):\n" + ("\n".join(edge_lines[:400]) or "- (none)")
+    )
+    try:
+        content = _invoke_chat(
+            [
+                {"role": "system", "content": _GRAPH_EXPLAIN_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            model=model, temperature=0.1,
+        )
+        parsed = _parse_json_content(content)
+        if isinstance(parsed, dict):
+            return {"summary": parsed.get("summary", ""), "steps": parsed.get("steps") or []}
+        return {"summary": "", "steps": []}
+    except Exception as e:
+        logger.info(f"llm: graph explanation failed for {focus_table}: {e}")
+        return {"summary": "", "steps": [], "error": str(e)}
+
+
 def _invoke_chat(messages: list[dict], model: Optional[str] = None, temperature: float = 0.0) -> str:
     """Low-level chat call → raw assistant content string. Raises on failure.
 

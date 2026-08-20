@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Database, Eye, Layers, ChevronDown, Key, ExternalLink, HardDrive, FolderOpen, Zap, Share2, Building2, Microscope } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
 import { useTransformStore } from "../../store/transformStore";
+import { businessTableLabel, businessDescription, humanizeName } from "../../lib/businessView";
 import type { TableNode as TableNodeType } from "../../api/client";
 
 // Injected by the Delta Sharing overlay (see LineageCanvas). Optional — only
@@ -31,6 +32,7 @@ function TableNodeComponent({ data, id }: NodeProps<TableNodeType & { isExpanded
   // loading change. With hundreds of nodes, whole-store subscription = every node
   // re-rendering on each hover (and memo() can't help — the hook fires first).
   const columnLineageEnabled = useLineageStore((s) => s.columnLineageEnabled);
+  const businessView = useLineageStore((s) => s.businessView);
   const selectedColumn = useLineageStore((s) => s.selectedColumn);
   const toggleNodeExpanded = useLineageStore((s) => s.toggleNodeExpanded);
   const setSelectedColumn = useLineageStore((s) => s.setSelectedColumn);
@@ -120,12 +122,12 @@ function TableNodeComponent({ data, id }: NodeProps<TableNodeType & { isExpanded
 
         <Icon size={15} className={`${config.color} flex-shrink-0 opacity-60`} />
 
-        <span className="font-mono font-medium text-[13px] text-slate-100 flex-1 leading-tight">
-          {data.name}
+        <span className={`${businessView ? "font-sans" : "font-mono"} font-medium text-[13px] text-slate-100 flex-1 leading-tight`}>
+          {businessView ? humanizeName(data.name) : data.name}
         </span>
 
-        <span className={`text-[9px] font-bold tracking-wider px-2 py-0.5 rounded-full ${config.bg} ${config.color} border ${config.border} uppercase flex-shrink-0`}>
-          {config.label}
+        <span className={`text-[9px] font-bold tracking-wider px-2 py-0.5 rounded-full ${config.bg} ${config.color} border ${config.border} ${businessView ? "" : "uppercase"} flex-shrink-0`}>
+          {businessView ? businessTableLabel(data.table_type) : config.label}
         </span>
 
         {/* Delta Sharing badges — outbound (shared to recipients) / inbound (shared-in) */}
@@ -148,7 +150,7 @@ function TableNodeComponent({ data, id }: NodeProps<TableNodeType & { isExpanded
           </span>
         )}
 
-        {columnLineageEnabled && columns.length > 0 && (
+        {!businessView && columnLineageEnabled && columns.length > 0 && (
           <motion.div
             animate={{ rotate: isExpanded ? 0 : -90 }}
             transition={{ duration: 0.2 }}
@@ -159,9 +161,16 @@ function TableNodeComponent({ data, id }: NodeProps<TableNodeType & { isExpanded
         )}
       </div>
 
-      {/* Expanded columns */}
+      {/* Plain-English description (business view only) */}
+      {businessView && (
+        <div className="px-4 pb-2.5 -mt-1 text-[11px] leading-snug text-slate-400 font-sans">
+          {businessDescription(data)}
+        </div>
+      )}
+
+      {/* Expanded columns — technical view only */}
       <AnimatePresence initial={false}>
-        {isExpanded && columns.length > 0 && (
+        {!businessView && isExpanded && columns.length > 0 && (
           <motion.div
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: "auto", opacity: 1 }}

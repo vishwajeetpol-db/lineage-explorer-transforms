@@ -407,6 +407,25 @@ describe("api/client", () => {
       await expect(api.resolveColumnTransformations(body)).rejects.toThrow("API error 500: e");
     });
 
+    it("explainLineageGraph POST + error", async () => {
+      const f = makeFetch({ summary: "flows A to B", steps: [{ title: "s", detail: "d" }] });
+      vi.stubGlobal("fetch", f);
+      const body = {
+        focus_table: "c.s.t",
+        nodes: [{ id: "n1", label: "Orders", type: "Dataset" }],
+        edges: [{ source: "n1", target: "n2" }],
+        detail: "data_and_processing" as const,
+      };
+      const out = await api.explainLineageGraph(body);
+      expect(lastCall(f)[0]).toBe("/api/lineage/explain");
+      expect(lastCall(f)[1].method).toBe("POST");
+      expect(out.summary).toBe("flows A to B");
+
+      const f2 = makeFetch(null, { ok: false, status: 503, text: "no llm" });
+      vi.stubGlobal("fetch", f2);
+      await expect(api.explainLineageGraph(body)).rejects.toThrow("API error 503: no llm");
+    });
+
     it("invalidateTransform without tableFqn", async () => {
       const f = makeFetch({ status: "ok", scope: "cache" });
       vi.stubGlobal("fetch", f);

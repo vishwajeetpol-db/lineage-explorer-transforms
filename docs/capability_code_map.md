@@ -118,6 +118,14 @@
 
 ## Part D — Closure History
 
+### v2.6.x — Business view, precise dataset lineage & AI graph explanation
+
+| Item | Was | Now | How |
+|------|-----|-----|-----|
+| Non-engineer readability | Single technical graph only | HAVE | Client-side **Business view** (relabel + humanize + plain-English descriptions + hide detail) with a **Data-only / Data + processing** sub-toggle. See **Part H**. |
+| Dataset-only lineage accuracy | Collapsing entities cross-producted inputs × outputs → dense mesh for hub tables | HAVE | Backend returns precise per-row `table_edges`; data-only renders those instead of reconstructing. See **Part H3**. |
+| Graph explainability | None | HAVE | **AI "Explain this lineage"** lightbulb → `POST /api/lineage/explain` narrates the on-screen graph (summary + steps). See **Part H4**. |
+
 ### v2.5.6 — Unified column-transformation precedence + cross-source versioning
 
 | Item | Was | Now | How |
@@ -293,3 +301,59 @@ governance-rule, access, ml-models, root-cause-trace, and analyze-producer
 ### Multi-producer demo
 
 `pritam_demo_workspace_catalog.multi_producer_demo.orders_curated` — written by 2 jobs (`mp_producer_a`=239232751351800, `mp_producer_b`=535053242967358); 3 of 4 columns diverge (amount_usd, status, region). SP needs `CAN_VIEW` on both jobs + `CAN_READ` on both producer notebooks for the comparison to resolve.
+
+---
+
+## Part H — Business view, precise dataset lineage & AI graph explanation (v2.6.x, this session)
+
+A plain-language lens over the Table Lineage graph for non-engineers, a fix for the
+"everything-connected-to-everything" mesh when collapsing processing nodes, and an
+AI narrative of the on-screen graph. All additive; the technical view is unchanged.
+
+### H1. Business view (plain-language lens)
+
+| File | Role |
+|---|---|
+| `frontend/src/store/lineageStore.ts` | `businessView: boolean` + `setBusinessView` / `toggleBusinessView`; persisted to `localStorage["bricktrace-business-view"]`, read at store init. Entering business view also clears column-level state (`columnEdges`, `selectedColumn`, `expandedNodes`). |
+| `frontend/src/lib/businessView.ts` | Pure, deterministic mapping module. `businessEntityLabel` (JOB→Process, PIPELINE→Data pipeline, NOTEBOOK→Code step, QUERY→Query, DASHBOARD→Report; default Process). `businessTableLabel` (MANAGED/EXTERNAL/MATERIALIZED_VIEW→Dataset, VIEW→View, STREAMING_TABLE→Live dataset, VOLUME/PATH→File, EXTERNAL_LINEAGE→External source; default Dataset). `humanizeName` (snake/kebab/camel/dotted → Title Case, preserves already-uppercase acronyms). `businessNodeLabel`, `businessNodeType`, `businessDescription` (table comment, else "built from N sources, feeding M downstream consumers"; entities "A <kind> that moves and transforms data"). `isHiddenInBusinessView` (hides `QUERY`). |
+| `frontend/src/components/graph/LineageCanvas.tsx` | Floating "Technical ⇄ Business" toggle (top-left of the canvas). In business view: relabels via the lib, and simplifies the graph (see H2/H3). |
+| `frontend/src/components/graph/TableNode.tsx` · `EntityNode.tsx` | `businessView`-gated rendering: friendly label (`humanizeName`) + friendly type badge (no `uppercase`), plain-English description subtitle (TableNode), and hides FQN affordances, column-expand/detail, entity IDs, per-run cost badge, and health popover. |
+| `frontend/src/lib/businessView.test.ts` · `store/lineageStore.test.ts` | Mapping/humanize/description/hidden-type coverage + store toggle + persistence. |
+
+### H2. Data-only vs Data + processing
+
+| File | Role |
+|---|---|
+| `frontend/src/store/lineageStore.ts` | `businessDetail: "data" \| "data_and_processing"` + `setBusinessDetail`; persisted `localStorage["bricktrace-business-detail"]` (default `data_and_processing`). |
+| `frontend/src/components/graph/LineageCanvas.tsx` | Sub-toggle shown only in business view. `"data"` hides **all** processing (entity) nodes; `"data_and_processing"` keeps jobs/pipelines and drops only the noisiest (`isHiddenInBusinessView` → QUERY). Hidden nodes are removed and their flow is bridged so the picture stays connected. |
+
+### H3. Precise table→table lineage (`table_edges`) — mesh fix
+
+**Root cause:** each `system.access.table_lineage` row is one real `(source_table → target_table)` pair *with* its mediating entity, but `_build_graph_from_rows` collapsed those rows into sets (`table→entity`, `entity→table`), discarding which source fed which target. The UI's entity-collapse then cross-producted each entity's inputs × outputs, fabricating edges and producing an O(N²) mesh for hub tables (e.g. `pritam_demo_workspace_catalog.silver_dynamic.customers_validated`).
+
+| File | Role |
+|---|---|
+| `backend/lineage_service.py` | `_build_graph_from_rows` now also collects the DISTINCT precise `(source, target)` pairs per row (`sref != tref`) and returns them as `table_edges`. Trace cache key bumped `trace:` → **`trace:v2:`** so pre-v2 cached traces (no `table_edges`) are ignored. |
+| `backend/models.py` | New `table_edges: list[LineageEdge] = []` on `LineageResponse`. |
+| `backend/main.py` | `GET /api/lineage/trace` (and scope lineage) return `table_edges`; both apply the truncation filter to `table_edges` alongside `edges`. |
+| `backend/perf_patches.py` | Distributed-cache trace patch key bumped to `trace:v2:` (namespace `trace`) in lock-step with `lineage_service`. |
+| `frontend/src/api/client.ts` | `table_edges?: LineageEdge[]` on `LineageResponse`. |
+| `frontend/src/store/lineageStore.ts` | `tableEdges` state, populated from `data.table_edges` in `setLineageData`; cleared on `reset`. |
+| `frontend/src/components/table-lineage/TableLineageWorkspace.tsx` | Passes `tableEdges: data.table_edges` into `setLineageData`. |
+| `frontend/src/components/graph/LineageCanvas.tsx` | Data-only view renders `tableEdges` filtered to visible datasets instead of cross-producting; falls back to bridging only if `table_edges` is absent (older cached trace). |
+| `tests/test_lineage_service.py` | `test_build_graph_table_edges_are_precise_not_cross_product` (asserts real `a→x`,`b→y`; fabricated `a→y`,`b→x` absent) + self/missing-skip test. |
+
+### H4. AI "Explain this lineage" (lightbulb)
+
+| File | Role |
+|---|---|
+| `backend/server/llm.py` | `explain_lineage_graph(nodes, edges, focus_table, detail, model)` — builds an id-free prompt (node labels + `A -> B` connections) under `_GRAPH_EXPLAIN_SYSTEM_PROMPT`; returns `{summary, steps:[{title, detail}]}`; never raises (`error` key on failure). |
+| `backend/routes/lineage.py` | `POST /api/lineage/explain` (analyze_router). Body `{focus_table, nodes:[{id,label,type}], edges:[{source,target}], detail, model}`. `503` if LLM unconfigured, `400` if no `focus_table`, `500` on error; runs the call in a thread. |
+| `frontend/src/components/graph/LineageExplainModal.tsx` | Portaled modal — summary + ordered "source → process → output" walkthrough; caches per `(focus · detail · graph signature)` for the session; regenerate button; Escape to close. |
+| `frontend/src/components/graph/LineageCanvas.tsx` | Business-view lightbulb button; posts the on-screen (business-view) `explainNodes`/`explainEdges` so the narrative matches exactly what's shown (respects data-only vs data+processing). |
+| `frontend/src/api/client.ts` | `api.explainLineageGraph` + `LineageExplainResult` / `LineageExplainStep` types. |
+| `tests/test_server_llm.py` · `tests/test_routes_column_transformations.py` · `frontend/src/api/client.test.ts` | LLM function, route (503/400/ok/bad-detail/500), and client method coverage. |
+
+### H5. Coverage gates after this work
+
+Backend **90.67 %** (1,482 passing); frontend **599** tests (96.4 % lines / 85.4 % branches). Both gates green.

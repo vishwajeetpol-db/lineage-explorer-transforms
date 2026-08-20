@@ -214,6 +214,40 @@ class TestGraphBuild:
         assert ("main.s.mid", "entity:PIPELINE:p1") not in pairs
         assert ("main.s.mid", "main.s.final") in pairs
 
+    def test_build_graph_table_edges_are_precise_not_cross_product(self):
+        """table_edges must carry the REAL per-row source→target pairs — never the
+        cross-product of an entity's inputs × outputs (the mesh bug)."""
+        client = MagicMock()
+        # One pipeline reads {a, b} and writes {x, y}, but the REAL pairs are only
+        # a->x and b->y. The entity-routed `edges` can't distinguish these, but
+        # `table_edges` (built per-row) must contain exactly the real pairs.
+        rows = [
+            {"source_table_full_name": "main.s.a", "target_table_full_name": "main.s.x",
+             "entity_type": "PIPELINE", "entity_id": "p1"},
+            {"source_table_full_name": "main.s.b", "target_table_full_name": "main.s.y",
+             "entity_type": "PIPELINE", "entity_id": "p1"},
+        ]
+        with patch.object(ls, "_execute_sql", return_value=[]), \
+             patch.object(ls, "_entity_cost", return_value=None), \
+             patch.object(ls, "_maybe_refresh_cost_cache"):
+            resp = ls._build_graph_from_rows(client, rows)
+        tpairs = {(e.source, e.target) for e in resp.table_edges}
+        assert tpairs == {("main.s.a", "main.s.x"), ("main.s.b", "main.s.y")}
+        # The fabricated cross-product pairs must NOT appear.
+        assert ("main.s.a", "main.s.y") not in tpairs
+        assert ("main.s.b", "main.s.x") not in tpairs
+
+    def test_build_graph_table_edges_skip_self_and_missing(self):
+        client = MagicMock()
+        rows = [
+            {"source_table_full_name": "main.s.a", "target_table_full_name": "main.s.a"},  # self
+            {"source_table_full_name": "main.s.c", "target_table_full_name": None},        # missing target
+        ]
+        with patch.object(ls, "_execute_sql", return_value=[]), \
+             patch.object(ls, "_maybe_refresh_cost_cache"):
+            resp = ls._build_graph_from_rows(client, rows)
+        assert resp.table_edges == []
+
     def test_build_graph_populates_columns(self):
         client = MagicMock()
         rows = [{"source_table_full_name": "main.s.a", "target_table_full_name": "main.s.b"}]

@@ -16,8 +16,10 @@ import ReactFlow, {
 } from "reactflow";
 import "reactflow/dist/style.css";
 import { AnimatePresence, motion } from "framer-motion";
-import { RotateCcw } from "lucide-react";
+import { RotateCcw, Code2, Briefcase, Lightbulb } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
+import { isHiddenInBusinessView, businessNodeLabel, businessNodeType } from "../../lib/businessView";
+import LineageExplainModal from "./LineageExplainModal";
 import { api } from "../../api/client";
 import { layoutGraph } from "../../lib/elkLayout";
 
@@ -44,6 +46,7 @@ function LineageCanvas() {
   const {
     nodes: allNodes,
     edges: allEdges,
+    tableEdges,
     focusTable,
     lineageView,
     lineageDepth,
@@ -55,10 +58,17 @@ function LineageCanvas() {
     loading,
     error,
     columnLineageEnabled,
+    businessView,
+    businessDetail,
+    setBusinessView,
+    setBusinessDetail,
     setSelectedNode,
     setSelectedColumn,
     setColumnEdges,
   } = useLineageStore();
+
+  // AI "explain this lineage" modal (Business-view lightbulb).
+  const [explainOpen, setExplainOpen] = useState(false);
 
   // Subgraph extraction: when focusTable is set, show only its lineage path.
   // lineageDepth controls how many table-to-table hops to show (0 = full).
@@ -134,7 +144,7 @@ function LineageCanvas() {
   }, [allNodes, allEdges, focusTable, lineageDepth]);
 
   // Apply view mode filter on top of subgraph extraction
-  const { viewNodes, viewEdges } = useMemo(() => {
+  const { viewNodes: baseNodes, viewEdges: baseEdges } = useMemo(() => {
     const isEntity = (id: string) => id.startsWith("entity:");
 
     if (lineageView === "table") {
@@ -207,6 +217,81 @@ function LineageCanvas() {
     // "full" mode — both tables and entities as-is
     return { viewNodes: rawNodes, viewEdges: rawEdges };
   }, [rawNodes, rawEdges, lineageView]);
+
+  // Business view simplification: drop the noisiest technical nodes (e.g. ad-hoc
+  // QUERY entities) and bridge the flow through them so the picture stays
+  // connected — source → target — without the low-level clutter. Column-level
+  // detail is already suppressed via the store when business view is enabled.
+  const { viewNodes, viewEdges } = useMemo(() => {
+    if (!businessView) return { viewNodes: baseNodes, viewEdges: baseEdges };
+    // "data" = hide every processing step (entity) and connect datasets directly.
+    // "data_and_processing" = keep jobs/pipelines, drop only the noisiest (queries).
+    const dataOnly = businessDetail === "data";
+    const hidden = new Set(
+      baseNodes
+        .filter((n) => (dataOnly ? n.node_type === "entity" : isHiddenInBusinessView(n)))
+        .map((n) => n.id)
+    );
+    if (hidden.size === 0) return { viewNodes: baseNodes, viewEdges: baseEdges };
+
+    const kept = baseNodes.filter((n) => !hidden.has(n.id));
+
+    // Data-only: use the backend's PRECISE table→table pairs (filtered to the
+    // datasets on screen) instead of cross-producting each entity's inputs ×
+    // outputs — the cross-product fabricates edges and turns a hub table into a
+    // dense mesh. Fall back to bridging only if the backend didn't supply pairs
+    // (e.g. an older cached trace).
+    if (dataOnly && tableEdges.length > 0) {
+      const keptIds = new Set(kept.map((n) => n.id));
+      const seenT = new Set<string>();
+      const edges: { source: string; target: string }[] = [];
+      for (const e of tableEdges) {
+        if (e.source === e.target) continue;
+        if (!keptIds.has(e.source) || !keptIds.has(e.target)) continue;
+        const k = `${e.source}|${e.target}`;
+        if (!seenT.has(k)) { seenT.add(k); edges.push({ source: e.source, target: e.target }); }
+      }
+      return { viewNodes: kept, viewEdges: edges };
+    }
+    const incoming = new Map<string, Set<string>>(); // hidden id → its sources
+    const outgoing = new Map<string, Set<string>>(); // hidden id → its targets
+    const passthrough: { source: string; target: string }[] = [];
+    const seen = new Set<string>();
+    const add = (source: string, target: string) => {
+      const k = `${source}|${target}`;
+      if (source !== target && !seen.has(k)) { seen.add(k); passthrough.push({ source, target }); }
+    };
+
+    for (const e of baseEdges) {
+      const sh = hidden.has(e.source);
+      const th = hidden.has(e.target);
+      if (!sh && !th) { add(e.source, e.target); continue; }
+      if (th) { if (!incoming.has(e.target)) incoming.set(e.target, new Set()); incoming.get(e.target)!.add(e.source); }
+      if (sh) { if (!outgoing.has(e.source)) outgoing.set(e.source, new Set()); outgoing.get(e.source)!.add(e.target); }
+    }
+    // Bridge s → [hidden] → t into s → t (only across still-visible endpoints).
+    for (const h of hidden) {
+      for (const s of incoming.get(h) || []) {
+        if (hidden.has(s)) continue;
+        for (const t of outgoing.get(h) || []) {
+          if (hidden.has(t)) continue;
+          add(s, t);
+        }
+      }
+    }
+    return { viewNodes: kept, viewEdges: passthrough };
+  }, [baseNodes, baseEdges, tableEdges, businessView, businessDetail]);
+
+  // Plain-language projection of the on-screen graph for the AI explanation.
+  // Memoized so the modal's fetch effect doesn't re-fire on every parent render.
+  const explainNodes = useMemo(
+    () => viewNodes.map((n) => ({ id: n.id, label: businessNodeLabel(n), type: businessNodeType(n) })),
+    [viewNodes]
+  );
+  const explainEdges = useMemo(
+    () => viewEdges.map((e) => ({ source: e.source, target: e.target })),
+    [viewEdges]
+  );
 
   // =========================================================================
   // DELTA SHARING OVERLAY — augment the view graph with sharing boundary nodes.
@@ -904,6 +989,101 @@ function LineageCanvas() {
           style={{ width: 160, height: 100 }}
         />
       </ReactFlow>
+
+      {/* Technical ⇄ Business view controls — flip into a plain-language lens for
+          non-engineers, choose how much to show, and explain the graph with AI. */}
+      <div className="absolute top-3 left-3 z-20 flex flex-col items-start gap-2">
+        <div className="flex items-center gap-2">
+          <div
+            role="group"
+            aria-label="Lineage detail level"
+            className="flex items-center gap-0.5 rounded-lg bg-surface-100/90 backdrop-blur-md border border-white/[0.06] p-0.5 shadow-[0_2px_12px_rgba(0,0,0,0.3)]"
+          >
+            <button
+              onClick={() => setBusinessView(false)}
+              aria-pressed={!businessView}
+              title="Technical view — full engineering detail"
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+                !businessView
+                  ? "bg-accent/20 text-accent-light"
+                  : "text-slate-500 hover:text-slate-300 hover:bg-white/[0.05]"
+              }`}
+            >
+              <Code2 size={13} />
+              Technical
+            </button>
+            <button
+              onClick={() => setBusinessView(true)}
+              aria-pressed={businessView}
+              title="Business view — plain-language, simplified for non-engineers"
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+                businessView
+                  ? "bg-emerald-500/20 text-emerald-300"
+                  : "text-slate-500 hover:text-slate-300 hover:bg-white/[0.05]"
+              }`}
+            >
+              <Briefcase size={13} />
+              Business
+            </button>
+          </div>
+
+          {/* AI explain-the-lineage bulb — business view only */}
+          {businessView && (
+            <button
+              onClick={() => setExplainOpen(true)}
+              title="Explain this lineage in plain English (AI)"
+              aria-label="Explain this lineage with AI"
+              className="flex items-center gap-1.5 px-2.5 py-[7px] rounded-lg bg-surface-100/90 backdrop-blur-md border border-amber-500/25 text-amber-300 hover:bg-amber-500/10 hover:border-amber-400/40 transition-colors shadow-[0_2px_12px_rgba(0,0,0,0.3)]"
+            >
+              <Lightbulb size={14} />
+              <span className="text-[11px] font-medium">Explain</span>
+            </button>
+          )}
+        </div>
+
+        {/* Data-only vs Data + processing — business view only */}
+        {businessView && (
+          <div
+            role="group"
+            aria-label="Business view content"
+            className="flex items-center gap-0.5 rounded-lg bg-surface-100/90 backdrop-blur-md border border-white/[0.06] p-0.5 shadow-[0_2px_12px_rgba(0,0,0,0.3)]"
+          >
+            <button
+              onClick={() => setBusinessDetail("data")}
+              aria-pressed={businessDetail === "data"}
+              title="Show only the datasets and how they connect"
+              className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+                businessDetail === "data"
+                  ? "bg-emerald-500/20 text-emerald-300"
+                  : "text-slate-500 hover:text-slate-300 hover:bg-white/[0.05]"
+              }`}
+            >
+              Data only
+            </button>
+            <button
+              onClick={() => setBusinessDetail("data_and_processing")}
+              aria-pressed={businessDetail === "data_and_processing"}
+              title="Show datasets plus the processing steps that move data between them"
+              className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+                businessDetail === "data_and_processing"
+                  ? "bg-emerald-500/20 text-emerald-300"
+                  : "text-slate-500 hover:text-slate-300 hover:bg-white/[0.05]"
+              }`}
+            >
+              Data + processing
+            </button>
+          </div>
+        )}
+      </div>
+
+      <LineageExplainModal
+        open={explainOpen}
+        onClose={() => setExplainOpen(false)}
+        focusTable={focusTable || "the selected datasets"}
+        nodes={explainNodes}
+        edges={explainEdges}
+        detail={businessDetail}
+      />
 
       {/* Large-graph hint — auto-hides after 6s via state (below). Layout of many
           nodes can briefly freeze the UI; this signals that's expected, not a bug. */}

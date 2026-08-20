@@ -62,6 +62,10 @@ export interface ColumnLineageEdge {
 export interface LineageResponse {
   nodes: GraphNode[];
   edges: LineageEdge[];
+  // Precise table→table dependencies (independent of the entity-routed `edges`),
+  // used for the "datasets only" business view so collapsing entities never has
+  // to cross-product an entity's inputs × outputs.
+  table_edges?: LineageEdge[];
   cached?: boolean;
   cached_at?: string | null;
   cache_expires_at?: string | null;
@@ -481,6 +485,17 @@ export interface ColumnOverviewResult {
   _cache?: CacheMeta | null;
 }
 
+export interface LineageExplainStep {
+  title: string;
+  detail: string;
+}
+
+export interface LineageExplainResult {
+  summary: string;
+  steps: LineageExplainStep[];
+  error?: string | null;
+}
+
 export interface AnalysisVersion {
   version: number;
   llm_model: string | null;
@@ -666,6 +681,25 @@ export const api = {
     });
     if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
     return res.json() as Promise<ColumnOverviewResult>;
+  },
+
+  // Plain-English AI explanation of the CURRENT lineage graph (Business-view
+  // lightbulb). The caller posts the on-screen nodes/edges so the narrative
+  // matches exactly what's shown (datasets-only vs datasets+processing).
+  explainLineageGraph: async (body: {
+    focus_table: string;
+    nodes: { id: string; label: string; type: string }[];
+    edges: { source: string; target: string }[];
+    detail?: "data" | "data_and_processing";
+    model?: string;
+  }) => {
+    const res = await fetch(`${BASE}/lineage/explain`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+    return res.json() as Promise<LineageExplainResult>;
   },
 
   // Deep framework fallback — streams NDJSON commentary events; `onEvent` is

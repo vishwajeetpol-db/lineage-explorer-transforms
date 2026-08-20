@@ -316,4 +316,48 @@ describe("lineageStore", () => {
     // Selectors retained
     expect(get().catalog).toBe("cat");
   });
+
+  describe("business view", () => {
+    beforeEach(() => {
+      useLineageStore.setState({ businessView: false });
+    });
+
+    it("setBusinessView(true) enables it and clears technical column state", () => {
+      get().setColumnLineageEnabled(true);
+      get().toggleNodeExpanded("cat.sch.t1");
+      get().setSelectedColumn({ table: "cat.sch.t1", column: "c1" });
+      get().setBusinessView(true);
+      expect(get().businessView).toBe(true);
+      expect(get().expandedNodes.size).toBe(0);
+      expect(get().selectedColumn).toBeNull();
+      expect(get().columnEdges).toEqual([]);
+      expect(localStorage.getItem("bricktrace-business-view")).toBe("1");
+    });
+
+    it("setBusinessView(false) disables it and persists off", () => {
+      get().setBusinessView(true);
+      get().setBusinessView(false);
+      expect(get().businessView).toBe(false);
+      expect(localStorage.getItem("bricktrace-business-view")).toBe("0");
+    });
+
+    it("toggleBusinessView flips the flag both ways", () => {
+      expect(get().businessView).toBe(false);
+      get().toggleBusinessView();
+      expect(get().businessView).toBe(true);
+      expect(localStorage.getItem("bricktrace-business-view")).toBe("1");
+      get().toggleBusinessView();
+      expect(get().businessView).toBe(false);
+      expect(localStorage.getItem("bricktrace-business-view")).toBe("0");
+    });
+
+    it("setBusinessDetail switches data / data+processing and persists", () => {
+      get().setBusinessDetail("data");
+      expect(get().businessDetail).toBe("data");
+      expect(localStorage.getItem("bricktrace-business-detail")).toBe("data");
+      get().setBusinessDetail("data_and_processing");
+      expect(get().businessDetail).toBe("data_and_processing");
+      expect(localStorage.getItem("bricktrace-business-detail")).toBe("data_and_processing");
+    });
+  });
 });

@@ -696,6 +696,7 @@ async def api_get_lineage(request: Request, catalog: str = Query(...), schema: s
             result.nodes = result.nodes[:len(nodes_raw)]
             retained_ids = {n.get("id") or n.get("name") for n in nodes_raw}
             result.edges = [e for e in result.edges if e.source in retained_ids and e.target in retained_ids]
+            result.table_edges = [e for e in result.table_edges if e.source in retained_ids and e.target in retained_ids]
             result.truncated = True
         # C2/C3/C5: Enrich response with graph warnings (C4 truncation already applied above)
         requested_cats = [catalog]
@@ -737,6 +738,7 @@ async def api_lineage_trace(request: Request, table: str = Query(...), live: boo
             result.nodes = result.nodes[:len(nodes_raw)]
             retained_ids = {n.get("id") or n.get("name") for n in nodes_raw}
             result.edges = [e for e in result.edges if e.source in retained_ids and e.target in retained_ids]
+            result.table_edges = [e for e in result.table_edges if e.source in retained_ids and e.target in retained_ids]
             result.truncated = True
         # C2/C3/C5: Trace crosses catalogs — extract all referenced catalogs from nodes
         requested_cats = list({n.get("catalog", "") for n in nodes_raw if n.get("catalog")})

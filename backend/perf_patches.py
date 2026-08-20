@@ -347,7 +347,8 @@ def _apply_distributed_cache_patch():
     def _patched_get_lineage_trace(seed_full_name, skip_cache=False):
         if skip_cache:
             return _orig_trace(seed_full_name, skip_cache)
-        cache_key = f"trace:{seed_full_name}"
+        # v2: keep in lock-step with get_lineage_trace's key (now carries table_edges).
+        cache_key = f"trace:v2:{seed_full_name}"
         # 1. In-process LRU
         cached = ls._cache_get(cache_key)
         if cached is not None:

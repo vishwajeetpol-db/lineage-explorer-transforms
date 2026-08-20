@@ -22,6 +22,9 @@ deploy that upgrades to 2.4.0 — enabling one is an explicit admin action.
 | Cached capability panels (v2.6.0) | Impact/Root Cause/Governance/Access cached per table in Delta; "cached / may be stale" badge + refresh; admin evict per entry/table/all | `server/capability_cache.py`, `/api/admin/capability-cache` — see [capability_code_map.md](capability_code_map.md) Part G |
 | Per-node run health check (v2.6.0) | Activity icon on every job/pipeline node → verdict + success rate + duration trend + cost total/spike + last-5 runs (per-run cost + deep links) | `server/observability.py` `get_recent_runs`, `/api/observability/runs`, `EntityNode.tsx` |
 | Multi-producer transformation comparison (v2.6.0) | Side-by-side per-column matrix when a table has 2+ producers, flagging divergent logic | `producer_source.compare_producers`, `/api/column-transformations/compare-producers` |
+| Business view (v2.6.x) | Canvas **Technical ⇄ Business** toggle: relabels technical types to business terms, humanizes `snake_case` names, shows a plain-English description per dataset, hides FQNs/columns/IDs/cost/health; persisted | `frontend/src/lib/businessView.ts`, `store/lineageStore.ts` (`businessView`) — see [capability_code_map.md](capability_code_map.md) Part H |
+| Data-only vs Data + processing (v2.6.x) | Business-view sub-toggle: datasets only, or datasets + the jobs/pipelines that move data between them; data-only renders **precise** `system.access.table_lineage` pairs (no cross-product mesh) | `businessDetail` in `lineageStore`, `LineageResponse.table_edges`, `/api/lineage/trace` |
+| AI "Explain this lineage" (v2.6.x) | Business-view lightbulb → modal with a plain-English summary + ordered source→process→output walkthrough of the current on-screen graph | `llm.explain_lineage_graph`, `POST /api/lineage/explain`, `components/graph/LineageExplainModal.tsx` |
 
 ## Control Panel
 

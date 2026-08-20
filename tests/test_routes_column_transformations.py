@@ -155,6 +155,50 @@ class TestColumnTransformations:
         assert resp.status_code == 200
 
 
+class TestExplainLineage:
+    def test_requires_llm_configured(self, app_client):
+        with patch("backend.server.llm.is_llm_configured", return_value=False):
+            resp = app_client.post("/api/lineage/explain", json={
+                "focus_table": "c.s.t", "nodes": [], "edges": []})
+        assert resp.status_code == 503
+
+    def test_requires_focus_table(self, app_client):
+        with patch("backend.server.llm.is_llm_configured", return_value=True):
+            resp = app_client.post("/api/lineage/explain", json={
+                "focus_table": "  ", "nodes": [], "edges": []})
+        assert resp.status_code == 400
+
+    def test_ok(self, app_client):
+        with patch("backend.server.llm.is_llm_configured", return_value=True), \
+             patch("backend.server.llm.explain_lineage_graph",
+                   return_value={"summary": "flows A to B", "steps": [{"title": "t", "detail": "d"}]}) as mock_ex:
+            resp = app_client.post("/api/lineage/explain", json={
+                "focus_table": "c.s.t",
+                "nodes": [{"id": "n1", "label": "A", "type": "Dataset"}],
+                "edges": [{"source": "n1", "target": "n2"}],
+                "detail": "data"})
+        assert resp.status_code == 200
+        assert resp.json()["summary"] == "flows A to B"
+        # detail normalized and passed through
+        assert mock_ex.call_args.args[3] == "data"
+
+    def test_bad_detail_defaults_to_data_and_processing(self, app_client):
+        with patch("backend.server.llm.is_llm_configured", return_value=True), \
+             patch("backend.server.llm.explain_lineage_graph",
+                   return_value={"summary": "s", "steps": []}) as mock_ex:
+            resp = app_client.post("/api/lineage/explain", json={
+                "focus_table": "c.s.t", "nodes": [], "edges": [], "detail": "weird"})
+        assert resp.status_code == 200
+        assert mock_ex.call_args.args[3] == "data_and_processing"
+
+    def test_service_error_500(self, app_client):
+        with patch("backend.server.llm.is_llm_configured", return_value=True), \
+             patch("backend.server.llm.explain_lineage_graph", side_effect=RuntimeError("boom")):
+            resp = app_client.post("/api/lineage/explain", json={
+                "focus_table": "c.s.t", "nodes": [], "edges": []})
+        assert resp.status_code == 500
+
+
 class TestLineageExtensions:
     def test_column_path_requires_params(self, app_client):
         resp = app_client.get("/api/lineage/column-path", params={"catalog": "c"})

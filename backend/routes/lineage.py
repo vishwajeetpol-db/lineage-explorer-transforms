@@ -384,6 +384,36 @@ async def column_transformation_overview(request: Request, body: CTOverviewIn):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class LineageExplainIn(BaseModel):
+    focus_table: str
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    detail: Optional[str] = "data_and_processing"
+    model: Optional[str] = None
+
+
+@analyze_router.post("/api/lineage/explain")
+async def explain_lineage(request: Request, body: LineageExplainIn):
+    """Plain-English AI explanation of the CURRENT lineage graph for a business
+    audience (used by the Business-view lightbulb). Stateless — the frontend posts
+    the on-screen (business-view) nodes + edges so the narrative matches exactly
+    what the user sees (datasets-only vs datasets+processing)."""
+    from backend.server import llm as llm_client
+    if not llm_client.is_llm_configured():
+        raise HTTPException(status_code=503, detail="AI explanation is unavailable — no serving endpoint is configured for this app.")
+    focus = (body.focus_table or "").strip()
+    if not focus:
+        raise HTTPException(status_code=400, detail="focus_table is required")
+    detail = "data" if (body.detail or "").strip() == "data" else "data_and_processing"
+    try:
+        return await asyncio.to_thread(
+            llm_client.explain_lineage_graph,
+            body.nodes or [], body.edges or [], focus, detail, body.model,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class CTDeepAnalyzeIn(BaseModel):
     catalog: str
     schema_name: str

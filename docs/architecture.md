@@ -62,6 +62,18 @@ None of these change how the always-on table/column/transformation lineage engin
 
 ---
 
+## 1.3 What's New in 2.6.x (Table Lineage workspace — Business view & AI explain)
+
+The Table Lineage workspace gains a second audience. Everything below is additive to the engine in §1.1/§4 — the same graph data, re-presented.
+
+- **Business view** — a canvas toggle **Technical ⇄ Business** (top-left of the lineage graph) that flips the detailed engineering graph into a plain-language lens for non-engineers. Fully **client-side and instant** (no backend call), persisted in `localStorage` (`bricktrace-business-view`). It relabels technical types into business terms, humanizes `snake_case`/`camelCase` names (`orders_curated` → "Orders Curated", acronyms preserved), shows a one-line plain-English description per dataset (its curator comment, else "built from N sources, feeding M downstream consumers"), and hides engineering detail (FQNs, column-level edges/expansion, job/pipeline IDs, per-run cost, health popovers). All mapping logic is pure and unit-tested in `frontend/src/lib/businessView.ts` (`businessEntityLabel`, `businessTableLabel`, `humanizeName`, `businessNodeLabel`, `businessNodeType`, `businessDescription`, `isHiddenInBusinessView`).
+- **Data only vs Data + processing** — a business-view sub-toggle (`businessDetail: "data" | "data_and_processing"`, persisted `bricktrace-business-detail`). "Data only" hides all processing (job/pipeline) nodes and draws dataset→dataset flow directly; "Data + processing" keeps them. Ad-hoc `QUERY` entities are always dropped.
+- **Precise dataset lineage (`table_edges`)** — the "Data only" view is drawn from **exact** per-row `(source_table → target_table)` pairs, not by cross-producting each entity's inputs × outputs (which fabricated edges and produced a dense "everything → everything" mesh for hub tables). `_build_graph_from_rows` (`lineage_service.py`) now emits these distinct pairs as `table_edges` on `LineageResponse` (`models.py`), independent of the entity-routed `edges`; `/api/lineage/trace` (and scope lineage) return them, truncation-filtered in `main.py`. The trace cache key was bumped to `trace:v2:` (in `lineage_service.py` and the `perf_patches.py` distributed layer) so pre-v2 cached traces without the field are ignored. `lineageStore` carries `tableEdges`.
+- **AI "Explain this lineage"** — a business-view lightbulb opens a modal (`components/graph/LineageExplainModal.tsx`) with an AI plain-English explanation of the **current on-screen** graph: an overall summary plus an ordered "source → process → output" walkthrough. Stateless — the frontend posts the visible (business-view) nodes/edges so the narrative matches exactly what's shown. Backed by `POST /api/lineage/explain` → `llm.explain_lineage_graph()`.
+- **Column Transformation panel** — restructured into tabs (Columns / Analyze / History / Producers); adds an **AI overview modal** (`ColumnOverviewModal.tsx`, `POST /api/column-transformations/overview` → `llm.explain_transformations()`) and **deep framework analysis** for metadata-driven pipelines that carry no column logic in code (`backend/server/framework_analysis.py`, streaming NDJSON `POST /api/column-transformations/deep-analyze`).
+
+---
+
 ## 2. Directory Structure
 
 The repository is **flat** — `backend/`, `frontend/`, and the `transformation_lineage/` engine package all sit at the top level. The build job runs the same `transformation_lineage/` package the backend imports (no separate embedded copy).
@@ -82,19 +94,23 @@ lineage_app/
 │   │   ├── capture.py               #   capture()/capture_cdc_spec() — runs inside opted-in pipelines
 │   │   └── plan_parser.py           #   pure-stdlib Analyzed Plan parser
 │   ├── federated_sync.py            # (2.4.0) Peer registry + Delta Sharing overview cross-reference
+│   ├── routes/                      # APIRouters (lineage.py — analyze/column-transformation/explain endpoints, …)
+│   ├── server/                      # Capability engines: llm.py (explain_transformations / explain_lineage_graph),
+│   │                                #   framework_analysis.py (2.6.x deep metadata-framework fallback), producer_source.py, …
 │   └── tests/                       # Unit tests
 ├── frontend/                        # React + TypeScript SPA
 │   ├── src/
 │   │   ├── components/
-│   │   │   ├── graph/               # ReactFlow canvas, ELK layout
+│   │   │   ├── graph/               # ReactFlow canvas, ELK layout, EntityNode/TableNode, LineageExplainModal (2.6.x)
+│   │   │   ├── table-lineage/        # Table Lineage workspace: capability panels + ColumnTransformationPanel + ColumnOverviewModal (2.6.x)
 │   │   │   ├── transform/           # TransformPanel, TransformCanvas, BuildProgress, PruningControls
 │   │   │   ├── lineage/             # Column drill-down
 │   │   │   ├── browse/ landing/ layout/ ui/
 │   │   │   ├── control-panel/       # (2.4.0) ControlPanel, ModuleSection, FeatureToggleCard, ImpactBadges, AccessRequirementsModal
 │   │   │   ├── AdminDashboard.tsx   # Ops dashboard + transformation-lineage invalidate controls
 │   │   ├── api/                     # Typed fetch client (client.ts, transform.ts, controlPanel.ts)
-│   │   ├── store/                   # Zustand stores (lineageStore, transformStore, featureFlagStore)
-│   │   └── lib/                     # Utilities, ELK worker
+│   │   ├── store/                   # Zustand stores (lineageStore [+ businessView/businessDetail/tableEdges], transformStore, featureFlagStore)
+│   │   └── lib/                     # Utilities, ELK worker, businessView.ts (2.6.x Business-view relabelling)
 │   └── dist/                        # Production build (served by FastAPI; committed)
 ├── transformation_lineage/          # Transformation-lineage engine (imported by app AND run by build job)
 │   ├── pipeline.py                  # Orchestrator (extract → version → parse → graph → reconcile → materialize → endpoints → enrich)
@@ -187,6 +203,9 @@ The transformation lineage pipeline:
 | PruningControls | `PruningControls.tsx` | **Category filter + path isolation** (the depth slider was removed — the popup always shows the column's full end-to-end lineage) |
 | AdminDashboard | `AdminDashboard.tsx` | Ops dashboard + **Flush cache** / **Wipe lineage** invalidate controls (`POST /api/transform/invalidate`) |
 | ControlPanel (2.4.0) | `control-panel/ControlPanel.tsx` | Admin-gated toggles for Runtime Plan Capture, Captured-Plan Precedence, Federated Sync, with per-flag access-requirement checks |
+| Business-view controls (2.6.x) | `graph/LineageCanvas.tsx` | Canvas toggle **Technical ⇄ Business**, the **Data only / Data + processing** sub-toggle, and the AI **Explain** lightbulb — all top-left of the graph, business-view only |
+| LineageExplainModal (2.6.x) | `graph/LineageExplainModal.tsx` | Portaled modal — AI plain-English summary + ordered "source→process→output" walkthrough of the current graph (`POST /api/lineage/explain`); caches per view, has a regenerate button |
+| ColumnOverviewModal (2.6.x) | `table-lineage/ColumnOverviewModal.tsx` | Portaled master–detail modal — AI plain-English overview of a table's column transformations (`POST /api/column-transformations/overview`) |
 
 ---
 
@@ -221,7 +240,8 @@ The store has **12 Delta tables** (`storage/schema.py`): `lineage_nodes`, `linea
 | GET | `/api/catalogs` | Available catalogs |
 | GET | `/api/schemas?catalog=` | Schemas in catalog |
 | GET | `/api/lineage?catalog=&schema=` | Table-level DAG |
-| GET | `/api/lineage/trace?table=` | End-to-end cross-catalog trace |
+| GET | `/api/lineage/trace?table=` | End-to-end cross-catalog trace. **(2.6.x)** Also returns `table_edges` — the precise per-row `(source→target)` dataset pairs used by the Business "Data only" view (independent of the entity-routed `edges`) |
+| POST | `/api/lineage/explain` | **(2.6.x)** AI plain-English explanation of the current graph — body `{focus_table, nodes, edges, detail, model}` → `{summary, steps[]}`; 503 if the LLM endpoint is unconfigured |
 | GET | `/api/columns?catalog=&schema=&table=` | Lazy column load |
 | GET | `/api/column-lineage?...` | Column-level edges |
 | GET | `/api/schema-column-lineage?...` | All column edges for schema |
@@ -238,6 +258,16 @@ The store has **12 Delta tables** (`storage/schema.py`): `lineage_nodes`, `linea
 | GET | `/api/transform/build-configured` | Check if pipeline is configured |
 | POST | `/api/transform/invalidate?scope=cache\|table\|all` | Invalidate transform cache / wipe stored lineage (admin) |
 | GET | `/api/transform/captured-expression?...` | (2.4.0) Runtime-captured expression for a column, or `{"captured": null}` when unavailable/disabled |
+
+### Column Transformation (2.5.6 – 2.6.x)
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/column-transformations` | Unified per-column transformations for a table, resolved best-source-first (captured plan → captured CDC → stored LLM → fresh LLM) |
+| POST | `/api/column-transformations/overview` | AI plain-English overview (summary + per-column explanation), cached per table |
+| POST | `/api/column-transformations/deep-analyze` | Streaming (NDJSON) deep framework analysis for metadata-driven pipelines — detect config → read params → query config tables → derive columns |
+| POST | `/api/column-transformations/versions` | Unified version list across sources (captured plans + stored LLM analyses) |
+| POST | `/api/column-transformations/compare` | Diff any two versions by ref (`plan_capture:N` / `llm:N`), incl. cross-source |
+| POST | `/api/column-transformations/compare-producers` | Per-column matrix comparing 2+ producers of one table |
 
 ### Control Panel (2.4.0)
 | Method | Path | Description |

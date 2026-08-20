@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { api, type EntityRuns } from "../../api/client";
 import { useLineageStore } from "../../store/lineageStore";
+import { businessEntityLabel, humanizeName } from "../../lib/businessView";
 
 type EntityNodeData = {
   node_type: "entity";
@@ -212,6 +213,7 @@ function EntityNodeComponent({ data }: NodeProps<EntityNodeData>) {
   const isDimmed = data.isDimmed ?? false;
   const Icon = entityIcons[data.entity_type] || Terminal;
   const discountPercent = useLineageStore((s) => s.discountPercent);
+  const businessView = useLineageStore((s) => s.businessView);
 
   const [displayName, setDisplayName] = useState(data.display_name);
   const [owner, setOwner] = useState(data.owner);
@@ -241,7 +243,8 @@ function EntityNodeComponent({ data }: NodeProps<EntityNodeData>) {
       .catch(() => setDisplayName(`${data.entity_type} ${data.entity_id.slice(0, 8)}…`));
   }, [data.entity_type, data.entity_id, displayName]);
 
-  const label = displayName || `${data.entity_type} ${data.entity_id.slice(0, 8)}…`;
+  const rawLabel = displayName || `${data.entity_type} ${data.entity_id.slice(0, 8)}…`;
+  const label = businessView ? humanizeName(rawLabel) : rawLabel;
 
   // Compute discounted cost — purely client-side math
   const costRaw = data.cost_usd;
@@ -286,10 +289,10 @@ function EntityNodeComponent({ data }: NodeProps<EntityNodeData>) {
         <div className="flex items-center gap-2.5">
           <div className={`w-1.5 h-1.5 rounded-full ${dotColor} shadow-[0_0_6px] ${dotShadow} flex-shrink-0`} />
           <Icon size={13} className={`${iconColor} flex-shrink-0 opacity-70`} />
-          <span className="font-mono font-medium text-[11px] text-slate-300 truncate max-w-[140px]">
+          <span className={`${businessView ? "font-sans" : "font-mono"} font-medium text-[11px] text-slate-300 truncate max-w-[140px]`}>
             {label}
           </span>
-          {costDisplay && (
+          {!businessView && costDisplay && (
             <span
               title="30-day serverless total for this entity. Open the health check (activity icon) for per-run costs."
               className="font-mono font-bold text-[12px] text-emerald-300 bg-emerald-500/10 px-1.5 py-0.5 rounded flex-shrink-0"
@@ -297,10 +300,10 @@ function EntityNodeComponent({ data }: NodeProps<EntityNodeData>) {
               ${costDisplay}
             </span>
           )}
-          <span className={`text-[8px] font-semibold tracking-wider uppercase px-1.5 py-0.5 rounded ${badgeColor} bg-white/[0.04]`}>
-            {data.entity_type}
+          <span className={`text-[8px] font-semibold tracking-wider ${businessView ? "" : "uppercase"} px-1.5 py-0.5 rounded ${badgeColor} bg-white/[0.04]`}>
+            {businessView ? businessEntityLabel(data.entity_type) : data.entity_type}
           </span>
-          {hasHealth && (
+          {!businessView && hasHealth && (
             <button
               onClick={(e) => { e.stopPropagation(); setShowHealth((v) => !v); setShowTooltip(false); }}
               title="Run health check"

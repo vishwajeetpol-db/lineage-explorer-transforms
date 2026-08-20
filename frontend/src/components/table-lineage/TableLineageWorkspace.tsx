@@ -112,6 +112,7 @@ export default function TableLineageWorkspace({ initialTable }: { initialTable?:
       useLineageStore.getState().setLineageData({
         nodes: data.nodes,
         edges: data.edges,
+        tableEdges: data.table_edges ?? [],
         cached: data.cached,
         cachedAt: data.cached_at,
         cacheExpiresAt: data.cache_expires_at,

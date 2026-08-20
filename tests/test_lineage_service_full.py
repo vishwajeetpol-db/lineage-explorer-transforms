@@ -213,7 +213,7 @@ class TestLineageTrace:
             resp = ls.get_lineage_trace("main.s.gold")
             assert resp.truncated is True
             # Not cached (truncated): a second fetch re-runs rather than serving stale.
-            assert ls._cache_get("trace:main.s.gold") is None
+            assert ls._cache_get("trace:v2:main.s.gold") is None
 
 
 # ---------------------------------------------------------------------------

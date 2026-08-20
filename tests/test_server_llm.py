@@ -156,6 +156,43 @@ class TestExplainTransformations:
         assert out["columns"] == [] and "endpoint down" in out["error"]
 
 
+class TestExplainLineageGraph:
+    def test_empty_nodes_short_circuits(self):
+        assert llm.explain_lineage_graph([], [], "c.s.t") == {"summary": "", "steps": []}
+
+    def test_happy_object_with_steps(self):
+        content = ('{"summary": "Raw orders become curated orders.", '
+                   '"steps": [{"title": "Ingest", "detail": "Raw orders land."}]}')
+        client = _client_returning(content)
+        nodes = [{"id": "n1", "label": "Raw Orders", "type": "Dataset"},
+                 {"id": "n2", "label": "Curated Orders", "type": "Dataset"}]
+        edges = [{"source": "n1", "target": "n2"}, {"source": "x", "target": "n2"}]
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            out = llm.explain_lineage_graph(nodes, edges, "c.s.curated", detail="data")
+        assert out["summary"].startswith("Raw orders")
+        assert out["steps"] == [{"title": "Ingest", "detail": "Raw orders land."}]
+        # Edges referencing an unknown node id are dropped from the prompt.
+        user_msg = client.api_client.do.call_args.kwargs["body"]["messages"][1]["content"]
+        assert "Raw Orders -> Curated Orders" in user_msg
+        assert "datasets only" in user_msg
+
+    def test_non_dict_response_defaults_empty(self):
+        client = _client_returning("[1, 2]")
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            out = llm.explain_lineage_graph([{"id": "n1", "label": "A", "type": "Dataset"}], [], "c.s.t")
+        assert out == {"summary": "", "steps": []}
+
+    def test_error_returns_error_key(self):
+        client = MagicMock()
+        client.api_client.do.side_effect = RuntimeError("endpoint down")
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": ""}):
+            out = llm.explain_lineage_graph([{"id": "n1", "label": "A", "type": "Dataset"}], [], "c.s.t")
+        assert out["summary"] == "" and out["steps"] == [] and "endpoint down" in out["error"]
+
+
 class TestDetectFrameworkConfig:
     def test_empty_source_short_circuits(self):
         out = llm.detect_framework_config("  ", "c.s.t")

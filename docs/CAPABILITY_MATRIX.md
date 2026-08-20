@@ -65,6 +65,17 @@ Per-table analysis workspace (`?view=tableLineage`) — catalog tree + lineage g
 | Per-table capability cache | ✅ | `capability_cache` Delta table; refresh badge per panel; `/api/admin/capability-cache` inventory + evict (entry/table/all) |
 | Multi-producer transformation comparison | ✅ | Side-by-side per-column matrix when a table has 2+ producers · `/api/column-transformations/compare-producers` |
 
+## 3c. Business view & AI graph explanation (v2.6.x)
+
+A plain-language lens over the technical lineage graph for non-engineers — a **Technical ⇄ Business** toggle on the canvas (top-left). Client-side and instant; the preference persists.
+
+| Capability | Status | What it does |
+|---|---|---|
+| Business relabelling | ✅ | Technical types → business terms (JOB→Process, PIPELINE→Data pipeline, NOTEBOOK→Code step, VIEW→View, MATERIALIZED_VIEW/MANAGED/EXTERNAL→Dataset, STREAMING_TABLE→Live dataset, VOLUME/PATH→File); `snake_case`→Title Case names; per-dataset plain-English description; hides FQNs, column detail, IDs, cost, health · `frontend/src/lib/businessView.ts` |
+| Data-only vs Data + processing | ✅ | Sub-toggle to show only datasets (and how they connect) or datasets + the jobs/pipelines that move data between them · `businessDetail` in `lineageStore` |
+| Precise dataset lineage (`table_edges`) | ✅ | Data-only uses the real per-row `(source→target)` pairs from `system.access.table_lineage` instead of cross-producting an entity's inputs × outputs — fixes the "everything connected to everything" mesh on hub tables · `LineageResponse.table_edges`, `GET /api/lineage/trace` |
+| AI "Explain this lineage" | ✅ | Lightbulb (business view) → modal with a plain-English summary + ordered source→process→output walkthrough of the current on-screen graph · `POST /api/lineage/explain` (`llm.explain_lineage_graph`) |
+
 ## 4. Platform & UX
 
 | Capability | Status | Notes |
@@ -73,6 +84,7 @@ Per-table analysis workspace (`?view=tableLineage`) — catalog tree + lineage g
 | Sidebar-shell home | ✅ | Nav, workspace selector, user profile, Recent Activity (v2.5.5) |
 | Deep-link routing | ✅ | `?table=`, `?view=`, `?admin=`, `?controlPanel=`, `?view=tableLineage` |
 | Three view modes + depth | ✅ | Tables / Pipelines / Full + hop slider |
+| Technical / Business view | ✅ | Canvas toggle flips the graph into a plain-language lens (relabel, hide detail, data-only vs data+processing, AI explain) · persisted (v2.6.x) |
 | In-graph tools | ✅ | ⌘K search, drag, fit-view, orphan highlight |
 | Excel export + preview | ✅ | Styled multi-sheet `.xlsx` |
 | Admin ops dashboard | ✅ | Latency/memory/cache/thread-pool metrics (admin-gated) |

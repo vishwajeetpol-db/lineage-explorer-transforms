@@ -151,6 +151,7 @@ Switch to **Pipelines** view to see job-to-job dependencies derived from shared 
 ## What It Does
 
 - **Visualizes** table-to-table and column-to-column lineage as an interactive DAG with upstream/downstream path highlighting
+- **Explains** the same lineage in plain language for non-engineers — a one-click **Business view** relabels and simplifies the graph, and an **AI lightbulb** narrates the whole flow in prose
 - **Discovers** all tables, views, jobs, notebooks, and DLT pipelines from Unity Catalog system tables — including cross-schema and cross-catalog references
 - **Connects** them with lineage edges (`feedsInto`, `writesTo`) and entity nodes showing which pipeline moves the data
 - **Integrates** with external dashboards via deep links — one URL parameter, any platform
@@ -172,6 +173,15 @@ Switch to **Pipelines** view to see job-to-job dependencies derived from shared 
 - **Interactive:** Drag nodes, zoom/pan, hover tooltips, orphan detection (amber border)
 - **Large graph optimization:** 50+ node graphs render instantly (no staggered animation). fitView retries at 100/500/1000/2000ms
 - **Cross-schema nodes:** Tables from other schemas/catalogs render with cyan dashed border and `CROSS-SCHEMA` badge. Full column metadata fetched from their `information_schema` via batch queries — expandable and clickable for column lineage tracing
+
+### Business View & AI Explanation
+
+- **Technical ⇄ Business toggle:** A control on the top-left of the lineage canvas flips the detailed engineering graph into a plain-language view aimed at non-engineers. Instant and client-side (no backend call); the preference persists across sessions.
+- **Plain-language relabeling:** Technical types become business terms — JOB→"Process", PIPELINE→"Data pipeline", NOTEBOOK→"Code step", VIEW→"View", MATERIALIZED_VIEW/MANAGED/EXTERNAL→"Dataset", STREAMING_TABLE→"Live dataset", VOLUME/PATH→"File". Names are humanized (`orders_curated` → "Orders Curated").
+- **Dataset descriptions:** Each dataset shows a one-line plain-English description — its Unity Catalog comment when present, otherwise a derived summary like "A dataset built from 3 sources, feeding 2 downstream consumers."
+- **Less clutter:** The business view hides engineering detail — fully-qualified names, column-level edges, job/pipeline IDs, per-run cost badges, and health popovers.
+- **Data only vs Data + processing:** A sub-toggle chooses whether to show just the datasets and how they connect, or the datasets plus the processing steps (jobs/pipelines) that move data between them. "Data only" uses the **precise** table→table dependencies recorded in system tables, so a heavily-connected table shows only its real dependencies rather than appearing falsely connected to everything.
+- **AI "Explain this lineage" (lightbulb):** A bulb button opens a modal with an AI-generated, plain-English explanation of the **current** on-screen graph — an overall summary plus an ordered "source → process → output" walkthrough. It respects the current view (data-only vs data+processing) and can be regenerated. Backed by `POST /api/lineage/explain`; requires a reachable Foundation Model serving endpoint, and shows a clear message if one isn't configured.
 
 ### Landing Page
 
@@ -224,6 +234,15 @@ Switch to **Pipelines** view to see job-to-job dependencies derived from shared 
 | **Pipelines** | Entity nodes only, connected by pipeline dependencies | Disabled | See which jobs depend on which |
 | **Tables** | Table nodes only, direct table-to-table edges | Enabled | Classic lineage view |
 | **Full** | Both tables and entity nodes with routed edges | Enabled | Complete picture: data flow + which pipeline moves it |
+
+**Business view** is a separate lens layered on top of the above (toggled Technical ⇄ Business on the canvas), with its own content sub-modes:
+
+| Business sub-mode | What Renders | Use Case |
+|---|---|---|
+| **Data only** | Datasets only, connected by their **precise** table→table dependencies (from system tables) | Give a business audience the cleanest "where does this data come from / go to" picture |
+| **Data + processing** | Datasets plus the processing steps (jobs/pipelines) that move data between them | Show non-engineers both the data and the steps that transform it |
+
+Because "Data only" uses the precise recorded pairs, a heavily-connected hub table shows only its real dependencies — it no longer appears falsely connected to everything.
 
 ### Depth Control
 
