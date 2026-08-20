@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>BrickTrace — Architecture</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --paper: #faf8f7;
+    --surface: #ffffff;
+    --surface-2: #f3efec;
+    --ink: #1a1614;
+    --ink-soft: #4a423d;
+    --ink-faint: #8a7f77;
+    --line: #e4ddd6;
+    --line-strong: #cfc5bc;
+    --accent: #c9252d;
+    --accent-soft: #f7e3e2;
+    --good: #16794a;
+    --warn: #b6791f;
+    --info: #2563a8;
+    --violet: #7a4dbf;
+    --code-bg: #17130f;
+    --code-fg: #e7d9c8;
+    --shadow: 0 1px 2px rgba(26,22,20,.05), 0 6px 24px rgba(26,22,20,.06);
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #16120f;
+      --surface: #1e1915;
+      --surface-2: #251f1a;
+      --ink: #f2ebe4;
+      --ink-soft: #cbbfb4;
+      --ink-faint: #948a80;
+      --line: #322a24;
+      --line-strong: #443a32;
+      --accent: #ef6f6f;
+      --accent-soft: #3a201f;
+      --good: #4cc38a;
+      --warn: #e0a94a;
+      --info: #6ea8e0;
+      --violet: #b98ff0;
+      --code-bg: #0e0b09;
+      --code-fg: #e7d9c8;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #16120f;
+    --surface: #1e1915;
+    --surface-2: #251f1a;
+    --ink: #f2ebe4;
+    --ink-soft: #cbbfb4;
+    --ink-faint: #948a80;
+    --line: #322a24;
+    --line-strong: #443a32;
+    --accent: #ef6f6f;
+    --accent-soft: #3a201f;
+    --good: #4cc38a;
+    --warn: #e0a94a;
+    --info: #6ea8e0;
+    --violet: #b98ff0;
+    --code-bg: #0e0b09;
+    --code-fg: #e7d9c8;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 30px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1020px; margin: 0 auto; padding: 0 24px 120px; }
+  .col { max-width: 680px; }
+
+  /* ---- Masthead ---- */
+  header.mast {
+    border-bottom: 2px solid var(--ink);
+    margin-bottom: 40px;
+    padding: 56px 0 26px;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 18px;
+  }
+  h1 {
+    font-family: var(--serif);
+    font-weight: 600;
+    font-size: clamp(38px, 6vw, 62px);
+    line-height: 1.02;
+    letter-spacing: -.015em;
+    margin: 0 0 18px;
+    text-wrap: balance;
+  }
+  .standfirst {
+    font-size: 20px;
+    line-height: 1.5;
+    color: var(--ink-soft);
+    max-width: 660px;
+    margin: 0 0 26px;
+  }
+  .meta-row {
+    display: flex; flex-wrap: wrap; gap: 8px 10px;
+    font-family: var(--mono); font-size: 12px;
+  }
+  .chip {
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    padding: 4px 11px;
+    color: var(--ink-soft);
+    background: var(--surface);
+  }
+  .chip b { color: var(--ink); font-weight: 600; }
+
+  /* ---- Contents ---- */
+  nav.toc {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 22px 26px;
+    margin-bottom: 56px;
+    box-shadow: var(--shadow);
+  }
+  nav.toc h2 {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--ink-faint);
+    margin: 0 0 14px; font-weight: 600;
+  }
+  nav.toc ol { margin: 0; padding: 0; list-style: none; counter-reset: t; columns: 2; column-gap: 40px; }
+  nav.toc li { counter-increment: t; margin: 0 0 9px; break-inside: avoid; }
+  nav.toc a {
+    color: var(--ink); text-decoration: none; display: flex; gap: 12px; align-items: baseline;
+    font-size: 15px;
+  }
+  nav.toc a:hover { color: var(--accent); }
+  nav.toc a::before {
+    content: counter(t, decimal-leading-zero);
+    font-family: var(--mono); font-size: 12px; color: var(--accent);
+    flex: 0 0 auto;
+  }
+  @media (max-width: 620px) { nav.toc ol { columns: 1; } }
+
+  /* ---- Sections ---- */
+  section { margin: 0 0 68px; scroll-margin-top: 20px; }
+  .sec-head { border-top: 1px solid var(--line); padding-top: 14px; margin-bottom: 26px; }
+  .sec-num {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .16em;
+    color: var(--accent); text-transform: uppercase;
+  }
+  h2.sec {
+    font-family: var(--serif); font-weight: 600;
+    font-size: clamp(27px, 4vw, 36px); line-height: 1.1; letter-spacing: -.01em;
+    margin: 6px 0 0; text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--sans); font-weight: 680; font-size: 19px;
+    letter-spacing: -.005em; margin: 36px 0 8px;
+  }
+  p { margin: 0 0 16px; }
+  .col p, .col ul, .col ol { max-width: 680px; }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  strong { font-weight: 660; }
+  em { font-style: italic; color: var(--ink-soft); }
+  ul, ol { padding-left: 22px; }
+  li { margin: 0 0 8px; }
+  code {
+    font-family: var(--mono); font-size: .86em;
+    background: var(--surface-2); border: 1px solid var(--line);
+    padding: 1px 5px; border-radius: 5px; color: var(--ink);
+  }
+  .lead {
+    font-size: 18.5px; color: var(--ink-soft); border-left: 3px solid var(--accent);
+    padding-left: 18px; margin: 0 0 24px;
+  }
+
+  /* ---- Figure ---- */
+  figure {
+    margin: 30px 0; padding: 0;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 14px; box-shadow: var(--shadow); overflow: hidden;
+  }
+  .fig-scroll { overflow-x: auto; padding: 26px 24px 6px; }
+  figure svg { display: block; height: auto; max-width: 100%; min-width: 0; }
+  figcaption {
+    padding: 12px 24px 18px; font-size: 13.5px; color: var(--ink-faint);
+    border-top: 1px solid var(--line); margin-top: 14px;
+    font-family: var(--sans);
+  }
+  figcaption b { color: var(--ink-soft); font-weight: 640; }
+
+  svg text { font-family: var(--sans); fill: var(--ink); }
+  svg .mono { font-family: var(--mono); }
+  svg .lbl { fill: var(--ink-faint); font-family: var(--mono); }
+
+  /* ---- Callout ---- */
+  .note {
+    background: var(--surface-2); border: 1px solid var(--line);
+    border-left: 3px solid var(--info);
+    border-radius: 10px; padding: 16px 20px; margin: 24px 0;
+    font-size: 15.5px; color: var(--ink-soft);
+  }
+  .note.principle { border-left-color: var(--accent); }
+  .note .k { font-family: var(--mono); font-size: 11.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); display: block; margin-bottom: 5px; }
+  .note.info { border-left-color: var(--info); }
+  .note.info .k { color: var(--info); }
+
+  /* ---- Building-block grid ---- */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 17px; box-shadow: var(--shadow);
+  }
+  .card .tag { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+  .card h4 { margin: 6px 0 6px; font-size: 15.5px; font-weight: 660; font-family: var(--sans); }
+  .card p { font-size: 13.5px; color: var(--ink-soft); margin: 0; line-height: 1.5; }
+  .card code { font-size: 11.5px; }
+
+  /* ---- Table ---- */
+  .tbl-scroll { overflow-x: auto; margin: 24px 0; border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; background: var(--surface); min-width: 560px; }
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-family: var(--mono); font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-faint); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  td code { font-size: 12px; }
+  td b { font-weight: 640; }
+
+  /* ---- Step list ---- */
+  ol.steps { list-style: none; counter-reset: s; padding: 0; margin: 24px 0; }
+  ol.steps > li {
+    counter-increment: s; position: relative; padding: 0 0 22px 52px; margin: 0;
+    border-left: 2px solid var(--line); margin-left: 15px;
+  }
+  ol.steps > li:last-child { border-left-color: transparent; padding-bottom: 0; }
+  ol.steps > li::before {
+    content: counter(s); position: absolute; left: -16px; top: -2px;
+    width: 30px; height: 30px; border-radius: 50%;
+    background: var(--accent); color: #fff; font-family: var(--mono); font-size: 13px; font-weight: 600;
+    display: grid; place-items: center;
+  }
+  ol.steps h4 { margin: 2px 0 5px; font-size: 16px; font-weight: 660; }
+  ol.steps h4 .agent { font-family: var(--mono); font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: .08em; display: block; margin-bottom: 1px; }
+  ol.steps p { font-size: 14.5px; color: var(--ink-soft); margin: 0; }
+
+  .kicker { font-family: var(--mono); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); margin: 40px 0 2px; }
+
+  footer { border-top: 2px solid var(--ink); margin-top: 40px; padding-top: 20px; color: var(--ink-faint); font-size: 13.5px; font-family: var(--mono); }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+<header class="mast">
+  <p class="eyebrow">Platform Architecture Reference</p>
+  <h1>BrickTrace</h1>
+  <p class="standfirst">Metadata-only Unity Catalog lineage intelligence — every table, every column, the exact transform logic that built it, who can touch it, what it costs, and whether it's healthy — across every catalog, reading only system tables and <code>BROWSE</code>, never a single row of your data.</p>
+  <div class="meta-row">
+    <span class="chip"><b>Runtime</b> · Databricks App (FastAPI + React)</span>
+    <span class="chip"><b>Data source</b> · Unity Catalog system tables</span>
+    <span class="chip"><b>Intelligence</b> · Foundation Model API</span>
+    <span class="chip"><b>Access</b> · Metadata-only (BROWSE + system tables)</span>
+    <span class="chip"><b>Version</b> · v2.6.x</span>
+  </div>
+</header>
+
+<nav class="toc" aria-label="Contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#glance">System at a glance</a></li>
+    <li><a href="#trace">The lineage trace</a></li>
+    <li><a href="#rows">From rows to a graph — routing vs precise pairs</a></li>
+    <li><a href="#transform">Transformation lineage — the differentiator</a></li>
+    <li><a href="#panels">Capability panels &amp; the per-table cache</a></li>
+    <li><a href="#business">Business view &amp; AI graph explanation</a></li>
+    <li><a href="#perf">Performance &amp; scale</a></li>
+    <li><a href="#security">Security model</a></li>
+    <li><a href="#features">Feature inventory</a></li>
+  </ol>
+</nav>
+
+<!-- 1 -->
+<section id="glance">
+  <div class="sec-head"><span class="sec-num">Section 01</span><h2 class="sec">System at a glance</h2></div>
+  <div class="col">
+    <p class="lead">BrickTrace is a native Databricks App: a FastAPI backend serving a React/Vite single-page app, running inside the workspace as an app service principal. It reads metadata and writes to exactly one place it owns.</p>
+    <p>The browser renders the lineage graph with <strong>React Flow</strong> laid out by <strong>ELK</strong> in a Web Worker. Every request goes over HTTPS to the FastAPI backend, which authenticates as the app's service principal via <strong>OAuth</strong> — no static tokens. From there the backend reaches four dependencies, and only four.</p>
+    <p>Three of them are read-only: Unity Catalog <strong>system tables</strong> queried through a SQL warehouse, the <strong>Foundation Model API</strong> for AI features, and the Workspace / Jobs / Pipelines <strong>REST APIs</strong> for producer source and run parameters. The fourth — an <strong>app-owned Delta schema</strong> — is the only thing BrickTrace ever writes to.</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 860 350" role="img" aria-label="A browser SPA talks over HTTPS to a FastAPI backend running as an app service principal; the backend reads Unity Catalog system tables, the Foundation Model API, and workspace REST APIs, and writes only to an app-owned Delta schema.">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0 0, 9 4.5, 0 9" fill="currentColor"/></marker>
+          <marker id="arA" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0 0, 9 4.5, 0 9" fill="var(--accent)"/></marker>
+        </defs>
+        <!-- Browser -->
+        <rect x="20" y="120" width="180" height="110" rx="12" fill="var(--surface-2)" stroke="var(--line-strong)"/>
+        <text x="110" y="110" text-anchor="middle" class="lbl" font-size="11.5">BROWSER</text>
+        <text x="110" y="160" text-anchor="middle" font-size="14.5" font-weight="640">React SPA</text>
+        <text x="110" y="182" text-anchor="middle" font-size="12" fill="var(--ink-soft)">React Flow graph</text>
+        <text x="110" y="200" text-anchor="middle" font-size="12" fill="var(--ink-soft)">ELK layout (Web Worker)</text>
+        <!-- Backend -->
+        <rect x="300" y="105" width="200" height="140" rx="12" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="400" y="95" text-anchor="middle" class="lbl" font-size="11.5" fill="var(--accent)">DATABRICKS APP</text>
+        <text x="400" y="140" text-anchor="middle" font-size="14.5" font-weight="660">FastAPI backend</text>
+        <text x="400" y="162" text-anchor="middle" font-size="12" fill="var(--ink-soft)">app service principal</text>
+        <text x="400" y="180" text-anchor="middle" font-size="12" fill="var(--ink-soft)">OAuth · no static token</text>
+        <line x1="325" y1="196" x2="475" y2="196" stroke="var(--line)"/>
+        <text x="400" y="216" text-anchor="middle" font-size="12" fill="var(--ink-soft)">coalesce · cache · serve</text>
+        <!-- Dependencies -->
+        <rect x="610" y="20" width="230" height="62" rx="10" fill="var(--surface-2)" stroke="var(--line-strong)"/>
+        <text x="725" y="45" text-anchor="middle" font-size="13.5" font-weight="640">UC system tables</text>
+        <text x="725" y="65" text-anchor="middle" class="mono" font-size="10.5" fill="var(--ink-soft)">access · billing · lakeflow · SQL wh</text>
+        <rect x="610" y="98" width="230" height="54" rx="10" fill="var(--surface-2)" stroke="var(--line-strong)"/>
+        <text x="725" y="121" text-anchor="middle" font-size="13.5" font-weight="640">Foundation Model API</text>
+        <text x="725" y="140" text-anchor="middle" class="mono" font-size="10.5" fill="var(--ink-soft)">LLM · transform + explain</text>
+        <rect x="610" y="168" width="230" height="54" rx="10" fill="var(--surface-2)" stroke="var(--line-strong)"/>
+        <text x="725" y="191" text-anchor="middle" font-size="13.5" font-weight="640">Workspace / Jobs / Pipelines</text>
+        <text x="725" y="210" text-anchor="middle" class="mono" font-size="10.5" fill="var(--ink-soft)">REST · producer source, params</text>
+        <rect x="610" y="238" width="230" height="66" rx="10" fill="var(--surface)" stroke="var(--accent)" stroke-dasharray="5 4"/>
+        <text x="725" y="262" text-anchor="middle" font-size="13.5" font-weight="640">App-owned Delta schema</text>
+        <text x="725" y="281" text-anchor="middle" class="mono" font-size="10.5" fill="var(--ink-soft)">rules · analysis · caches</text>
+        <text x="725" y="297" text-anchor="middle" class="lbl" font-size="10" fill="var(--accent)">THE ONLY WRITES</text>
+        <!-- arrows -->
+        <line x1="202" y1="175" x2="296" y2="175" stroke="currentColor" stroke-width="1.6" marker-end="url(#ar)"/>
+        <text x="249" y="167" text-anchor="middle" class="lbl" font-size="10">HTTPS</text>
+        <line x1="502" y1="150" x2="606" y2="55" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar)"/>
+        <line x1="502" y1="165" x2="606" y2="123" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar)"/>
+        <line x1="502" y1="185" x2="606" y2="192" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar)"/>
+        <line x1="502" y1="205" x2="606" y2="266" stroke="var(--accent)" stroke-width="1.7" marker-end="url(#arA)"/>
+        <text x="556" y="90" text-anchor="middle" class="lbl" font-size="10">read</text>
+        <text x="556" y="255" text-anchor="middle" class="lbl" font-size="10" fill="var(--accent)">write</text>
+        <!-- metadata boundary -->
+        <text x="725" y="330" text-anchor="middle" class="lbl" font-size="10.5">metadata only — never table row data</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 1.</b> The whole system on one page. Reads fan out to system tables, the model API, and workspace REST; the single write path is the app-owned Delta schema. Table <em>row data</em> is never touched.</figcaption>
+  </figure>
+
+  <div class="note principle">
+    <span class="k">Design principle</span>
+    BrickTrace is a metadata reader. It queries Unity Catalog system tables and <code>BROWSE</code> metadata, and its only writes land in one dedicated app-owned schema — so it clears security review quickly and can be shared workspace-wide.
+  </div>
+</section>
+
+<!-- 2 -->
+<section id="trace">
+  <div class="sec-head"><span class="sec-num">Section 02</span><h2 class="sec">The lineage trace</h2></div>
+  <div class="col">
+    <p class="lead">Pick any table and BrickTrace renders its <em>complete</em> lineage cone — every upstream source back to every downstream target — across all catalogs and schemas, with the mediating jobs and pipelines in between.</p>
+    <p>The trace is a <strong>directional breadth-first walk</strong> over <code>system.access.table_lineage</code> from the seed table. The direction is the subtle part: ancestors are found by following <code>target → source</code> only, and descendants by following <code>source → target</code> only. A bidirectional walk would fan out through shared source tables (a raw <code>samples.tpch.orders</code> read by dozens of unrelated pipelines) and pull in every sibling consumer. Keeping each direction pure confines the trace to the seed's own cone.</p>
+    <p>The walk is metastore-wide — it crosses catalog and schema boundaries freely — and stops at a node cap with a truncation guard so a pathological graph can't run away. Complete traces are cached (see <a href="#perf">§7</a>).</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 840 260" role="img" aria-label="From a seed table, an upstream walk follows target-to-source edges and a downstream walk follows source-to-target edges, producing the connected lineage cone of table and entity nodes.">
+        <defs>
+          <marker id="ar2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0 0, 9 4.5, 0 9" fill="currentColor"/></marker>
+        </defs>
+        <text x="120" y="35" text-anchor="middle" class="lbl" font-size="11" fill="var(--accent)">◀ UPSTREAM · target→source</text>
+        <text x="720" y="35" text-anchor="middle" class="lbl" font-size="11" fill="var(--info)">DOWNSTREAM · source→target ▶</text>
+        <!-- nodes -->
+        <rect x="30" y="110" width="120" height="46" rx="9" fill="var(--surface-2)" stroke="var(--line-strong)"/>
+        <text x="90" y="138" text-anchor="middle" font-size="12.5">raw source</text>
+        <ellipse cx="250" cy="133" rx="52" ry="26" fill="var(--surface)" stroke="var(--line-strong)"/>
+        <text x="250" y="130" text-anchor="middle" class="mono" font-size="10" fill="var(--ink-faint)">JOB</text>
+        <text x="250" y="145" text-anchor="middle" font-size="11.5">ingest</text>
+        <rect x="360" y="108" width="120" height="50" rx="9" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="420" y="128" text-anchor="middle" class="lbl" font-size="9.5" fill="var(--accent)">SEED</text>
+        <text x="420" y="146" text-anchor="middle" font-size="12.5" font-weight="640">this table</text>
+        <ellipse cx="590" cy="133" rx="52" ry="26" fill="var(--surface)" stroke="var(--line-strong)"/>
+        <text x="590" y="130" text-anchor="middle" class="mono" font-size="10" fill="var(--ink-faint)">PIPELINE</text>
+        <text x="590" y="145" text-anchor="middle" font-size="11.5">curate</text>
+        <rect x="700" y="86" width="120" height="42" rx="9" fill="var(--surface-2)" stroke="var(--line-strong)"/>
+        <text x="760" y="112" text-anchor="middle" font-size="12">mart</text>
+        <rect x="700" y="146" width="120" height="42" rx="9" fill="var(--surface-2)" stroke="var(--line-strong)"/>
+        <text x="760" y="172" text-anchor="middle" font-size="12">dashboard tbl</text>
+        <!-- edges -->
+        <line x1="150" y1="133" x2="196" y2="133" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar2)"/>
+        <line x1="304" y1="133" x2="358" y2="133" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar2)"/>
+        <line x1="480" y1="133" x2="536" y2="133" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar2)"/>
+        <line x1="642" y1="128" x2="698" y2="112" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar2)"/>
+        <line x1="642" y1="140" x2="698" y2="162" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar2)"/>
+        <line x1="205" y1="230" x2="635" y2="230" stroke="var(--line-strong)" stroke-dasharray="4 4"/>
+        <text x="420" y="248" text-anchor="middle" class="lbl" font-size="10.5">connected component only — no fan-out through shared sources</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 2.</b> A directional BFS keeps each side pure — upstream follows <code>target→source</code>, downstream <code>source→target</code> — so the trace returns the seed's true ancestors and descendants and nothing else.</figcaption>
+  </figure>
+</section>
+
+<!-- 3 -->
+<section id="rows">
+  <div class="sec-head"><span class="sec-num">Section 03</span><h2 class="sec">From rows to a graph — routing vs precise pairs</h2></div>
+  <div class="col">
+    <p class="lead">Each <code>system.access.table_lineage</code> row is one real dependency: a <code>(source_table, target_table, entity)</code> triple. <code>_build_graph_from_rows</code> turns those rows into two distinct edge sets — and keeping them distinct is what makes the graph both readable and correct.</p>
+    <p>For <strong>display</strong>, edges are <em>entity-routed</em>: <code>table → entity → table</code>, so the job or pipeline that produced the dependency shows up as a hub node you can inspect for health and cost. But routing through a hub is lossy — it records that an entity read {A, B} and wrote {X, Y}, without recording which input actually fed which output.</p>
+    <p>So the backend also emits <strong><code>table_edges</code></strong>: the DISTINCT precise <code>(source → target)</code> pairs, taken straight from the rows. When the UI needs a datasets-only view, it renders these instead of trying to reconstruct dataset edges by collapsing the hub.</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 840 300" role="img" aria-label="One entity reading two tables and writing two tables. Cross-producting its inputs by outputs fabricates four edges including two wrong ones; the precise per-row table_edges keep only the two real pairs.">
+        <defs>
+          <marker id="ar3" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0 0, 9 4.5, 0 9" fill="currentColor"/></marker>
+          <marker id="ar3g" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0 0, 9 4.5, 0 9" fill="var(--good)"/></marker>
+          <marker id="ar3r" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0 0, 9 4.5, 0 9" fill="var(--accent)"/></marker>
+        </defs>
+        <!-- left: cross-product -->
+        <text x="210" y="28" text-anchor="middle" class="lbl" font-size="11" fill="var(--accent)">HUB COLLAPSE (cross-product) — wrong</text>
+        <rect x="30" y="60" width="86" height="38" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)"/><text x="73" y="84" text-anchor="middle" font-size="12">A</text>
+        <rect x="30" y="150" width="86" height="38" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)"/><text x="73" y="174" text-anchor="middle" font-size="12">B</text>
+        <rect x="300" y="60" width="86" height="38" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)"/><text x="343" y="84" text-anchor="middle" font-size="12">X</text>
+        <rect x="300" y="150" width="86" height="38" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)"/><text x="343" y="174" text-anchor="middle" font-size="12">Y</text>
+        <line x1="116" y1="79" x2="298" y2="79" stroke="var(--good)" stroke-width="1.6" marker-end="url(#ar3g)"/>
+        <line x1="116" y1="169" x2="298" y2="169" stroke="var(--good)" stroke-width="1.6" marker-end="url(#ar3g)"/>
+        <line x1="116" y1="86" x2="298" y2="160" stroke="var(--accent)" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#ar3r)"/>
+        <line x1="116" y1="162" x2="298" y2="86" stroke="var(--accent)" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#ar3r)"/>
+        <text x="210" y="235" text-anchor="middle" class="lbl" font-size="10" fill="var(--accent)">2 real + 2 fabricated (A→Y, B→X)</text>
+        <!-- divider -->
+        <line x1="430" y1="45" x2="430" y2="250" stroke="var(--line)"/>
+        <!-- right: precise -->
+        <text x="640" y="28" text-anchor="middle" class="lbl" font-size="11" fill="var(--good)">PRECISE table_edges — correct</text>
+        <rect x="470" y="60" width="86" height="38" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)"/><text x="513" y="84" text-anchor="middle" font-size="12">A</text>
+        <rect x="470" y="150" width="86" height="38" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)"/><text x="513" y="174" text-anchor="middle" font-size="12">B</text>
+        <rect x="740" y="60" width="86" height="38" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)"/><text x="783" y="84" text-anchor="middle" font-size="12">X</text>
+        <rect x="740" y="150" width="86" height="38" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)"/><text x="783" y="174" text-anchor="middle" font-size="12">Y</text>
+        <line x1="556" y1="79" x2="738" y2="79" stroke="var(--good)" stroke-width="1.8" marker-end="url(#ar3g)"/>
+        <line x1="556" y1="169" x2="738" y2="169" stroke="var(--good)" stroke-width="1.8" marker-end="url(#ar3g)"/>
+        <text x="648" y="235" text-anchor="middle" class="lbl" font-size="10" fill="var(--good)">only the real pairs: A→X, B→Y</text>
+        <text x="420" y="285" text-anchor="middle" class="lbl" font-size="10.5">each row already carries the exact (source → target) — no guessing required</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 3.</b> Why datasets-only uses <code>table_edges</code>. Collapsing an entity hub by cross-producting its inputs × outputs invents edges (dashed) — on a heavily-connected table that becomes an "everything-connected-to-everything" mesh. The per-row precise pairs never do.</figcaption>
+  </figure>
+
+  <div class="note principle">
+    <span class="k">Design principle</span>
+    Never reconstruct what you already recorded. The entity-routed <code>edges</code> are for display; the precise <code>table_edges</code> are the source of truth for dataset-to-dataset flow.
+  </div>
+</section>
+
+<!-- 4 -->
+<section id="transform">
+  <div class="sec-head"><span class="sec-num">Section 04</span><h2 class="sec">Transformation lineage — the differentiator</h2></div>
+  <div class="col">
+    <p class="lead">Unity Catalog records that "column A depends on column B." BrickTrace goes a layer deeper and reconstructs the <em>actual</em> SQL/PySpark expression that produced each column — casts, aggregates, <code>CASE</code> logic, window functions, CTE chains.</p>
+    <p>For a given column, a <strong>precedence resolver</strong> picks the best available source, most-trustworthy first. Deterministic, captured evidence wins; the LLM is the fallback, and a stored LLM answer is reused until the producer's source changes.</p>
+  </div>
+
+  <ol class="steps">
+    <li>
+      <h4><span class="agent">precedence 1 · deterministic</span>Captured Spark plan</h4>
+      <p>If the producing pipeline ran with runtime plan capture on, the analyzed physical plan gives the exact per-column expression — no inference.</p>
+    </li>
+    <li>
+      <h4><span class="agent">precedence 2 · deterministic</span>Captured CDC spec</h4>
+      <p>For merge/CDC writers, the recorded change spec supplies the column mapping directly.</p>
+    </li>
+    <li>
+      <h4><span class="agent">precedence 3 · reused</span>Stored LLM analysis version</h4>
+      <p>A previously computed analysis is served from the <code>producer_analysis</code> store and flagged <em>stale</em> when the producer's source hash no longer matches — so the UI can offer a one-click re-analyze.</p>
+    </li>
+    <li>
+      <h4><span class="agent">precedence 4 · fresh</span>Fresh LLM analysis</h4>
+      <p>When nothing is stored, BrickTrace fetches the producer's source code and asks the Foundation Model to infer per-column transformations, then versions the result.</p>
+    </li>
+  </ol>
+
+  <div class="note info">
+    <span class="k">Fallback · deep framework analysis</span>
+    When direct analysis finds no column logic — a generic, metadata-driven ETL engine whose mappings live in config tables — an agentic <strong>streaming (NDJSON)</strong> second pass takes over: detect the config mechanism from the source, read the job/pipeline parameters, query the identified config table(s), and derive the per-column mappings, narrating each step as it goes. (<code>backend/server/framework_analysis.py</code>, <code>POST /api/column-transformations/deep-analyze</code>.)
+  </div>
+</section>
+
+<!-- 5 -->
+<section id="panels">
+  <div class="sec-head"><span class="sec-num">Section 05</span><h2 class="sec">Capability panels &amp; the per-table cache</h2></div>
+  <div class="col">
+    <p class="lead">Around the graph, a Table Lineage workspace opens draggable capability panels — each answering a different question about the focused table, and each cached so reopening is instant.</p>
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="tag">Governance</div><h4>Impact / blast radius</h4><p>Every downstream table, its owners, and the dashboards and jobs that consume it — before you change anything.</p></div>
+    <div class="card"><div class="tag">Operations</div><h4>Root cause</h4><p>Health-based upstream trace to the prime-suspect producer when a table goes stale or wrong.</p></div>
+    <div class="card"><div class="tag">Governance</div><h4>Governance</h4><p>Ownership, column sensitivity with downstream propagation, and custom classification rules that follow the data.</p></div>
+    <div class="card"><div class="tag">Governance</div><h4>Access &amp; security</h4><p>Declared UC grants joined with actual audited usage — surfacing dormant grants to revoke.</p></div>
+    <div class="card"><div class="tag">Insight</div><h4>ML models</h4><p>Model → training-data lineage tying UC-registered models back to the tables they learned from.</p></div>
+    <div class="card"><div class="tag">Differentiator</div><h4>Column transformation</h4><p>Per-column expressions, an AI overview, version history, and side-by-side multi-producer comparison.</p></div>
+  </div>
+
+  <p class="col">The four heaviest panels — Impact, Root Cause, Governance, and Access — are persisted per <code>(table, tab)</code> in an app-owned <code>capability_cache</code> Delta table with a 24-hour TTL. Each shows a <strong>"cached · may be stale"</strong> badge and a refresh control that forces a live recompute, and admins can evict per entry, per table, or the whole cache from the ops dashboard.</p>
+</section>
+
+<!-- 6 -->
+<section id="business">
+  <div class="sec-head"><span class="sec-num">Section 06</span><h2 class="sec">Business view &amp; AI graph explanation</h2></div>
+  <div class="col">
+    <p class="lead">One underlying graph, two lenses. The <strong>Technical</strong> view is built for engineers; the <strong>Business</strong> view is a plain-language projection for everyone else — and it's a client-side, instant flip, not a second data fetch.</p>
+    <p>Business view relabels technical types to business terms (a job becomes a <em>Process</em>, a pipeline a <em>Data pipeline</em>, a table a <em>Dataset</em>), humanizes <code>snake_case</code> names into Title Case, shows a one-line plain-English description per dataset, and hides engineering detail — fully-qualified names, column-level edges, IDs, cost, and health. A sub-toggle chooses <strong>Data only</strong> (just the datasets and how they connect, drawn from the precise <code>table_edges</code>) or <strong>Data + processing</strong> (datasets plus the jobs and pipelines between them).</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 840 250" role="img" aria-label="A single graph model feeds two views: a technical view with fully-qualified names and detail, and a business view with plain-language labels and a data-only vs data-plus-processing sub-toggle, plus an AI explain lightbulb.">
+        <defs>
+          <marker id="ar6" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0 0, 9 4.5, 0 9" fill="currentColor"/></marker>
+        </defs>
+        <rect x="40" y="95" width="170" height="70" rx="11" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="125" y="122" text-anchor="middle" font-size="14" font-weight="640">graph model</text>
+        <text x="125" y="143" text-anchor="middle" class="mono" font-size="10.5" fill="var(--ink-soft)">nodes · edges · table_edges</text>
+        <!-- technical -->
+        <rect x="330" y="30" width="210" height="80" rx="11" fill="var(--surface-2)" stroke="var(--line-strong)"/>
+        <text x="435" y="20" text-anchor="middle" class="lbl" font-size="10.5">TECHNICAL VIEW</text>
+        <text x="435" y="60" text-anchor="middle" class="mono" font-size="11" fill="var(--ink-soft)">cat.sch.orders_curated</text>
+        <text x="435" y="80" text-anchor="middle" font-size="11" fill="var(--ink-soft)">columns · IDs · cost · health</text>
+        <!-- business -->
+        <rect x="330" y="150" width="210" height="80" rx="11" fill="var(--surface-2)" stroke="var(--line-strong)"/>
+        <text x="435" y="140" text-anchor="middle" class="lbl" font-size="10.5">BUSINESS VIEW</text>
+        <text x="435" y="178" text-anchor="middle" font-size="12.5" font-weight="620">"Orders Curated" · Dataset</text>
+        <text x="435" y="198" text-anchor="middle" font-size="10.5" fill="var(--ink-soft)">plain-English description</text>
+        <text x="435" y="216" text-anchor="middle" class="lbl" font-size="9.5">Data only ┃ Data + processing</text>
+        <!-- explain -->
+        <rect x="620" y="150" width="180" height="80" rx="11" fill="var(--surface)" stroke="var(--info)" stroke-width="1.6"/>
+        <text x="710" y="140" text-anchor="middle" class="lbl" font-size="10.5" fill="var(--info)">AI · /api/lineage/explain</text>
+        <text x="710" y="180" text-anchor="middle" font-size="13" font-weight="640">Explain this lineage</text>
+        <text x="710" y="200" text-anchor="middle" font-size="10.5" fill="var(--ink-soft)">summary + source→</text>
+        <text x="710" y="216" text-anchor="middle" font-size="10.5" fill="var(--ink-soft)">process→output steps</text>
+        <!-- arrows -->
+        <line x1="210" y1="120" x2="326" y2="75" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar6)"/>
+        <line x1="210" y1="140" x2="326" y2="185" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar6)"/>
+        <line x1="540" y1="190" x2="616" y2="190" stroke="var(--info)" stroke-width="1.6" marker-end="url(#ar6)"/>
+      </svg>
+    </div>
+    <figcaption><b>Figure 4.</b> The two lenses render from the same model. In business view, a lightbulb posts the <em>currently visible</em> nodes and edges to <code>/api/lineage/explain</code>, so the AI narrative matches exactly what's on screen.</figcaption>
+  </figure>
+
+  <p class="col">The AI <strong>"Explain this lineage"</strong> lightbulb sends the on-screen business-view graph to <code>llm.explain_lineage_graph()</code>, which returns a plain-English summary plus an ordered <em>source → process → output</em> walkthrough. Because the frontend posts what's visible, the explanation respects the current view — data-only or data-plus-processing.</p>
+</section>
+
+<!-- 7 -->
+<section id="perf">
+  <div class="sec-head"><span class="sec-num">Section 07</span><h2 class="sec">Performance &amp; scale</h2></div>
+  <div class="col">
+    <p class="lead">Because BrickTrace only reads metadata, the warehouse is barely touched — and layered caching plus request coalescing keep it that way even at organization scale.</p>
+    <ul>
+      <li><strong>Request coalescing</strong> — many concurrent users asking for the same trace collapse to a single warehouse query; the rest wait on the same in-flight result.</li>
+      <li><strong>In-process LRU + TTL cache</strong> — a memory-bounded cache in each replica serves hot traces without touching the warehouse.</li>
+      <li><strong>Distributed Delta cache</strong> — a shared cache (applied via <code>perf_patches.py</code>) lets replicas reuse each other's completed traces across restarts.</li>
+      <li><strong>Parallel BFS</strong> — the trace frontier is expanded concurrently across catalogs.</li>
+      <li><strong>Versioned cache keys</strong> — the trace cache key is <code>trace:v2:</code>; bumping the version retires cached shapes when the response schema changes (as it did when <code>table_edges</code> was added), rather than serving stale structure.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- 8 -->
+<section id="security">
+  <div class="sec-head"><span class="sec-num">Section 08</span><h2 class="sec">Security model</h2></div>
+  <div class="col">
+    <p class="lead">The security story is short by design: read metadata, write one schema, gate the dangerous switches.</p>
+    <ul>
+      <li><strong>Metadata-only.</strong> BrickTrace reads Unity Catalog system tables and <code>BROWSE</code> metadata. It never reads a row of your table data.</li>
+      <li><strong>OAuth service principal.</strong> The app authenticates as its own service principal through the SDK — no static tokens are stored or required.</li>
+      <li><strong>One write surface.</strong> All writes are confined to a single app-owned Delta schema (governance rules, producer analysis, DQ rules, notifications, caches). Your data catalogs are never written to.</li>
+      <li><strong>Admin-gated operations.</strong> Live mode (cache bypass), the Control Panel's opt-in capabilities, and cache eviction require membership in <code>ADMIN_GROUP_NAME</code>.</li>
+      <li><strong>Graceful degradation.</strong> When a system-table grant is missing, the affected panel stays empty and the diagnostics surface names the exact grant to add — the app never fails opaquely.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- 9 -->
+<section id="features">
+  <div class="sec-head"><span class="sec-num">Section 09</span><h2 class="sec">Feature inventory</h2></div>
+  <div class="col">
+    <p class="lead">The capability families and the primary API route behind each.</p>
+  </div>
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th style="width:30%">Capability</th><th>What it does</th><th style="width:26%">Primary route</th></tr></thead>
+      <tbody>
+        <tr><td><b>Table &amp; column lineage</b></td><td>Cross-catalog trace with entity hubs and precise <code>table_edges</code></td><td><code>GET /api/lineage/trace</code></td></tr>
+        <tr><td><b>Transformation lineage</b></td><td>Per-column expressions; AI overview; deep framework fallback; multi-producer compare</td><td><code>/api/column-transformations*</code></td></tr>
+        <tr><td><b>AI lineage explanation</b></td><td>Plain-English summary + walkthrough of the current graph</td><td><code>POST /api/lineage/explain</code></td></tr>
+        <tr><td><b>Impact / blast radius</b></td><td>Downstream tables with owners, consumers, and sensitivity</td><td><code>GET /api/impact</code></td></tr>
+        <tr><td><b>Governance &amp; classification</b></td><td>Ownership, column sensitivity, propagation, custom rules</td><td><code>GET /api/governance</code></td></tr>
+        <tr><td><b>Access &amp; security</b></td><td>Declared grants joined with audited usage; dormant-grant finder</td><td><code>GET /api/access</code></td></tr>
+        <tr><td><b>Observability / run health</b></td><td>Per-node verdict, success rate, duration trend, per-run cost</td><td><code>GET /api/observability/runs</code></td></tr>
+        <tr><td><b>AI/ML lineage</b></td><td>Serving inventory and model → training-data lineage</td><td><code>/api/ml/*</code></td></tr>
+        <tr><td><b>Discovery &amp; search</b></td><td>Asset search, PII/sensitive-column and orphan finders</td><td><code>/api/search</code>, <code>/api/discover/*</code></td></tr>
+        <tr><td><b>Data quality rules</b></td><td>Per-column expectations in an app-owned store</td><td><code>/api/dq-rules</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<footer>
+  BrickTrace · Architecture Reference · v2.6.x — metadata-only Unity Catalog lineage intelligence.
+</footer>
+
+</div>
+</body>
+</html>

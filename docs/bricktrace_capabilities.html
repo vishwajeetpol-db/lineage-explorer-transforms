@@ -78,6 +78,7 @@
   .tag.gov { background: #efe9ff; color: var(--violet); }
   .tag.ops { background: #e6f1fa; color: var(--sky); }
   .tag.core { background: #e7f6ef; color: var(--emerald); }
+  .tag.ai { background: #efe9ff; color: var(--violet); }
   .value { margin-top: 7px; padding-top: 7px; border-top: 1px dashed var(--line);
     color: var(--ink); font-size: 11.5px; }
   .value b { color: var(--emerald); font-weight: 700; }
@@ -179,12 +180,14 @@
     <div class="d"><b>Native &amp; instant to deploy.</b> A Databricks App — one command, shared across your workspace, no external infra.</div>
     <div class="d"><b>Scales to thousands.</b> Shared caching means the warehouse is barely touched, even org-wide.</div>
     <div class="d"><b>Beyond lineage.</b> Governance, access, run health, and cost unified in the same view.</div>
+    <div class="d"><b>Speaks to every audience.</b> One click flips the graph into a plain-language Business view — same lineage for analysts, stewards, and execs, not just engineers.</div>
+    <div class="d"><b>Explains itself.</b> An AI narrator turns the on-screen graph into a plain-English source&nbsp;→&nbsp;process&nbsp;→&nbsp;output walkthrough.</div>
   </div>
 </div>
 
 <!-- ================= CORE CAPABILITIES ================= -->
 <h2><span class="n">02</span>What you get</h2>
-<p class="lead section-intro">Six capability areas, unified in one interactive workspace.</p>
+<p class="lead section-intro">Seven capability areas, unified in one interactive workspace.</p>
 
 <div class="card">
   <div class="cap-head"><h3>End-to-end lineage, instantly</h3><span class="tag core">Foundation</span></div>
@@ -201,7 +204,10 @@
   <p>Column-level lineage from real Unity Catalog edges — zero false positives. Then the layer no one
      else has: BrickTrace parses the producing code to reconstruct the <em>actual</em> SQL/PySpark
      expression behind each column — casts, aggregates, CASE logic, window functions, CTE chains —
-     across notebooks, jobs, DLT pipelines, views, and query history.</p>
+     across notebooks, jobs, DLT pipelines, views, and query history. An <em>AI overview</em>
+     narrates a table's transformations in plain English; for metadata-driven frameworks whose
+     column logic lives in config tables, a deep agentic pass derives the mappings from the
+     config and parameters the pipeline actually reads.</p>
   <div class="value"><b>Business value:</b> prove how any metric was calculated for audits and
      migrations, and trace a wrong number to the exact line of logic that caused it.</div>
 </div>
@@ -239,6 +245,20 @@
      they learned from.</p>
   <div class="value"><b>Business value:</b> retire unused assets, find hidden sensitive data, and know
      instantly which ML models are exposed when a source table has an issue.</div>
+</div>
+
+<div class="card">
+  <div class="cap-head"><h3>Business view &amp; AI explanations</h3><span class="tag ai">For everyone</span></div>
+  <p>A one-click <em>Business view</em> flips the engineering graph into plain language for
+     non-technical stakeholders: technical types become business terms (<em>Process</em>,
+     <em>Data pipeline</em>, <em>Dataset</em>, <em>File</em>), <code>snake_case</code> names read as
+     titles, and every dataset carries a plain-English description — while fully-qualified names,
+     columns, IDs, and cost are hidden. A <em>data-only</em> mode shows just how datasets connect,
+     using the <em>precise</em> Unity Catalog source→target pairs (never a fabricated mesh), and an
+     AI <em>Explain this lineage</em> button narrates the whole flow — source → process → output —
+     in a few sentences anyone can read.</p>
+  <div class="value"><b>Business value:</b> put lineage in front of analysts, stewards, and
+     executives without a data-engineering translator — the same graph serves every audience.</div>
 </div>
 
 <!-- ================= WHO IT'S FOR ================= -->
@@ -296,6 +316,7 @@
     <tr><td>Why is this dataset stale or wrong?</td><td>Health-based root-cause tracing to the prime suspect</td><td>Lower incident MTTR</td></tr>
     <tr><td>What is this pipeline costing us?</td><td>Per-node serverless cost &amp; per-run breakdown</td><td>Targeted cost optimization</td></tr>
     <tr><td>Which ML models used this table?</td><td>Model → training-data lineage</td><td>Contained model risk</td></tr>
+    <tr><td>How do I explain this flow to a non-engineer?</td><td>One-click Business view + AI plain-English walkthrough</td><td>Lineage for every audience</td></tr>
   </tbody>
 </table>
 
