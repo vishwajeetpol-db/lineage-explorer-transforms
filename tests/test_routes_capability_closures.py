@@ -211,19 +211,52 @@ class TestWebhooks:
     """Webhook CRUD endpoints.
 
     A9 fix: GET returns {"webhooks": [...]} not a bare list.
-    A2 fix: POST and DELETE are admin-gated (403 for non-admin).
+    A2 fix: GET, POST and DELETE are all admin-gated (403 for non-admin), and GET
+    redacts the webhook URL to scheme+host.
     """
 
-    def test_list_webhooks_returns_wrapped_dict(self, app_client):
+    def test_list_webhooks_returns_wrapped_dict(self, admin_client):
         """A9: Response is {webhooks: [...]} not a list."""
         with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
             mock_sql.return_value = []
-            resp = app_client.get("/api/notifications/webhooks")
+            resp = admin_client.get("/api/notifications/webhooks")
             assert resp.status_code == 200
             data = resp.json()
             # Wrapped in dict, not raw list
             assert isinstance(data, dict)
             assert "webhooks" in data
+
+    def test_list_webhooks_rejects_non_admin(self, non_admin_client):
+        """A2 FIX: the listing exposes delivery endpoints — admin only, matching
+        its create/delete peers and CHANGELOG's 'Admin-gated' claim."""
+        with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = non_admin_client.get("/api/notifications/webhooks")
+            assert resp.status_code == 403
+            mock_sql.assert_not_called()
+
+    def test_list_webhooks_redacts_url_path(self, admin_client):
+        """A2 FIX: Slack/Teams webhooks carry their secret in the URL path, so only
+        scheme+host is returned."""
+        with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
+            mock_sql.return_value = [{
+                "webhook_id": "w1", "name": "slack", "event_types": "*",
+                "enabled": True, "created_at": "2026-07-01",
+                "url": "https://hooks.slack.com/services/T000/B000/SuperSecretToken",
+            }]
+            resp = admin_client.get("/api/notifications/webhooks")
+            assert resp.status_code == 200
+            row = resp.json()["webhooks"][0]
+            assert row["url"] == "https://hooks.slack.com"
+            assert "SuperSecretToken" not in resp.text
+
+    def test_list_webhooks_redacts_unparseable_url(self, admin_client):
+        """A non-URL value must not fall through to the client verbatim."""
+        with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
+            mock_sql.return_value = [{"webhook_id": "w1", "url": "not-a-url/secret"}]
+            resp = admin_client.get("/api/notifications/webhooks")
+            assert resp.status_code == 200
+            assert resp.json()["webhooks"][0]["url"] == "(redacted)"
 
     def test_create_webhook_rejects_non_admin(self, non_admin_client):
         """A2: POST requires admin — non-admin gets 403."""
@@ -370,6 +403,87 @@ class TestRecordDQMetrics:
                 "rules_failed": 1,
             })
             assert resp.status_code == 200
+
+    def test_record_metrics_rejects_non_numeric_score(self, admin_client):
+        """A1 FIX: the numeric columns sit at UNQUOTED positions in the INSERT, so
+        a non-numeric value would be raw SQL — coercion turns it into a 400."""
+        with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = admin_client.post("/api/dq-rules/record-metrics", json={
+                "table_fqn": "main.default.orders",
+                "quality_score": "0.5, 1, 1, 1, current_timestamp(), 'x') --",
+                "rules_evaluated": 1, "rules_passed": 1, "rules_failed": 0,
+            })
+            assert resp.status_code == 400
+            # Rejected before the INSERT is built.
+            assert not any(
+                "INSERT INTO" in c[0][0] for c in mock_sql.call_args_list
+            )
+
+    def test_record_metrics_rejects_non_numeric_rule_counts(self, admin_client):
+        with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = admin_client.post("/api/dq-rules/record-metrics", json={
+                "table_fqn": "main.default.orders",
+                "quality_score": 0.9, "rules_evaluated": "10 OR 1=1",
+                "rules_passed": 9, "rules_failed": 1,
+            })
+            assert resp.status_code == 400
+
+    def test_record_metrics_coerces_numeric_strings(self, admin_client):
+        """Numeric-looking strings still work — coercion, not rejection."""
+        with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = admin_client.post("/api/dq-rules/record-metrics", json={
+                "table_fqn": "main.default.orders",
+                "quality_score": "0.95", "rules_evaluated": "10",
+                "rules_passed": "9", "rules_failed": "1",
+            })
+            assert resp.status_code == 200
+            insert = [c[0][0] for c in mock_sql.call_args_list if "INSERT INTO" in c[0][0]][0]
+            assert "0.95" in insert and "10, 9, 1" in insert
+
+
+class TestEnqueueDelivery:
+    """POST /api/notifications/enqueue-delivery.
+
+    A2 FIX: admin-gated — it is a write that makes the delivery job POST to every
+    registered endpoint, and it was the only ungated mutation in this file.
+    """
+
+    def test_enqueue_rejects_non_admin(self, non_admin_client):
+        with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = non_admin_client.post("/api/notifications/enqueue-delivery")
+            assert resp.status_code == 403
+            mock_sql.assert_not_called()
+
+    def test_enqueue_admin_succeeds(self, admin_client):
+        with patch("backend.routes.capability_closures._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = admin_client.post("/api/notifications/enqueue-delivery")
+            assert resp.status_code == 200
+            assert resp.json()["queued"] == 0
+
+    def test_enqueue_escapes_backslash_quote_url(self, admin_client):
+        r"""A1 FIX: a webhook URL starting `\'` must not close its literal —
+        quote-doubling alone produced `\''`, whose second quote terminates it."""
+        def _se(sql):
+            if "is_read = false" in sql:
+                return [{"notif_type": "schema_change", "severity": "HIGH",
+                         "title": "t", "detail": "d", "table_fqn": "c.s.t",
+                         "detected_at": "2026-07-01"}]
+            if "enabled = true" in sql:
+                return [{"webhook_id": "w1", "event_types": "*", "url": "\\' OR 1=1--"}]
+            return []
+
+        with patch("backend.routes.capability_closures._execute_sql", side_effect=_se) as mock_sql:
+            resp = admin_client.post("/api/notifications/enqueue-delivery")
+            assert resp.status_code == 200
+            assert resp.json()["queued"] == 1
+            insert = [c[0][0] for c in mock_sql.call_args_list if "INSERT INTO" in c[0][0]][0]
+            assert "'\\\\'' OR 1=1--'" in insert
+            assert "'\\''" not in insert  # the bypassable quote-only form
 
 
 class TestDeliveryStatus:

@@ -41,6 +41,37 @@ class TestSet:
             assert s.set("k", "x" * (MAX_VALUE_BYTES + 1), namespace="ns") is False
             m.assert_not_called()
 
+    def test_payload_backslash_quote_escaped(self):
+        r"""A payload value starting `\'` must not be able to close the literal.
+        Quote-doubling alone produced `\''`, whose first quote Spark treats as an
+        escaped quote and whose second CLOSES the string. json.dumps already
+        doubles the backslash, and sql_str doubles it again — four in the
+        statement — so nothing here is left for Spark to consume."""
+        s = _svc()
+        with patch.object(s, "_sql", return_value=[]) as m:
+            assert s.set("k", "\\' OR 1=1--", namespace="ns") is True
+            sent = m.call_args[0][0]
+            assert "\\\\\\\\'' OR 1=1--" in sent
+
+
+class TestNamespaceEscaping:
+    """The namespace lands in the cache_ns literal of every statement."""
+
+    def test_namespace_escaped_not_sliced_after_escaping(self):
+        r"""sql_str(limit=) truncates BEFORE escaping. Slicing the escaped form
+        could cut a `\\` or `''` pair in half and re-open the literal."""
+        s = _svc()
+        long_ns = "\\'" + ("a" * 200)
+        with patch.object(s, "_sql", return_value=[]) as m:
+            s.invalidate("k", long_ns)
+            sent = m.call_args[0][0]
+            assert "'\\\\''" in sent            # backslash doubled, then quote
+            assert "'\\''" not in sent          # bypassable form absent
+            # Cap is 100 SOURCE chars: the 2-char prefix + 98 'a's, and the
+            # doubling that follows never lands mid-pair.
+            assert "a" * 98 in sent
+            assert "a" * 99 not in sent
+
 
 class TestInvalidate:
     def test_invalidate_key(self):

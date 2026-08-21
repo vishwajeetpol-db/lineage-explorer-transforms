@@ -16,6 +16,19 @@ def mock_sql():
         yield m
 
 
+# A canonical UUID for the id-shaped fields (term_id/domain_id/kpi_id).
+FIXED_UUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+
+
+def _all_sql(mock_sql) -> str:
+    """Every statement the handler pushed to the warehouse, joined.
+
+    Asserting over all calls (rather than call_args) keeps these tests immune to
+    the lazy CREATE TABLE IF NOT EXISTS statements _lazy_ensure() may emit first.
+    """
+    return "\n".join(c.args[0] for c in mock_sql.call_args_list)
+
+
 class TestExecuteSqlAndEnsure:
     def test_execute_sql_no_warehouse(self):
         import backend.routes.glossary as g
@@ -123,12 +136,13 @@ class TestTerms:
         assert resp.json()["status"] == "ok"
 
     def test_upsert_term_with_id(self, app_client, mock_sql):
+        # A supplied id must be a UUID — see TestSecurity for the non-UUID path.
         resp = app_client.post(
             "/api/glossary/terms",
-            json={"term_id": "fixed", "name": "Rev", "definition": "d"},
+            json={"term_id": FIXED_UUID, "name": "Rev", "definition": "d"},
         )
         assert resp.status_code == 200
-        assert resp.json()["term_id"] == "fixed"
+        assert resp.json()["term_id"] == FIXED_UUID
 
     def test_upsert_term_missing_required_422(self, app_client, mock_sql):
         resp = app_client.post("/api/glossary/terms", json={"name": "only"})
@@ -141,13 +155,14 @@ class TestTerms:
         )
         assert resp.status_code == 500
 
-    def test_delete_term_ok(self, app_client, mock_sql):
-        resp = app_client.delete("/api/glossary/terms/t1")
+    # DELETE is admin-gated, so these two drive it as an admin.
+    def test_delete_term_ok(self, admin_client, mock_sql):
+        resp = admin_client.delete("/api/glossary/terms/t1")
         assert resp.status_code == 200
 
-    def test_delete_term_error_500(self, app_client, mock_sql):
+    def test_delete_term_error_500(self, admin_client, mock_sql):
         mock_sql.side_effect = RuntimeError("boom")
-        resp = app_client.delete("/api/glossary/terms/t1")
+        resp = admin_client.delete("/api/glossary/terms/t1")
         assert resp.status_code == 500
 
 
@@ -361,3 +376,182 @@ class TestLineageOverlay:
             "/api/glossary/lineage-overlay", params={"catalog": "c"}
         )
         assert resp.status_code == 500
+
+
+class TestSecurity:
+    """Regression tests for the SQL-injection and authz findings in this module."""
+
+    # --- FIX 1: client-supplied ids must be UUIDs, and are escaped anyway ---
+    def test_upsert_term_rejects_non_uuid_id(self, app_client, mock_sql):
+        resp = app_client.post(
+            "/api/glossary/terms",
+            json={"term_id": "not-a-uuid", "name": "R", "definition": "d"},
+        )
+        assert resp.status_code == 400
+        assert "MERGE INTO" not in _all_sql(mock_sql)
+
+    def test_upsert_term_rejects_merge_injection_payload(self, app_client, mock_sql):
+        # The confirmed exploit: term_id was interpolated raw into BOTH the MERGE
+        # source and the INSERT VALUES clause, so this payload exfiltrated rows
+        # through the term_id column on the next GET /terms.
+        payload = (
+            "x'||CAST((SELECT concat_ws(',', collect_list(salary)) "
+            "FROM main.hr.salaries) AS STRING)||'y"
+        )
+        resp = app_client.post(
+            "/api/glossary/terms",
+            json={"name": "n", "definition": "d", "term_id": payload},
+        )
+        assert resp.status_code == 400
+        assert "collect_list" not in _all_sql(mock_sql)
+
+    def test_upsert_term_accepts_uuid_id(self, app_client, mock_sql):
+        resp = app_client.post(
+            "/api/glossary/terms",
+            json={"term_id": FIXED_UUID, "name": "R", "definition": "d"},
+        )
+        assert resp.status_code == 200
+        assert FIXED_UUID in _all_sql(mock_sql)
+
+    def test_upsert_domain_rejects_non_uuid_id(self, app_client, mock_sql):
+        resp = app_client.post(
+            "/api/glossary/domains", json={"domain_id": "x'||y", "name": "F"}
+        )
+        assert resp.status_code == 400
+        assert "MERGE INTO" not in _all_sql(mock_sql)
+
+    def test_upsert_kpi_rejects_non_uuid_id(self, app_client, mock_sql):
+        resp = app_client.post(
+            "/api/glossary/kpis",
+            json={"kpi_id": "x'||y", "name": "M", "definition": "d"},
+        )
+        assert resp.status_code == 400
+        assert "MERGE INTO" not in _all_sql(mock_sql)
+
+    # --- FIX 2: the backslash bypass on the free-text list filters ---
+    # `\'` is an escape sequence in Databricks SQL, so quote-doubling alone turned
+    # a leading `\'` into `\''` whose second quote CLOSED the literal.
+    def test_list_terms_escapes_backslash_payload_in_q(self, app_client, mock_sql):
+        payload = "\\' OR 1=1 --"
+        resp = app_client.get("/api/glossary/terms", params={"q": payload})
+        assert resp.status_code == 200
+        sql = _all_sql(mock_sql)
+        assert "\\\\''" in sql              # backslash doubled first, then the quote
+        assert payload.lower() not in sql.lower()   # never lands verbatim
+
+    def test_list_terms_escapes_backslash_payload_in_domain(self, app_client, mock_sql):
+        payload = "\\' UNION SELECT 1 --"
+        resp = app_client.get("/api/glossary/terms", params={"domain": payload})
+        assert resp.status_code == 200
+        sql = _all_sql(mock_sql)
+        assert "\\\\''" in sql
+        assert payload not in sql
+
+    def test_list_terms_rejects_unknown_status(self, app_client, mock_sql):
+        resp = app_client.get(
+            "/api/glossary/terms", params={"status": "' OR 1=1 --"}
+        )
+        assert resp.status_code == 400
+        assert "SELECT * FROM" not in _all_sql(mock_sql)
+
+    def test_list_terms_allows_every_known_status(self, app_client, mock_sql):
+        for status in ("draft", "approved", "deprecated"):
+            resp = app_client.get("/api/glossary/terms", params={"status": status})
+            assert resp.status_code == 200, status
+
+    def test_get_term_escapes_backslash_payload(self, app_client, mock_sql):
+        mock_sql.return_value = []
+        resp = app_client.get("/api/glossary/terms/" + "\\'--")
+        assert resp.status_code == 404          # escaped, so it simply matches nothing
+        assert "\\\\''" in _all_sql(mock_sql)
+
+    # --- ALSO: identifier params on the graph/overlay paths are allow-listed ---
+    def test_lineage_overlay_rejects_bad_catalog(self, app_client, mock_sql):
+        resp = app_client.get(
+            "/api/glossary/lineage-overlay", params={"catalog": "c' OR '1'='1"}
+        )
+        assert resp.status_code == 400
+
+    def test_lineage_overlay_rejects_bad_schema(self, app_client, mock_sql):
+        resp = app_client.get(
+            "/api/glossary/lineage-overlay", params={"catalog": "c", "schema": "s'--"}
+        )
+        assert resp.status_code == 400
+
+    def test_for_table_rejects_bad_identifier(self, app_client, mock_sql):
+        resp = app_client.get(
+            "/api/glossary/for-table",
+            params={"catalog": "c", "schema": "s", "table": "t' OR '1'='1"},
+        )
+        assert resp.status_code == 400
+
+    # --- FIX 3: only the destructive DELETE is gated ---
+    def test_delete_term_non_admin_403(self, non_admin_client, mock_sql):
+        resp = non_admin_client.delete("/api/glossary/terms/t1")
+        assert resp.status_code == 403
+        assert "DELETE FROM" not in _all_sql(mock_sql)
+
+    def test_delete_term_anonymous_403(self, app_client, mock_sql):
+        resp = app_client.delete("/api/glossary/terms/t1")
+        assert resp.status_code == 403
+        assert "DELETE FROM" not in _all_sql(mock_sql)
+
+    def test_delete_term_admin_allowed(self, admin_client, mock_sql):
+        resp = admin_client.delete("/api/glossary/terms/t1")
+        assert resp.status_code == 200
+        assert "DELETE FROM" in _all_sql(mock_sql)
+
+    def test_upsert_term_open_to_non_admin_and_records_caller(
+        self, non_admin_client, mock_sql
+    ):
+        resp = non_admin_client.post(
+            "/api/glossary/terms", json={"name": "R", "definition": "d"}
+        )
+        assert resp.status_code == 200
+        sql = _all_sql(mock_sql)
+        assert "user@test.com" in sql       # real caller, not a hardcoded 'app'
+        assert "'app'" not in sql
+
+    def test_upsert_kpi_records_caller(self, non_admin_client, mock_sql):
+        resp = non_admin_client.post(
+            "/api/glossary/kpis", json={"name": "M", "definition": "d"}
+        )
+        assert resp.status_code == 200
+        sql = _all_sql(mock_sql)
+        assert "user@test.com" in sql
+        assert "'app'" not in sql
+
+    def test_link_term_records_caller(self, non_admin_client, mock_sql):
+        resp = non_admin_client.post(
+            "/api/glossary/link",
+            json={"term_id": "t1", "asset_type": "table", "asset_fqn": "c.s.t"},
+        )
+        assert resp.status_code == 200
+        sql = _all_sql(mock_sql)
+        assert "user@test.com" in sql
+        assert "'app'" not in sql
+
+    def test_upsert_domain_owner_defaults_to_caller(self, non_admin_client, mock_sql):
+        # glossary_domains has no created_by column, so a blank owner falls back
+        # to the caller — otherwise the row would be unattributable.
+        resp = non_admin_client.post("/api/glossary/domains", json={"name": "Finance"})
+        assert resp.status_code == 200
+        assert "user@test.com" in _all_sql(mock_sql)
+
+    def test_upsert_domain_keeps_explicit_owner(self, non_admin_client, mock_sql):
+        resp = non_admin_client.post(
+            "/api/glossary/domains", json={"name": "Finance", "owner": "cfo@test.com"}
+        )
+        assert resp.status_code == 200
+        assert "cfo@test.com" in _all_sql(mock_sql)
+
+    # --- ALSO: 500s no longer echo the raw SQL error back to the caller ---
+    def test_error_detail_does_not_leak_sql(self, app_client, mock_sql):
+        mock_sql.side_effect = RuntimeError(
+            "SQL failed: [TABLE_OR_VIEW_NOT_FOUND] main.hr.salaries"
+        )
+        resp = app_client.get("/api/glossary/terms")
+        assert resp.status_code == 500
+        detail = resp.json()["detail"]
+        assert "SQL failed" not in detail
+        assert "salaries" not in detail

@@ -28,7 +28,10 @@ class TestAnalyzeProducer:
         assert resp.status_code == 400
 
     def test_post_ok(self, app_client):
-        with patch("backend.routes.lineage.analyze_producer",
+        # _assert_producer_of is patched out here: this test covers the handler, and
+        # the guard itself has dedicated coverage in TestProducerAuthorization.
+        with patch("backend.routes.lineage._assert_producer_of"), \
+             patch("backend.routes.lineage.analyze_producer",
                    return_value={"source": "llm", "columns": [], "version": 1}):
             resp = app_client.post("/api/analyze-producer", json={
                 "entity_type": "JOB", "entity_id": "123", "target_table": "c.s.t"})
@@ -118,7 +121,8 @@ class TestColumnTransformations:
             {"type": "step", "step": "start", "status": "running", "message": "go"},
             {"type": "result", "derived": True, "columns": [{"target_column": "x"}], "version": 3},
         ]
-        with patch("backend.server.framework_analysis.deep_analyze_stream",
+        with patch("backend.routes.lineage._assert_producer_of"), \
+             patch("backend.server.framework_analysis.deep_analyze_stream",
                    return_value=iter(events)):
             resp = app_client.post("/api/column-transformations/deep-analyze", json={
                 "catalog": "c", "schema_name": "s", "table": "t",
@@ -132,7 +136,8 @@ class TestColumnTransformations:
     def test_deep_analyze_stream_error_is_emitted(self, app_client):
         def boom(*a, **k):
             raise RuntimeError("mid-flight")
-        with patch("backend.server.framework_analysis.deep_analyze_stream", side_effect=boom):
+        with patch("backend.routes.lineage._assert_producer_of"), \
+             patch("backend.server.framework_analysis.deep_analyze_stream", side_effect=boom):
             resp = app_client.post("/api/column-transformations/deep-analyze", json={
                 "catalog": "c", "schema_name": "s", "table": "t",
                 "entity_type": "JOB", "entity_id": "123"})
@@ -153,6 +158,96 @@ class TestColumnTransformations:
                 "catalog": "c", "schema_name": "s", "table": "t",
                 "ref_from": "plan_capture:1", "ref_to": "llm:2"})
         assert resp.status_code == 200
+
+
+class TestProducerAuthorization:
+    """The source fetch runs as the app SP, whose read scope is broader than any
+    one caller's, and `entity_id` accepts a free-form workspace path. Without a
+    producer check a non-admin could aim it at an unrelated notebook and get the
+    source back — so the pair must be one UC actually recorded for the target."""
+
+    _NB = {"entity_type": "NOTEBOOK", "entity_id": "/Users/someone-else/private",
+           "target_table": "c.s.t"}
+
+    def test_unrecorded_producer_is_refused(self, app_client):
+        # No lineage row linking this notebook to the target → 403, and the
+        # source fetch must never be reached.
+        with patch("backend.routes.lineage._execute_sql", return_value=[]), \
+             patch("backend.routes.lineage.analyze_producer") as mock_analyze:
+            resp = app_client.post("/api/analyze-producer", json=self._NB)
+        assert resp.status_code == 403
+        assert "not a recorded producer" in resp.json()["detail"]
+        mock_analyze.assert_not_called()
+
+    def test_recorded_producer_is_allowed(self, app_client):
+        with patch("backend.routes.lineage._execute_sql", return_value=[{"ok": 1}]), \
+             patch("backend.routes.lineage.analyze_producer",
+                   return_value={"source": "llm", "columns": []}) as mock_analyze:
+            resp = app_client.post("/api/analyze-producer", json=self._NB)
+        assert resp.status_code == 200
+        mock_analyze.assert_called_once()
+
+    def test_admin_bypasses_the_producer_check(self, admin_client):
+        # Admins already have the broader access the guard is protecting.
+        with patch("backend.routes.lineage._execute_sql") as mock_sql, \
+             patch("backend.routes.lineage.analyze_producer",
+                   return_value={"source": "llm", "columns": []}):
+            resp = admin_client.post("/api/analyze-producer", json=self._NB)
+        assert resp.status_code == 200
+        mock_sql.assert_not_called()
+
+    def test_lookup_failure_fails_closed(self, app_client):
+        # If the lineage check can't run we refuse rather than trusting the caller.
+        with patch("backend.routes.lineage._execute_sql", side_effect=RuntimeError("no perms")), \
+             patch("backend.routes.lineage.analyze_producer") as mock_analyze:
+            resp = app_client.post("/api/analyze-producer", json=self._NB)
+        assert resp.status_code == 503
+        mock_analyze.assert_not_called()
+
+    def test_deep_analyze_is_guarded_too(self, app_client):
+        with patch("backend.routes.lineage._execute_sql", return_value=[]), \
+             patch("backend.server.framework_analysis.deep_analyze_stream") as mock_stream:
+            resp = app_client.post("/api/column-transformations/deep-analyze", json={
+                "catalog": "c", "schema_name": "s", "table": "t",
+                "entity_type": "NOTEBOOK", "entity_id": "/Users/someone-else/private"})
+        assert resp.status_code == 403
+        mock_stream.assert_not_called()
+
+
+class TestStoredSourceRedaction:
+    """`analysis_store._decode_row` returns `source_code` verbatim, so any endpoint
+    returning a full row hands out the producer's code. Only admins need it."""
+
+    _ROW = {"version": 1, "columns": [], "source_hash": "abc", "source_code": "SECRET TOKEN=dapi123"}
+
+    def test_version_redacts_source_for_non_admin(self, app_client):
+        with patch("backend.routes.lineage._assert_producer_of"), \
+             patch("backend.routes.lineage.get_version", return_value=dict(self._ROW)):
+            resp = app_client.get("/api/analyze-producer/version", params={
+                "entity_type": "JOB", "entity_id": "1", "target_table": "c.s.t", "version": 1})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["source_code"] is None
+        assert body["source_code_redacted"] is True
+
+    def test_version_keeps_source_for_admin(self, admin_client):
+        with patch("backend.routes.lineage.get_version", return_value=dict(self._ROW)):
+            resp = admin_client.get("/api/analyze-producer/version", params={
+                "entity_type": "JOB", "entity_id": "1", "target_table": "c.s.t", "version": 1})
+        assert resp.status_code == 200
+        assert resp.json()["source_code"] == "SECRET TOKEN=dapi123"
+
+    def test_compare_redacts_both_sides_for_non_admin(self, app_client):
+        with patch("backend.routes.lineage._assert_producer_of"), \
+             patch("backend.routes.lineage.get_version", side_effect=[dict(self._ROW), dict(self._ROW)]):
+            resp = app_client.get("/api/analyze-producer/compare", params={
+                "entity_type": "JOB", "entity_id": "1", "target_table": "c.s.t",
+                "from_version": 1, "to_version": 2})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["from"]["source_code"] is None and body["to"]["source_code"] is None
+        # the derived signal survives redaction
+        assert body["source_changed"] is False
 
 
 class TestExplainLineage:

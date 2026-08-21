@@ -92,8 +92,16 @@ class TestEndpointUsage:
         with patch.object(ml, "_execute_sql", return_value=[{"day": "d"}]) as m:
             out = ml.get_endpoint_usage("ep'; DROP")
         assert out == [{"day": "d"}]
-        assert "DROP" in m.call_args[0][0]
-        assert "'; DROP" not in m.call_args[0][0].split("endpoint_name = '")[1][:20] or "ep" in m.call_args[0][0]
+        # The quote is DOUBLED (escaped), not stripped: the payload stays inside
+        # the literal instead of terminating it.
+        assert "endpoint_name = 'ep''; DROP'" in m.call_args[0][0]
+
+    def test_backslash_escaped_before_quote(self):
+        """`\\'` must become `\\\\''` — escaping the quote alone would let the
+        backslash consume it and re-open the literal."""
+        with patch.object(ml, "_execute_sql", return_value=[]) as m:
+            ml.get_endpoint_usage("ep\\' OR 1=1 -- ")
+        assert "endpoint_name = 'ep\\\\'' OR 1=1 -- '" in m.call_args[0][0]
 
     def test_error(self):
         with patch.object(ml, "_execute_sql", side_effect=RuntimeError("x")):
@@ -224,6 +232,30 @@ class TestGetTableForModel:
             out = ml.get_table_for_model("m'x", "3")
         assert out == [{"training_table": "c.s.t"}]
         assert "model_version = '3'" in m.call_args[0][0]
+        # model_name is escaped, not quote-stripped
+        assert "model_name = 'm''x'" in m.call_args[0][0]
+
+    def test_version_union_payload_stays_inside_literal(self):
+        """The confirmed exploit: model_version reached the WHERE clause with no
+        treatment at all. The route now 400s it, and the sink escapes it, so even
+        a direct service-layer caller cannot break out."""
+        payload = (
+            "y' AND 1=0 UNION SELECT CAST(ssn AS STRING) "
+            "FROM main.finance.payroll -- "
+        )
+        with patch.object(ml, "_ensure_model_lineage_table"), \
+             patch.object(ml, "_execute_sql", return_value=[]) as m:
+            ml.get_table_for_model("x", payload)
+        sql = m.call_args[0][0]
+        # Every quote in the payload is doubled, so the UNION is inert text.
+        assert "model_version = 'y'' AND 1=0 UNION SELECT" in sql
+        assert "model_version = 'y' AND" not in sql
+
+    def test_version_backslash_quote_escaped(self):
+        with patch.object(ml, "_ensure_model_lineage_table"), \
+             patch.object(ml, "_execute_sql", return_value=[]) as m:
+            ml.get_table_for_model("x", "3\\' OR 1=1 -- ")
+        assert "model_version = '3\\\\'' OR 1=1 -- '" in m.call_args[0][0]
 
     def test_without_version(self):
         with patch.object(ml, "_ensure_model_lineage_table"), \
@@ -251,3 +283,27 @@ class TestRegisterModelLineage:
              patch.object(ml, "_execute_sql", return_value=[]) as m:
             ml.register_model_lineage("mdl", "1", "flat")
         assert "'flat'" in m.call_args[0][0]
+
+    def test_trailing_backslash_cannot_shift_quoting_parity(self):
+        """Every field here is raw request-body input with no allow-list. Under the
+        old quote-STRIPPING, a value ending in a backslash escaped its literal's
+        closing quote, so the NEXT field's content was parsed as SQL. Doubling the
+        backslash keeps each field inside its own literal."""
+        with patch.object(ml, "_ensure_model_lineage_table"), \
+             patch.object(ml, "_execute_sql", return_value=[]) as m:
+            ml.register_model_lineage(
+                "mdl\\", "1", "c.s.t",
+                notes=", (SELECT current_user()), 'x",
+            )
+        sql = m.call_args[0][0]
+        assert "'mdl\\\\'" in sql            # backslash doubled -> literal closes
+        assert "'mdl\\'," not in sql         # ...never left as a lone escape
+        assert "''x'" in sql                 # the notes quote is doubled too
+
+    def test_none_fields_become_empty_literals(self):
+        """sql_str(None) is '' — the old `(s or "")` lambda behaviour is preserved."""
+        with patch.object(ml, "_ensure_model_lineage_table"), \
+             patch.object(ml, "_execute_sql", return_value=[]) as m:
+            ml.register_model_lineage("mdl", "1", "c.s.t", job_id=None, notes=None)
+        assert "'mdl', '1', 'c.s.t'" in m.call_args[0][0]
+        assert "None" not in m.call_args[0][0]

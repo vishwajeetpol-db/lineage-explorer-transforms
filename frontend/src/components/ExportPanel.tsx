@@ -1,10 +1,15 @@
 import { useState } from 'react';
+import { useLineageStore } from '../store/lineageStore';
 
 /**
  * ExportPanel - Provides OpenLineage export/import and graph snapshot functionality.
  * Covers capabilities 07 (Versioned Lineage) and 17 (Open Standards).
  */
 export function ExportPanel({ catalog = '', schema = '' }: { catalog?: string; schema?: string }) {
+  // Importing OpenLineage events injects lineage into the shared graph, so the
+  // backend admin-gates it. Hide the tab for non-admins rather than showing a
+  // control that always 403s.
+  const isAdmin = useLineageStore((s) => s.isAdmin);
   const [activeTab, setActiveTab] = useState<'export' | 'import' | 'snapshots'>('export');
   const [exporting, setExporting] = useState(false);
   const [importData, setImportData] = useState('');
@@ -84,7 +89,7 @@ export function ExportPanel({ catalog = '', schema = '' }: { catalog?: string; s
 
       {/* Tabs */}
       <div className="flex gap-1 mb-6 bg-gray-800 rounded-lg p-1">
-        {(['export', 'import', 'snapshots'] as const).map(tab => (
+        {(['export', 'import', 'snapshots'] as const).filter(t => t !== 'import' || isAdmin).map(tab => (
           <button key={tab} onClick={() => { setActiveTab(tab); if (tab === 'snapshots') loadSnapshots(); }}
             className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
               activeTab === tab ? 'bg-indigo-600 text-white' : 'text-gray-400 hover:text-white'

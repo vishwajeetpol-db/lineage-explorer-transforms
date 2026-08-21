@@ -23,10 +23,13 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client, get_table_lineage, get_schema_column_lineage
+from backend.validators import _validate, require_admin, sql_str
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,11 @@ WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")
 OPENLINEAGE_PRODUCER = "https://github.com/databricks/lineage-explorer"
 OPENLINEAGE_SCHEMA_URL = "https://openlineage.io/spec/2-0-2/OpenLineage.json"
+
+# The only statuses ever written to the producer queue: 'pending' by
+# /producer/produce, 'delivered'/'failed' by the external delivery job.
+# Allow-listed so status_filter can never carry SQL into the queue query.
+PRODUCER_STATUSES = ("pending", "delivered", "failed")
 
 
 def _execute_sql(sql: str) -> list[dict]:
@@ -192,8 +200,12 @@ async def export_openlineage(
             content={"events": events, "count": len(events), "schemaURL": OPENLINEAGE_SCHEMA_URL},
             headers={"Content-Type": "application/json"},
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Detail stays server-side: the raw text is SQL/SDK error output.
+        logger.error(f"openlineage export failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to export OpenLineage events")
 
 
 @router.post("/api/import/openlineage")
@@ -201,7 +213,12 @@ async def import_openlineage(request: Request, body: dict):
     """Ingest OpenLineage RunEvents into the lineage graph.
 
     Accepts a list of RunEvent objects and registers them as external
-    lineage edges in an app-owned table."""
+    lineage edges in an app-owned table.
+
+    Admin-gated: this is a lineage-ingest write into an app-owned table.
+    Non-admins should not be able to inject lineage events that later render
+    as trusted graph edges."""
+    require_admin(request)
     events = body.get("events", [])
     if not events:
         raise HTTPException(status_code=400, detail="No events provided")
@@ -226,26 +243,32 @@ async def import_openlineage(request: Request, body: dict):
             eid = str(uuid.uuid4())
             job = event.get("job", {})
             run = event.get("run", {})
-            inputs_json = json.dumps(event.get("inputs", [])).replace("'", "''")
-            outputs_json = json.dumps(event.get("outputs", [])).replace("'", "''")
-            raw_json = json.dumps(event).replace("'", "''")[:8000]
+            # Every value below is caller-supplied: escape with sql_str, which
+            # handles backslashes before quotes and truncates before escaping so
+            # a cut can never split an escape pair and re-open the literal.
+            inputs_json = sql_str(json.dumps(event.get("inputs", [])), 4000)
+            outputs_json = sql_str(json.dumps(event.get("outputs", [])), 4000)
+            raw_json = sql_str(json.dumps(event), 8000)
 
             _execute_sql(f"""
                 INSERT INTO {EXT_TABLE}
                 (event_id, event_type, event_time, job_namespace, job_name, run_id, input_datasets, output_datasets, raw_event, imported_at)
-                VALUES ('{eid}', '{event.get("eventType", "COMPLETE")}',
-                        TIMESTAMP '{event.get("eventTime", now)}',
-                        '{job.get("namespace", "").replace(chr(39), chr(39)*2)[:500]}',
-                        '{job.get("name", "").replace(chr(39), chr(39)*2)[:500]}',
-                        '{run.get("runId", "").replace(chr(39), chr(39)*2)[:200]}',
-                        '{inputs_json[:4000]}', '{outputs_json[:4000]}',
+                VALUES ('{eid}', '{sql_str(event.get("eventType", "COMPLETE"), 100)}',
+                        TIMESTAMP '{sql_str(event.get("eventTime", now), 100)}',
+                        '{sql_str(job.get("namespace", ""), 500)}',
+                        '{sql_str(job.get("name", ""), 500)}',
+                        '{sql_str(run.get("runId", ""), 200)}',
+                        '{inputs_json}', '{outputs_json}',
                         '{raw_json}', TIMESTAMP '{now}')
             """)
             imported += 1
 
         return {"status": "ok", "imported": imported}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"openlineage import failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to import OpenLineage events")
 
 
 # ===========================================================================
@@ -301,39 +324,59 @@ async def configure_producer(request: Request, body: dict):
       endpoint_name: str — Friendly name (e.g. "Marquez", "Atlan", "DataHub")
       api_key_secret_scope: str — (optional) Databricks secret scope for auth
       api_key_secret_key: str — (optional) Secret key within scope
+
+    Admin-gated: an endpoint registration is an outbound-delivery trust anchor.
+    The MERGE below keys on endpoint_name, so an ungated caller could re-point
+    an existing row's endpoint_url and exfiltrate every produced event.
     """
+    require_admin(request)
     _lazy_ensure_producer()
     endpoint_url = body.get("endpoint_url", "").strip()
-    endpoint_name = body.get("endpoint_name", "default").strip()
+    # Capped here (not at interpolation) so the stored and returned names agree.
+    endpoint_name = body.get("endpoint_name", "default").strip()[:200]
     if not endpoint_url:
         raise HTTPException(status_code=400, detail="endpoint_url is required")
+    # Only https:// with a real host — events carry lineage metadata and (via the
+    # configured secret) an auth token, so plaintext http://, file:// and other
+    # schemes are rejected rather than silently delivered to.
+    parsed = urlparse(endpoint_url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise HTTPException(
+            status_code=400,
+            detail="endpoint_url must be an https:// URL with a host",
+        )
 
     import uuid
     config_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    scope = (body.get("api_key_secret_scope") or "").replace("'", "''")[:200]
-    key = (body.get("api_key_secret_key") or "").replace("'", "''")[:200]
+    scope = sql_str(body.get("api_key_secret_scope") or "", 200)
+    key = sql_str(body.get("api_key_secret_key") or "", 200)
 
     try:
+        # WHEN MATCHED deliberately does NOT touch api_key_secret_scope /
+        # api_key_secret_key: an existing row's secret reference is a trust
+        # anchor and must not be silently re-pointed by a later configure call.
+        # Rotating a secret reference means deleting and re-creating the row.
         await asyncio.to_thread(_execute_sql, f"""
             MERGE INTO {PRODUCER_CONFIG_TABLE} t
-            USING (SELECT '{endpoint_name.replace(chr(39), chr(39)*2)}' AS endpoint_name) s
+            USING (SELECT '{sql_str(endpoint_name)}' AS endpoint_name) s
             ON t.endpoint_name = s.endpoint_name
             WHEN MATCHED THEN UPDATE SET
-                endpoint_url = '{endpoint_url.replace(chr(39), chr(39)*2)[:2000]}',
-                api_key_secret_scope = '{scope}',
-                api_key_secret_key = '{key}',
+                endpoint_url = '{sql_str(endpoint_url, 2000)}',
                 active = true,
                 updated_at = TIMESTAMP '{now}'
             WHEN NOT MATCHED THEN INSERT
                 (config_id, endpoint_url, endpoint_name, api_key_secret_scope, api_key_secret_key, active, created_at, updated_at)
-            VALUES ('{config_id}', '{endpoint_url.replace(chr(39), chr(39)*2)[:2000]}',
-                    '{endpoint_name.replace(chr(39), chr(39)*2)}', '{scope}', '{key}',
+            VALUES ('{config_id}', '{sql_str(endpoint_url, 2000)}',
+                    '{sql_str(endpoint_name)}', '{scope}', '{key}',
                     true, TIMESTAMP '{now}', TIMESTAMP '{now}')
         """)
         return {"status": "ok", "config_id": config_id, "endpoint_name": endpoint_name}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"openlineage producer configure failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to configure producer endpoint")
 
 
 @router.get("/api/openlineage/producer/config")
@@ -346,7 +389,8 @@ async def get_producer_config(request: Request):
         )
         return {"endpoints": rows}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"openlineage producer config read failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to read producer configuration")
 
 
 @router.post("/api/openlineage/producer/produce")
@@ -363,7 +407,19 @@ async def produce_events(
     in the producer queue for asynchronous delivery to configured endpoints.
 
     Designed to be called by a scheduled Databricks job (e.g. hourly/daily).
+
+    Admin-gated: this is a lineage-ingest write into the app-owned producer
+    queue. Non-admins should not be able to inject lineage events.
     """
+    require_admin(request)
+    # catalog/schema are UC identifiers interpolated into the system-table scan
+    # below. Allow-list them before any SQL is built — the identifier regex
+    # forbids quotes and spaces, so no UNION/comment payload can survive. These
+    # run outside the try so their 400 isn't rewritten as a 500. lookback_hours
+    # is already bounded by Query(ge=1, le=168).
+    catalog = _validate(catalog, "catalog")
+    if schema:
+        schema = _validate(schema, "schema")
     _lazy_ensure_producer()
     try:
         # 1. Find recent lineage-producing writes
@@ -427,7 +483,7 @@ async def produce_events(
 
             # Queue the event
             eid = str(uuid.uuid4())
-            event_json = json.dumps(event).replace("'", "''")[:16000]
+            event_json = sql_str(json.dumps(event), 16000)
             _execute_sql(f"""
                 INSERT INTO {PRODUCER_QUEUE_TABLE}
                 (event_id, event_json, target_endpoint, status, produced_at, delivered_at, error_message)
@@ -442,8 +498,11 @@ async def produce_events(
             "catalog": catalog,
             "schema": schema,
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"openlineage produce failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to produce OpenLineage events")
 
 
 @router.get("/api/openlineage/producer/events")
@@ -457,7 +516,16 @@ async def producer_events(
     Used to monitor production health and debug delivery issues.
     """
     _lazy_ensure_producer()
-    where = f"WHERE status = '{status_filter.replace(chr(39), chr(39)*2)}'" if status_filter else ""
+    # status_filter lands in the WHERE clause of a query whose rows are returned
+    # to the caller. Allow-list it against the statuses the queue actually uses
+    # (outside the try, so the 400 isn't rewritten as a 500) and escape the value
+    # anyway — defence in depth if PRODUCER_STATUSES ever grows.
+    if status_filter and status_filter not in PRODUCER_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"status_filter must be one of: {' | '.join(PRODUCER_STATUSES)}",
+        )
+    where = f"WHERE status = '{sql_str(status_filter)}'" if status_filter else ""
     try:
         rows = await asyncio.to_thread(
             _execute_sql, f"""
@@ -474,4 +542,5 @@ async def producer_events(
         )
         return {"events": rows, "counts": {r["status"]: int(r["cnt"]) for r in counts}}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"openlineage producer events read failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to read producer event queue")

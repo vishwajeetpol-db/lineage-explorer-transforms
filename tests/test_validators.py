@@ -9,7 +9,11 @@ import re
 import pytest
 from fastapi import HTTPException
 
-from backend.validators import _IDENTIFIER_RE, _FULL_NAME_RE, _validate
+from unittest.mock import MagicMock, patch
+
+from backend.validators import (
+    _IDENTIFIER_RE, _FULL_NAME_RE, _validate, sql_str, require_admin,
+)
 
 
 class TestIdentifierRegex:
@@ -227,3 +231,72 @@ class TestValidateFunction:
             _validate(long_invalid, "catalog")
         # Verify truncation doesn't leak full payload
         assert len(exc_info.value.detail) < 200
+
+
+class TestSqlStr:
+    r"""`sql_str` is the load-bearing escape for every user value that reaches SQL
+    text. The backslash-before-quote ORDER is the whole point: Databricks SQL
+    (Spark) treats `\` as an escape inside single-quoted literals by default, so
+    quote-doubling alone is bypassable — a value starting `\'` becomes `\''`,
+    whose first quote is consumed as an escaped quote and whose second quote
+    CLOSES the literal, letting the remainder execute as SQL."""
+
+    def test_doubles_quotes(self):
+        assert sql_str("O'Brien") == "O''Brien"
+
+    def test_escapes_backslash_before_quote(self):
+        # The bypass payload: a lone backslash-quote must NOT be able to close the
+        # literal. Backslash is doubled first, so the quote stays escaped data.
+        assert sql_str("\\'") == "\\\\''"
+
+    def test_bypass_payload_cannot_close_the_literal(self):
+        payload = "\\' UNION SELECT ssn FROM main.pii.customers -- "
+        out = sql_str(payload)
+        # The dangerous adjacency is a single backslash immediately followed by a
+        # single quote; after escaping the backslash is doubled so it is data.
+        assert "\\\\''" in out
+        assert not out.startswith("\\'")
+
+    def test_order_matters_regression(self):
+        # Quote-first-then-backslash would produce \\'' from \' too, but would
+        # mangle a bare backslash differently. Pin the exact expected output so a
+        # future refactor can't silently swap the order.
+        assert sql_str("a\\b'c") == "a\\\\b''c"
+
+    def test_none_and_non_string(self):
+        assert sql_str(None) == ""
+        assert sql_str(7) == "7"
+
+    def test_limit_truncates_before_escaping(self):
+        # Truncating AFTER escaping could split an escape pair and re-open the
+        # literal; `limit` must therefore apply to the raw value.
+        assert sql_str("\\" * 10, limit=2) == "\\\\\\\\"
+        assert sql_str("abcdef", limit=3) == "abc"
+
+    def test_limit_ignored_when_non_positive(self):
+        assert sql_str("abc", limit=0) == "abc"
+
+
+class TestRequireAdmin:
+    """Every privileged handler calls this explicitly — the app has no auth
+    middleware and no router-level dependencies, so a missing call ships ungated."""
+
+    def test_raises_403_for_non_admin(self):
+        with patch("backend.main._get_user_info", return_value=("user@x.com", False)):
+            with pytest.raises(HTTPException) as exc:
+                require_admin(MagicMock())
+        assert exc.value.status_code == 403
+
+    def test_raises_403_for_anonymous(self):
+        with patch("backend.main._get_user_info", return_value=(None, False)):
+            with pytest.raises(HTTPException) as exc:
+                require_admin(MagicMock())
+        assert exc.value.status_code == 403
+
+    def test_returns_email_for_admin(self):
+        with patch("backend.main._get_user_info", return_value=("admin@x.com", True)):
+            assert require_admin(MagicMock()) == "admin@x.com"
+
+    def test_admin_with_no_email_returns_empty_string(self):
+        with patch("backend.main._get_user_info", return_value=(None, True)):
+            assert require_admin(MagicMock()) == ""

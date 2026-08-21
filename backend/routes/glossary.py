@@ -7,7 +7,7 @@ Endpoints:
   GET    /api/glossary/terms          — list all business terms (with optional search)
   GET    /api/glossary/terms/{id}     — get a single term with linked assets
   POST   /api/glossary/terms          — create or update a business term
-  DELETE /api/glossary/terms/{id}     — remove a business term
+  DELETE /api/glossary/terms/{id}     — remove a business term (ADMIN ONLY)
   GET    /api/glossary/domains        — list all data domains
   POST   /api/glossary/domains        — create or update a data domain
   GET    /api/glossary/kpis           — list KPI definitions
@@ -22,6 +22,11 @@ Persisted in app-owned Delta tables:
   - glossary_domains (domain_id, name, description, owner, ...)
   - glossary_kpis (kpi_id, name, formula_sql, source_tables, ...)
   - glossary_term_links (term_id, asset_type, asset_fqn, column_name)
+
+Authorization: the reads and the upserts are open to every app user — this is a
+collaborative catalog and the UI wires the term form up for everyone — so each
+written row records the real caller in created_by/owner instead of a generic
+'app'. The destructive DELETE is admin-gated via require_admin().
 """
 from __future__ import annotations
 
@@ -36,6 +41,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
+from backend.validators import _validate, require_admin, sql_str
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +55,11 @@ KPIS_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.glossary_kpis"
 LINKS_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.glossary_term_links"
 WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")
+
+# Lifecycle values a term filter may ask for. The UI's status dropdown offers
+# exactly these three (GlossaryPanel.tsx), so anything else is a hand-crafted
+# request — allow-list it instead of escaping it into the WHERE clause.
+TERM_STATUSES = ("draft", "approved", "deprecated")
 
 
 def _execute_sql(sql: str) -> list[dict]:
@@ -101,6 +112,36 @@ def _lazy_ensure():
         _tables_ensured = True
 
 
+def _uuid_or_new(value: Optional[str], name: str) -> str:
+    """Return a canonical UUID: the caller's value if it is one, else a fresh one.
+
+    The three upsert endpoints interpolate this id into BOTH the MERGE source
+    (`USING (SELECT '<id>')`) and the `INSERT ... VALUES` clause, which made it
+    the one field an attacker could steer into two SQL positions at once. Ids are
+    server-generated in the normal flow — the UI never sends one — so allow-listing
+    the shape closes the hole outright and sql_str() at each interpolation site is
+    then only defence in depth.
+    """
+    if not value:
+        return str(uuid.uuid4())
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail=f"Invalid {name}: must be a UUID")
+
+
+def _caller(request: Request) -> str:
+    """Return the requesting user's email for the row's attribution columns.
+
+    The upserts here are open to every app user (see upsert_term), so the row must
+    record who actually made the change rather than a hardcoded 'app' — the SQL
+    itself runs as the app service principal and carries no identity.
+    """
+    from backend.main import _get_user_info
+    email, _ = _get_user_info(request)
+    return email or "unknown"
+
+
 # --- Models ---
 class TermIn(BaseModel):
     term_id: Optional[str] = None
@@ -149,16 +190,22 @@ async def list_terms(
 ):
     """List all business terms with optional search/filter."""
     _lazy_ensure()
+    # sql_str, not quote-doubling: these filters land in a `SELECT *` whose rows go
+    # straight back to the caller, so a value starting `\'` would otherwise close
+    # the literal and let the rest of it execute as SQL.
     conditions = ["1=1"]
     if q:
-        safe_q = q.replace("'", "''")[:100]
-        conditions.append(f"(lower(name) LIKE '%{safe_q.lower()}%' OR lower(definition) LIKE '%{safe_q.lower()}%')")
+        safe_q = sql_str(q, limit=100).lower()
+        conditions.append(f"(lower(name) LIKE '%{safe_q}%' OR lower(definition) LIKE '%{safe_q}%')")
     if domain:
-        safe_d = domain.replace("'", "''")[:100]
-        conditions.append(f"domain = '{safe_d}'")
+        conditions.append(f"domain = '{sql_str(domain, limit=100)}'")
     if status:
-        safe_s = status.replace("'", "''")[:50]
-        conditions.append(f"status = '{safe_s}'")
+        if status not in TERM_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status: expected one of {', '.join(TERM_STATUSES)}",
+            )
+        conditions.append(f"status = '{sql_str(status, limit=50)}'")
     where = " AND ".join(conditions)
     try:
         rows = await asyncio.to_thread(
@@ -166,14 +213,15 @@ async def list_terms(
         )
         return {"terms": rows, "count": len(rows)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"glossary: list_terms failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list glossary terms")
 
 
 @router.get("/terms/{term_id}")
 async def get_term(request: Request, term_id: str):
     """Get a single term with its linked assets."""
     _lazy_ensure()
-    safe_id = term_id.replace("'", "''")[:100]
+    safe_id = sql_str(term_id, limit=100)
     try:
         terms = await asyncio.to_thread(
             _execute_sql, f"SELECT * FROM {TERMS_TABLE} WHERE term_id = '{safe_id}'"
@@ -187,47 +235,65 @@ async def get_term(request: Request, term_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"glossary: get_term failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load glossary term")
 
 
 @router.post("/terms")
 async def upsert_term(request: Request, body: TermIn):
-    """Create or update a business term."""
+    """Create or update a business term.
+
+    Deliberately NOT admin-gated: the glossary is a collaborative catalog and the
+    UI exposes this to every app user (GlossaryPanel.tsx). `created_by` therefore
+    records the real caller so each row stays attributable. Only the destructive
+    DELETE below is admin-gated.
+    """
     _lazy_ensure()
-    tid = body.term_id or str(uuid.uuid4())
+    tid = _uuid_or_new(body.term_id, "term_id")
+    actor = _caller(request)
     now = datetime.now(timezone.utc).isoformat()
     try:
         await asyncio.to_thread(_execute_sql, f"""
-            MERGE INTO {TERMS_TABLE} t USING (SELECT '{tid}' AS term_id) s ON t.term_id = s.term_id
+            MERGE INTO {TERMS_TABLE} t USING (SELECT '{sql_str(tid)}' AS term_id) s ON t.term_id = s.term_id
             WHEN MATCHED THEN UPDATE SET
-                name = '{body.name.replace(chr(39), chr(39)*2)}',
-                definition = '{body.definition.replace(chr(39), chr(39)*2)[:2000]}',
-                domain = '{(body.domain or "").replace(chr(39), chr(39)*2)}',
-                owner = '{(body.owner or "").replace(chr(39), chr(39)*2)}',
-                status = '{(body.status or "draft").replace(chr(39), chr(39)*2)}',
-                synonyms = '{(body.synonyms or "").replace(chr(39), chr(39)*2)}',
+                name = '{sql_str(body.name)}',
+                definition = '{sql_str(body.definition, limit=2000)}',
+                domain = '{sql_str(body.domain)}',
+                owner = '{sql_str(body.owner)}',
+                status = '{sql_str(body.status or "draft")}',
+                synonyms = '{sql_str(body.synonyms)}',
                 updated_at = TIMESTAMP '{now}'
             WHEN NOT MATCHED THEN INSERT (term_id, name, definition, domain, owner, status, synonyms, created_by, created_at, updated_at)
-            VALUES ('{tid}', '{body.name.replace(chr(39), chr(39)*2)}', '{body.definition.replace(chr(39), chr(39)*2)[:2000]}',
-                    '{(body.domain or "").replace(chr(39), chr(39)*2)}', '{(body.owner or "").replace(chr(39), chr(39)*2)}',
-                    '{(body.status or "draft").replace(chr(39), chr(39)*2)}', '{(body.synonyms or "").replace(chr(39), chr(39)*2)}',
-                    'app', TIMESTAMP '{now}', TIMESTAMP '{now}')
+            VALUES ('{sql_str(tid)}', '{sql_str(body.name)}', '{sql_str(body.definition, limit=2000)}',
+                    '{sql_str(body.domain)}', '{sql_str(body.owner)}',
+                    '{sql_str(body.status or "draft")}', '{sql_str(body.synonyms)}',
+                    '{sql_str(actor)}', TIMESTAMP '{now}', TIMESTAMP '{now}')
         """)
         return {"status": "ok", "term_id": tid}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"glossary: upsert_term failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save glossary term")
 
 
 @router.delete("/terms/{term_id}")
 async def delete_term(request: Request, term_id: str):
+    """Delete a term and every asset link pointing at it. Admin-gated.
+
+    Unlike the upserts this is destructive and unrecoverable — the Delta rows are
+    removed, not soft-deleted — so it requires an app admin. UI consequence:
+    GlossaryPanel.tsx renders the delete control for every user, so a non-admin
+    clicking it now gets a 403; the control should be hidden for non-admins.
+    """
+    require_admin(request)
     _lazy_ensure()
-    safe_id = term_id.replace("'", "''")[:100]
+    safe_id = sql_str(term_id, limit=100)
     try:
         await asyncio.to_thread(_execute_sql, f"DELETE FROM {TERMS_TABLE} WHERE term_id = '{safe_id}'")
         await asyncio.to_thread(_execute_sql, f"DELETE FROM {LINKS_TABLE} WHERE term_id = '{safe_id}'")
         return {"status": "ok"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"glossary: delete_term failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete glossary term")
 
 
 # --- Domain endpoints ---
@@ -238,71 +304,81 @@ async def list_domains(request: Request):
         rows = await asyncio.to_thread(_execute_sql, f"SELECT * FROM {DOMAINS_TABLE} ORDER BY name")
         return {"domains": rows}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"glossary: list_domains failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list data domains")
 
 
 @router.post("/domains")
 async def upsert_domain(request: Request, body: DomainIn):
+    """Create or update a data domain. Open to all app users, like upsert_term."""
     _lazy_ensure()
-    did = body.domain_id or str(uuid.uuid4())
+    did = _uuid_or_new(body.domain_id, "domain_id")
+    # glossary_domains has no created_by column, so `owner` is the only attribution
+    # this row can carry — fall back to the caller when the body leaves it blank.
+    owner = body.owner or _caller(request)
     now = datetime.now(timezone.utc).isoformat()
     try:
         await asyncio.to_thread(_execute_sql, f"""
-            MERGE INTO {DOMAINS_TABLE} t USING (SELECT '{did}' AS domain_id) s ON t.domain_id = s.domain_id
+            MERGE INTO {DOMAINS_TABLE} t USING (SELECT '{sql_str(did)}' AS domain_id) s ON t.domain_id = s.domain_id
             WHEN MATCHED THEN UPDATE SET
-                name = '{body.name.replace(chr(39), chr(39)*2)}',
-                description = '{(body.description or "").replace(chr(39), chr(39)*2)[:1000]}',
-                owner = '{(body.owner or "").replace(chr(39), chr(39)*2)}',
-                color = '{(body.color or "#6366f1").replace(chr(39), chr(39)*2)}',
+                name = '{sql_str(body.name)}',
+                description = '{sql_str(body.description, limit=1000)}',
+                owner = '{sql_str(owner)}',
+                color = '{sql_str(body.color or "#6366f1")}',
                 updated_at = TIMESTAMP '{now}'
             WHEN NOT MATCHED THEN INSERT (domain_id, name, description, owner, color, created_at, updated_at)
-            VALUES ('{did}', '{body.name.replace(chr(39), chr(39)*2)}', '{(body.description or "").replace(chr(39), chr(39)*2)[:1000]}',
-                    '{(body.owner or "").replace(chr(39), chr(39)*2)}', '{(body.color or "#6366f1").replace(chr(39), chr(39)*2)}',
+            VALUES ('{sql_str(did)}', '{sql_str(body.name)}', '{sql_str(body.description, limit=1000)}',
+                    '{sql_str(owner)}', '{sql_str(body.color or "#6366f1")}',
                     TIMESTAMP '{now}', TIMESTAMP '{now}')
         """)
         return {"status": "ok", "domain_id": did}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"glossary: upsert_domain failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save data domain")
 
 
 # --- KPI endpoints ---
 @router.get("/kpis")
 async def list_kpis(request: Request, domain: Optional[str] = Query(None)):
     _lazy_ensure()
-    where = f"WHERE domain = '{domain.replace(chr(39), chr(39)*2)}'" if domain else ""
+    where = f"WHERE domain = '{sql_str(domain, limit=100)}'" if domain else ""
     try:
         rows = await asyncio.to_thread(_execute_sql, f"SELECT * FROM {KPIS_TABLE} {where} ORDER BY name")
         return {"kpis": rows}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"glossary: list_kpis failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list KPI definitions")
 
 
 @router.post("/kpis")
 async def upsert_kpi(request: Request, body: KpiIn):
+    """Create or update a KPI definition. Open to all app users, like upsert_term."""
     _lazy_ensure()
-    kid = body.kpi_id or str(uuid.uuid4())
+    kid = _uuid_or_new(body.kpi_id, "kpi_id")
+    actor = _caller(request)
     now = datetime.now(timezone.utc).isoformat()
     try:
         await asyncio.to_thread(_execute_sql, f"""
-            MERGE INTO {KPIS_TABLE} t USING (SELECT '{kid}' AS kpi_id) s ON t.kpi_id = s.kpi_id
+            MERGE INTO {KPIS_TABLE} t USING (SELECT '{sql_str(kid)}' AS kpi_id) s ON t.kpi_id = s.kpi_id
             WHEN MATCHED THEN UPDATE SET
-                name = '{body.name.replace(chr(39), chr(39)*2)}',
-                definition = '{body.definition.replace(chr(39), chr(39)*2)[:2000]}',
-                formula_sql = '{(body.formula_sql or "").replace(chr(39), chr(39)*2)[:4000]}',
-                source_tables = '{(body.source_tables or "").replace(chr(39), chr(39)*2)}',
-                owner = '{(body.owner or "").replace(chr(39), chr(39)*2)}',
-                domain = '{(body.domain or "").replace(chr(39), chr(39)*2)}',
-                granularity = '{(body.granularity or "").replace(chr(39), chr(39)*2)}',
+                name = '{sql_str(body.name)}',
+                definition = '{sql_str(body.definition, limit=2000)}',
+                formula_sql = '{sql_str(body.formula_sql, limit=4000)}',
+                source_tables = '{sql_str(body.source_tables)}',
+                owner = '{sql_str(body.owner)}',
+                domain = '{sql_str(body.domain)}',
+                granularity = '{sql_str(body.granularity)}',
                 updated_at = TIMESTAMP '{now}'
             WHEN NOT MATCHED THEN INSERT (kpi_id, name, definition, formula_sql, source_tables, owner, domain, granularity, created_by, created_at, updated_at)
-            VALUES ('{kid}', '{body.name.replace(chr(39), chr(39)*2)}', '{body.definition.replace(chr(39), chr(39)*2)[:2000]}',
-                    '{(body.formula_sql or "").replace(chr(39), chr(39)*2)[:4000]}', '{(body.source_tables or "").replace(chr(39), chr(39)*2)}',
-                    '{(body.owner or "").replace(chr(39), chr(39)*2)}', '{(body.domain or "").replace(chr(39), chr(39)*2)}',
-                    '{(body.granularity or "").replace(chr(39), chr(39)*2)}', 'app', TIMESTAMP '{now}', TIMESTAMP '{now}')
+            VALUES ('{sql_str(kid)}', '{sql_str(body.name)}', '{sql_str(body.definition, limit=2000)}',
+                    '{sql_str(body.formula_sql, limit=4000)}', '{sql_str(body.source_tables)}',
+                    '{sql_str(body.owner)}', '{sql_str(body.domain)}',
+                    '{sql_str(body.granularity)}', '{sql_str(actor)}', TIMESTAMP '{now}', TIMESTAMP '{now}')
         """)
         return {"status": "ok", "kpi_id": kid}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"glossary: upsert_kpi failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save KPI definition")
 
 
 # --- Term-to-asset linking ---
@@ -315,8 +391,10 @@ async def terms_for_table(
 ):
     """Return all glossary terms linked to a specific table."""
     _lazy_ensure()
-    fqn = f"{catalog}.{schema}.{table}"
-    safe_fqn = fqn.replace("'", "''")[:300]
+    # Identifiers are allow-listed (_validate); the assembled FQN still goes through
+    # sql_str so the literal can't be broken out of even if the regex ever loosens.
+    fqn = f"{_validate(catalog, 'catalog')}.{_validate(schema, 'schema')}.{_validate(table, 'table')}"
+    safe_fqn = sql_str(fqn, limit=300)
     try:
         links = await asyncio.to_thread(_execute_sql, f"""
             SELECT l.*, t.name AS term_name, t.definition AS term_definition, t.domain
@@ -326,25 +404,28 @@ async def terms_for_table(
         """)
         return {"links": links}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"glossary: terms_for_table failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load terms for table")
 
 
 @router.post("/link")
 async def link_term(request: Request, body: TermLinkIn):
-    """Link a business term to a table or column."""
+    """Link a business term to a table or column. Open to all app users."""
     _lazy_ensure()
     lid = str(uuid.uuid4())
+    actor = _caller(request)
     now = datetime.now(timezone.utc).isoformat()
     try:
         await asyncio.to_thread(_execute_sql, f"""
             INSERT INTO {LINKS_TABLE} (link_id, term_id, asset_type, asset_fqn, column_name, created_by, created_at)
-            VALUES ('{lid}', '{body.term_id.replace(chr(39), chr(39)*2)}', '{body.asset_type.replace(chr(39), chr(39)*2)}',
-                    '{body.asset_fqn.replace(chr(39), chr(39)*2)}', '{(body.column_name or "").replace(chr(39), chr(39)*2)}',
-                    'app', TIMESTAMP '{now}')
+            VALUES ('{sql_str(lid)}', '{sql_str(body.term_id, limit=100)}', '{sql_str(body.asset_type, limit=50)}',
+                    '{sql_str(body.asset_fqn, limit=300)}', '{sql_str(body.column_name, limit=255)}',
+                    '{sql_str(actor)}', TIMESTAMP '{now}')
         """)
         return {"status": "ok", "link_id": lid}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"glossary: link_term failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to link term to asset")
 
 
 # ===========================================================================
@@ -368,8 +449,8 @@ async def propagate_suggestions(
     on a source table can propagate to every downstream gold table.
     """
     _lazy_ensure()
-    fqn = f"{catalog}.{schema}.{table}"
-    safe_fqn = fqn.replace("'", "''")
+    fqn = f"{_validate(catalog, 'catalog')}.{_validate(schema, 'schema')}.{_validate(table, 'table')}"
+    safe_fqn = sql_str(fqn)
 
     try:
         # 1. Get terms linked to the source table
@@ -396,7 +477,7 @@ async def propagate_suggestions(
                     rows = _execute_sql(f"""
                         SELECT DISTINCT target_table_full_name
                         FROM system.access.table_lineage
-                        WHERE source_table_full_name = '{src.replace(chr(39), chr(39)*2)}'
+                        WHERE source_table_full_name = '{sql_str(src)}'
                           AND event_time > current_timestamp() - INTERVAL 90 DAYS
                         LIMIT 30
                     """)
@@ -416,7 +497,7 @@ async def propagate_suggestions(
         # 3. Find which downstream tables are missing these terms
         suggestions = []
         for tgt_table in sorted(downstream_tables)[:50]:
-            safe_tgt = tgt_table.replace("'", "''")
+            safe_tgt = sql_str(tgt_table)
             existing = _execute_sql(f"""
                 SELECT term_id FROM {LINKS_TABLE}
                 WHERE asset_fqn = '{safe_tgt}' AND asset_type = 'table'
@@ -437,7 +518,8 @@ async def propagate_suggestions(
             "suggestion_count": len(suggestions),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"glossary: propagate_suggestions failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to compute propagation suggestions")
 
 
 @router.get("/lineage-overlay")
@@ -453,7 +535,12 @@ async def lineage_overlay(
     colors, and KPI indicators on lineage graph nodes.
     """
     _lazy_ensure()
-    scope_filter = f"l.asset_fqn LIKE '{catalog}.{schema}.%'" if schema else f"l.asset_fqn LIKE '{catalog}.%'"
+    # These two were interpolated raw — no escaping at all — straight into a LIKE
+    # pattern and, below, into the KPI query. Allow-list them as identifiers and
+    # escape on the way in.
+    cat = sql_str(_validate(catalog, "catalog"))
+    sch = sql_str(_validate(schema, "schema")) if schema else None
+    scope_filter = f"l.asset_fqn LIKE '{cat}.{sch}.%'" if sch else f"l.asset_fqn LIKE '{cat}.%'"
     try:
         rows = await asyncio.to_thread(_execute_sql, f"""
             SELECT l.asset_fqn, l.column_name, l.asset_type,
@@ -491,7 +578,7 @@ async def lineage_overlay(
         kpis = await asyncio.to_thread(_execute_sql, f"""
             SELECT kpi_id, name, formula_sql, source_tables, domain, granularity
             FROM {KPIS_TABLE}
-            WHERE source_tables LIKE '%{catalog}%'
+            WHERE source_tables LIKE '%{cat}%'
             LIMIT 100
         """)
 
@@ -503,4 +590,5 @@ async def lineage_overlay(
             "kpis": kpis,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"glossary: lineage_overlay failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to build glossary overlay")

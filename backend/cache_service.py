@@ -40,6 +40,7 @@ from typing import Any, Optional
 
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
+from backend.validators import sql_str
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,11 @@ WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")
 
 MAX_VALUE_BYTES = 256_000
+# Namespace tags are short labels ('lineage', 'column'), so they are capped
+# before hitting the key column. The cap is passed to sql_str as `limit=`, which
+# truncates BEFORE escaping — slicing an already-escaped string can cut a `\\`
+# or `''` pair in half and re-open the SQL literal.
+NS_MAX_LEN = 100
 
 _DEL = "DELETE"  # avoid inline keyword for code-scanner clarity
 
@@ -129,7 +135,7 @@ class DeltaCacheService:
         try:
             self._ensure_table()
             hk = self._hash(key)
-            ns = namespace.replace("'", "''")[:100]
+            ns = sql_str(namespace, limit=NS_MAX_LEN)
             rows = self._sql(f"""
                 SELECT value_json FROM {CACHE_TABLE}
                 WHERE cache_key = '{hk}'
@@ -163,11 +169,15 @@ class DeltaCacheService:
         try:
             self._ensure_table()
             hk = self._hash(key)
-            ns = namespace.replace("'", "''")[:100]
+            ns = sql_str(namespace, limit=NS_MAX_LEN)
             serialized = json.dumps(value, default=str)
             if len(serialized.encode()) > MAX_VALUE_BYTES:
                 return False
-            safe_val = serialized.replace("'", "''")
+            # Escape via sql_str, not quote-doubling: json.dumps emits `\"` for a
+            # quote inside the payload, and Spark would consume that backslash —
+            # corrupting the JSON on read and, for a leading `\'`, closing the
+            # literal outright.
+            safe_val = sql_str(serialized)
             now = datetime.now(timezone.utc).isoformat()
             self._sql(f"""
                 MERGE INTO {CACHE_TABLE} t
@@ -194,7 +204,7 @@ class DeltaCacheService:
         try:
             self._ensure_table()
             hk = self._hash(key)
-            ns = namespace.replace("'", "''")[:100]
+            ns = sql_str(namespace, limit=NS_MAX_LEN)
             # Mark as expired rather than a hard row removal to preserve Delta CDF history
             self._sql(f"""
                 UPDATE {CACHE_TABLE}
@@ -210,7 +220,7 @@ class DeltaCacheService:
         """Expire all entries in a namespace. Returns count expired."""
         try:
             self._ensure_table()
-            ns = namespace.replace("'", "''")[:100]
+            ns = sql_str(namespace, limit=NS_MAX_LEN)
             rows = self._sql(
                 f"SELECT COUNT(*) AS cnt FROM {CACHE_TABLE}"
                 f" WHERE cache_ns = '{ns}' AND expires_at > current_timestamp()"

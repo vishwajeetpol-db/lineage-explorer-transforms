@@ -26,10 +26,17 @@ class TestTerms:
                 "name": "Revenue", "definition": "Total income"})
         assert resp.status_code in (200, 201)
 
-    def test_delete_term_ok(self, app_client):
+    def test_delete_term_ok(self, admin_client):
+        # DELETE is admin-gated (require_admin) — an anonymous client gets 403.
         with patch("backend.routes.glossary._execute_sql", return_value=[]):
-            resp = app_client.delete("/api/glossary/terms/t1")
+            resp = admin_client.delete("/api/glossary/terms/t1")
         assert resp.status_code in (200, 204)
+
+    def test_delete_term_non_admin_403(self, non_admin_client):
+        with patch("backend.routes.glossary._execute_sql", return_value=[]) as m:
+            resp = non_admin_client.delete("/api/glossary/terms/t1")
+        assert resp.status_code == 403
+        assert not any("DELETE FROM" in c.args[0] for c in m.call_args_list)
 
 
 class TestDomainsAndKpis:

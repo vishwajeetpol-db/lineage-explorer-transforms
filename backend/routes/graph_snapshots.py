@@ -27,6 +27,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client, get_table_lineage
+from backend.validators import _IDENTIFIER_RE, require_admin, sql_str
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,21 @@ def _lazy_ensure():
         _table_ensured = True
 
 
+def _validate_scope(scope: str) -> str:
+    """Constrain a snapshot scope to `catalog` or `catalog.schema`, else HTTP 400.
+
+    Scope is never free text: capture_snapshot below derives it from the request's
+    catalog/schema_name, and auto-capture (capability_closures) uses a bare
+    catalog name. Allow-listing the shape rejects injection payloads outright
+    instead of relying on escaping alone, and keeps the values written by capture
+    in the same language the list filter accepts.
+    """
+    parts = (scope or "").strip().split(".")
+    if len(parts) > 2 or not all(_IDENTIFIER_RE.match(p or "") for p in parts):
+        raise HTTPException(status_code=400, detail=f"Invalid scope: '{(scope or '')[:50]}'")
+    return ".".join(parts)
+
+
 class CaptureRequest(BaseModel):
     catalog: str
     schema_name: Optional[str] = None
@@ -84,9 +100,19 @@ class CaptureRequest(BaseModel):
 
 @router.post("/capture")
 async def capture_snapshot(request: Request, body: CaptureRequest):
-    """Capture current lineage graph as a point-in-time snapshot."""
+    """Capture current lineage graph as a point-in-time snapshot.
+
+    Deliberately NOT admin-gated: capture is wired into the Export & Interop
+    panel for every App user (frontend/src/components/ExportPanel.tsx). Instead
+    of gating it, each row records the real caller in captured_by so an
+    unexpected snapshot is attributable.
+    """
+    scope = _validate_scope(
+        f"{body.catalog}.{body.schema_name}" if body.schema_name else body.catalog
+    )
     _lazy_ensure()
-    scope = f"{body.catalog}.{body.schema_name}" if body.schema_name else body.catalog
+    from backend.main import _get_user_info
+    caller, _ = _get_user_info(request)
 
     try:
         # Fetch current lineage graph
@@ -111,8 +137,10 @@ async def capture_snapshot(request: Request, body: CaptureRequest):
         # Store snapshot
         sid = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
-        label = (body.label or f"Snapshot {now[:10]}").replace("'", "''")[:200]
-        graph_escaped = graph_json.replace("'", "''")
+        label = sql_str(body.label or f"Snapshot {now[:10]}", 200)
+        # No limit: truncating serialized JSON would corrupt it — the 10MB guard
+        # below rejects oversized graphs instead.
+        graph_escaped = sql_str(graph_json)
 
         # Cap graph_json at 10MB to prevent oversized rows
         if len(graph_escaped) > 10_000_000:
@@ -121,8 +149,9 @@ async def capture_snapshot(request: Request, body: CaptureRequest):
         _execute_sql(f"""
             INSERT INTO {SNAPSHOTS_TABLE}
             (snapshot_id, scope, label, captured_at, captured_by, node_count, edge_count, graph_json, metadata)
-            VALUES ('{sid}', '{scope.replace(chr(39), chr(39)*2)}', '{label}',
-                    TIMESTAMP '{now}', 'app', {len(nodes_data)}, {len(edges_data)},
+            VALUES ('{sid}', '{sql_str(scope)}', '{label}',
+                    TIMESTAMP '{now}', '{sql_str(caller or "unknown", 200)}',
+                    {len(nodes_data)}, {len(edges_data)},
                     '{graph_escaped}', '')
         """)
 
@@ -136,7 +165,9 @@ async def capture_snapshot(request: Request, body: CaptureRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Detail stays server-side: the raw text is SQL/SDK error output.
+        logger.error(f"snapshot capture failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to capture snapshot")
 
 
 @router.get("")
@@ -146,8 +177,9 @@ async def list_snapshots(
     limit: int = Query(50, ge=1, le=200),
 ):
     """List available snapshots."""
+    # Validate before _lazy_ensure so a bad filter costs no warehouse round-trip.
+    where = f"WHERE scope = '{sql_str(_validate_scope(scope))}'" if scope else ""
     _lazy_ensure()
-    where = f"WHERE scope = '{scope.replace(chr(39), chr(39)*2)}'" if scope else ""
     try:
         rows = await asyncio.to_thread(
             _execute_sql,
@@ -155,14 +187,15 @@ async def list_snapshots(
         )
         return {"snapshots": rows}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"snapshot list failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list snapshots")
 
 
 @router.get("/{snapshot_id}")
 async def get_snapshot(request: Request, snapshot_id: str):
     """Retrieve a specific snapshot with full graph data."""
     _lazy_ensure()
-    safe_id = snapshot_id.replace("'", "''")[:100]
+    safe_id = sql_str(snapshot_id, 100)
     try:
         rows = await asyncio.to_thread(
             _execute_sql, f"SELECT * FROM {SNAPSHOTS_TABLE} WHERE snapshot_id = '{safe_id}'"
@@ -180,7 +213,8 @@ async def get_snapshot(request: Request, snapshot_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"snapshot fetch failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch snapshot")
 
 
 @router.get("/diff")
@@ -191,8 +225,8 @@ async def diff_snapshots(
 ):
     """Compare two snapshots and return added/removed nodes and edges."""
     _lazy_ensure()
-    safe_a = snapshot_a.replace("'", "''")[:100]
-    safe_b = snapshot_b.replace("'", "''")[:100]
+    safe_a = sql_str(snapshot_a, 100)
+    safe_b = sql_str(snapshot_b, 100)
 
     try:
         rows_a = await asyncio.to_thread(
@@ -227,15 +261,25 @@ async def diff_snapshots(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"snapshot diff failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to diff snapshots")
 
 
 @router.delete("/{snapshot_id}")
 async def delete_snapshot(request: Request, snapshot_id: str):
+    """Delete a snapshot.
+
+    Admin-gated: this is a hard DELETE with no per-user scoping (captured_by is
+    not a filter here), so any caller could otherwise walk GET /api/snapshots and
+    destroy the whole lineage version history. Matches the gate on the sibling
+    write to this table, POST /api/snapshots/auto-capture.
+    """
+    require_admin(request)
     _lazy_ensure()
-    safe_id = snapshot_id.replace("'", "''")[:100]
+    safe_id = sql_str(snapshot_id, 100)
     try:
         await asyncio.to_thread(_execute_sql, f"DELETE FROM {SNAPSHOTS_TABLE} WHERE snapshot_id = '{safe_id}'")
         return {"status": "ok"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"snapshot delete failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete snapshot")

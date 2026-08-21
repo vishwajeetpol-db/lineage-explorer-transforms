@@ -149,8 +149,8 @@ class TestDQRulesPost:
             assert resp.status_code == 400
 
     def test_sql_injection_via_custom_expression(self, admin_client):
-        """A1 BUG: CUSTOM expression field is interpolated into SQL.
-        The `safe` lambda only strips single quotes — does not prevent injection."""
+        """A1 FIX: CUSTOM expressions are checked against an allow-list grammar,
+        so a query keyword is rejected at write time (400)."""
         with patch("backend.routes.dq._execute_sql") as mock_sql:
             mock_sql.return_value = []
             resp = admin_client.post("/api/dq-rules", json={
@@ -160,8 +160,34 @@ class TestDQRulesPost:
                 "expression": "1=1 UNION SELECT * FROM information_schema.tables--",
                 "severity": "ERROR",
             })
-            # Currently 200 (injection passes) — should be 400 after fix
-            assert resp.status_code in (200, 400)
+            assert resp.status_code == 400
+
+    def test_scalar_subquery_expression_rejected(self, admin_client):
+        """A1 FIX: the read-oracle payload. A bare scalar subquery needs no quotes
+        and tripped none of the old deny-list patterns; the allow-list rejects it,
+        so it can never be stored and later executed by /metrics."""
+        with patch("backend.routes.dq._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = admin_client.post("/api/dq-rules", json={
+                "table_fqn": "main.default.orders",
+                "rule_type": "CUSTOM",
+                "expression": "(SELECT count(*) FROM main.hr.payroll WHERE salary > 250000) > 0",
+            })
+            assert resp.status_code == 400
+            assert "SELECT" in resp.json()["detail"]
+
+    def test_legitimate_custom_expression_accepted(self, admin_client):
+        """A1 FIX (other direction): an ordinary rule with string literals and an
+        IN list must still be storable."""
+        with patch("backend.routes.dq._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = admin_client.post("/api/dq-rules", json={
+                "table_fqn": "main.default.orders",
+                "column_name": "amount",
+                "rule_type": "CUSTOM",
+                "expression": "amount > 0 AND status IN ('active','pending')",
+            })
+            assert resp.status_code == 200
 
     def test_sql_injection_via_notes_field(self, admin_client):
         """A1: notes field is also interpolated into INSERT."""
@@ -198,35 +224,61 @@ class TestDQRulesDelete:
             assert data["status"] == "deleted"
 
     def test_delete_sql_injection_in_rule_id(self, admin_client):
-        """A1: rule_id is sanitized by strip quotes+truncate but still interpolated."""
+        """A1 FIX: rule_id is truncated then escaped with sql_str, so the quotes
+        stay inside the literal instead of being silently deleted."""
         with patch("backend.routes.dq._execute_sql") as mock_sql:
             mock_sql.return_value = []
             resp = admin_client.delete("/api/dq-rules/x' OR '1'='1")
-            # Single quotes stripped by safe_id logic, but path still passes
             assert resp.status_code == 200
+            sent = mock_sql.call_args[0][0]
+            assert "'x'' OR ''1''=''1'" in sent
+
+    def test_delete_backslash_quote_rule_id_cannot_close_literal(self, admin_client):
+        r"""A1 FIX: a `\'`-prefixed value. Quote-doubling alone produced `\''`,
+        whose second quote closes the literal on Databricks SQL; sql_str escapes
+        the backslash first so both quotes stay inside."""
+        with patch("backend.routes.dq._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = admin_client.delete("/api/dq-rules/\\' OR 1=1--")
+            assert resp.status_code == 200
+            sent = mock_sql.call_args[0][0]
+            assert "'\\\\'' OR 1=1--'" in sent
+            assert "'\\''" not in sent  # the bypassable form must not appear
 
 
 class TestDQLiveMetrics:
     """GET /api/dq-rules/metrics — execute rules live.
 
     C10: Requires catalog SELECT (breaks metadata-only isolation).
+    A2 FIX: now admin-gated — it executes stored CUSTOM expressions as the app SP.
     """
 
-    def test_requires_table_fqn(self, app_client):
-        resp = app_client.get("/api/dq-rules/metrics")
+    def test_rejects_non_admin(self, non_admin_client):
+        """A2 FIX: executing stored SQL requires admin."""
+        with patch("backend.routes.dq._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = non_admin_client.get("/api/dq-rules/metrics", params={
+                "table_fqn": "main.default.orders"
+            })
+            assert resp.status_code == 403
+            # Gate runs before any SQL — nothing is executed for a non-admin.
+            mock_sql.assert_not_called()
+
+    def test_requires_table_fqn(self, admin_client):
+        resp = admin_client.get("/api/dq-rules/metrics")
         assert resp.status_code == 422
 
-    def test_invalid_table_fqn_rejected(self, app_client):
-        resp = app_client.get("/api/dq-rules/metrics", params={
+    def test_invalid_table_fqn_rejected(self, admin_client):
+        resp = admin_client.get("/api/dq-rules/metrics", params={
             "table_fqn": "bad;injection"
         })
         assert resp.status_code == 400
 
-    def test_valid_request_succeeds(self, app_client):
+    def test_valid_request_succeeds(self, admin_client):
         """C10: Live metrics require SELECT on target table (data access)."""
         with patch("backend.routes.dq._execute_sql") as mock_sql:
             mock_sql.return_value = []
-            resp = app_client.get("/api/dq-rules/metrics", params={
+            resp = admin_client.get("/api/dq-rules/metrics", params={
                 "table_fqn": "main.default.orders"
             })
             assert resp.status_code == 200

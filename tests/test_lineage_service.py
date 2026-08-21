@@ -288,7 +288,12 @@ class TestPublicLineage:
         assert isinstance(out, list) and out[0]["name"] == "id"
 
     def test_resolve_entity_name_delegates(self):
-        with patch("backend.server.entities.resolve_entity",
+        # `_get_client` MUST be patched: resolve_entity_name builds a client before
+        # delegating, so without this the test constructs a real WorkspaceClient,
+        # picks up any ambient ~/.databrickscfg profile, and blocks on the SDK's
+        # ~5-minute host-metadata retry before failing.
+        with patch.object(ls, "_get_client", return_value=MagicMock()), \
+             patch("backend.server.entities.resolve_entity",
                    return_value={"name": "My Job", "deep_link": None}) if _importable_entities() else _noop():
             out = ls.resolve_entity_name("JOB", "123")
         assert isinstance(out, dict)

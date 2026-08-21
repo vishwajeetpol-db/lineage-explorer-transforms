@@ -19,16 +19,18 @@ from __future__ import annotations
 import os
 import uuid
 import json
+import math
 import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
-from backend.validators import _IDENTIFIER_RE, _FULL_NAME_RE, _validate
+from backend.validators import _IDENTIFIER_RE, _FULL_NAME_RE, _validate, require_admin, sql_str
 from backend.circuit_breaker import sql_circuit_breaker
 
 logger = logging.getLogger(__name__)
@@ -209,7 +211,7 @@ async def auto_capture_all_scopes(request: Request):
                     INSERT INTO {SNAPSHOTS_TABLE}
                     (snapshot_id, scope, label, captured_at, captured_by, node_count, edge_count, graph_json, metadata)
                     VALUES ('{sid}', '{cat}', 'Auto {now[:10]}', TIMESTAMP '{now}', 'scheduler',
-                            {len(nodes)}, {len(edges_list)}, '{graph_json.replace(chr(39), chr(39)*2)}', '{{"auto":true}}')
+                            {len(nodes)}, {len(edges_list)}, '{sql_str(graph_json)}', '{{"auto":true}}')
                 """)
                 captured.append({"catalog": cat, "snapshot_id": sid, "nodes": len(nodes), "edges": len(edges_list)})
             except Exception as e:
@@ -271,16 +273,33 @@ async def record_dq_metrics(request: Request, body: dict):
     _ensure_dq_history()
     run_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    fqn = (body.get("table_fqn", "") or "").replace("'", "''")
-    # A1 FIX: Validate table_fqn format
-    if fqn and not _FULL_NAME_RE.match(fqn.replace("''", "'")):
+    raw_fqn = (body.get("table_fqn", "") or "").strip()
+    # A1 FIX: Validate table_fqn format (before escaping, so the regex sees the
+    # value the caller actually sent)
+    if raw_fqn and not _FULL_NAME_RE.match(raw_fqn):
         raise HTTPException(status_code=400, detail="Invalid table_fqn format")
+    fqn = sql_str(raw_fqn)
+    # A1 FIX: coerce the four numeric columns. They are interpolated at UNQUOTED
+    # positions, so without coercion any string in the body — from an admin, but
+    # still — is written straight into the statement as SQL.
+    try:
+        quality_score = float(body.get("quality_score", 0) or 0)
+        rules_evaluated = int(body.get("rules_evaluated", 0) or 0)
+        rules_passed = int(body.get("rules_passed", 0) or 0)
+        rules_failed = int(body.get("rules_failed", 0) or 0)
+        if not math.isfinite(quality_score):
+            raise ValueError("quality_score must be finite")
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="quality_score must be a number and rules_evaluated/passed/failed integers",
+        )
     try:
         await asyncio.to_thread(_execute_sql, f"""
             INSERT INTO {DQ_HISTORY_TABLE} VALUES (
-                '{run_id}', '{fqn}', {body.get('quality_score', 0)},
-                {body.get('rules_evaluated', 0)}, {body.get('rules_passed', 0)}, {body.get('rules_failed', 0)},
-                TIMESTAMP '{now}', '{json.dumps(body.get("details", {})).replace(chr(39), chr(39)*2)[:4000]}')
+                '{run_id}', '{fqn}', {quality_score},
+                {rules_evaluated}, {rules_passed}, {rules_failed},
+                TIMESTAMP '{now}', '{sql_str(json.dumps(body.get("details", {})), limit=4000)}')
         """)
         return {"status": "ok", "run_id": run_id}
     except Exception as e:
@@ -297,7 +316,7 @@ async def dq_trends(request: Request, table_fqn: str = Query(...), days: int = Q
     if not _FULL_NAME_RE.match(table_fqn):
         raise HTTPException(status_code=400, detail="Invalid table_fqn format")
     _ensure_dq_history()
-    safe_fqn = table_fqn.replace(chr(39), chr(39)*2)
+    safe_fqn = sql_str(table_fqn)
     try:
         rows = await asyncio.to_thread(_execute_sql, f"""
             SELECT run_id, quality_score, rules_evaluated, rules_passed, rules_failed, evaluated_at
@@ -374,13 +393,41 @@ class WebhookIn(BaseModel):
     secret: Optional[str] = ""
 
 
+def _redact_url(url: Optional[str]) -> str:
+    """Reduce a webhook URL to scheme://host.
+
+    Slack/Teams-style webhook URLs carry their delivery secret in the PATH
+    (`/services/T000/B000/XXXX`), so returning the full URL leaks a credential.
+    Scheme+host is enough for an admin to recognise which endpoint a row is.
+    """
+    if not url:
+        return ""
+    try:
+        parts = urlparse(url)
+        if parts.scheme and parts.netloc:
+            return f"{parts.scheme}://{parts.netloc}"
+    except Exception:
+        pass
+    return "(redacted)"
+
+
 @router.get("/api/notifications/webhooks")
 async def list_webhooks(request: Request):
-    """List registered webhook endpoints."""
+    """List registered webhook endpoints. Admin-gated.
+
+    A2 FIX: the create/delete peers below both require admin and CHANGELOG.md
+    documents all three as admin-gated, but this read was open — and it returned
+    the raw `url`, i.e. any user could read every webhook's delivery token. The
+    gate is now enforced and `url` is redacted to scheme+host on the way out, so
+    a path-embedded secret never leaves the server at all.
+    """
+    require_admin(request)
     _ensure_webhook_tables()
     try:
         rows = await asyncio.to_thread(_execute_sql,
             f"SELECT webhook_id, name, url, event_types, enabled, created_at FROM {WEBHOOKS_TABLE}")
+        for row in rows:
+            row["url"] = _redact_url(row.get("url"))
         return {"webhooks": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -396,7 +443,7 @@ async def register_webhook(request: Request, body: WebhookIn):
     _ensure_webhook_tables()
     wid = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    safe = lambda s: (s or "").replace("'", "''")[:500]
+    safe = lambda s: sql_str(s, limit=500)
     try:
         await asyncio.to_thread(_execute_sql, f"""
             INSERT INTO {WEBHOOKS_TABLE} VALUES (
@@ -417,7 +464,7 @@ async def delete_webhook(request: Request, webhook_id: str):
         raise HTTPException(status_code=403, detail="Admin required")
     try:
         await asyncio.to_thread(_execute_sql,
-            f"DELETE FROM {WEBHOOKS_TABLE} WHERE webhook_id = '{webhook_id.replace(chr(39), chr(39)*2)[:100]}'")
+            f"DELETE FROM {WEBHOOKS_TABLE} WHERE webhook_id = '{sql_str(webhook_id, limit=100)}'")
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -425,12 +472,18 @@ async def delete_webhook(request: Request, webhook_id: str):
 
 @router.post("/api/notifications/enqueue-delivery")
 async def enqueue_delivery(request: Request):
-    """Queue unread notifications for webhook delivery.
+    """Queue unread notifications for webhook delivery. Admin-gated.
 
     Matches notifications against registered webhooks by event_type,
     creates delivery queue entries. A separate Databricks job polls the
     queue and performs the actual HTTP POST delivery (decoupled for security).
+
+    A2 FIX: this is a write that causes outbound HTTP from the delivery job, and
+    it was the only ungated mutation among the webhook endpoints (register and
+    delete both require admin) — an anonymous caller could flood every registered
+    endpoint with notification traffic.
     """
+    require_admin(request)
     _ensure_webhook_tables()
     NOTIF_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.notifications"
     try:
@@ -450,15 +503,15 @@ async def enqueue_delivery(request: Request):
             for n in notifications:
                 if "*" not in types and n.get("notif_type", "") not in types:
                     continue
-                payload = json.dumps({
+                payload = sql_str(json.dumps({
                     "type": n.get("notif_type"), "severity": n.get("severity"),
                     "title": n.get("title"), "detail": n.get("detail"),
                     "table_fqn": n.get("table_fqn"), "detected_at": str(n.get("detected_at", "")),
-                }).replace("'", "''")[:4000]
+                }), limit=4000)
                 did = str(uuid.uuid4())
                 _execute_sql(f"""
                     INSERT INTO {DELIVERY_QUEUE_TABLE} VALUES (
-                        '{did}', '{wh_id}', '{url.replace(chr(39), chr(39)*2)}',
+                        '{did}', '{sql_str(wh_id)}', '{sql_str(url)}',
                         '{payload}', 'pending', TIMESTAMP '{now}', NULL)
                 """)
                 queued += 1
