@@ -195,10 +195,27 @@ class FreshnessInfo(BaseModel):
     is_stale: bool = True
 
 
+# Canonical vocabulary for "why is there no (or only partial) transformation
+# lineage". ONE list shared by every producer of a reason_code — producer_source
+# (source/LLM failures), framework_analysis (deep-analysis failures) and
+# TransformDiagnosis (build-time diagnosis) — so the UI's reason → label mapping
+# stays exhaustive instead of silently falling through for a newly added code.
+# Mirrored by `TransformReasonCode` in frontend/src/api/client.ts; keep in sync.
+TransformReasonCode = Literal[
+    # producer source / LLM analysis
+    "access_denied", "entity_missing", "no_source", "no_columns",
+    "llm_error", "llm_not_configured",
+    # deep metadata-driven-framework analysis
+    "config_empty", "detect_failed",
+    # build-time diagnosis
+    "no_producer", "producer_outside_window", "producer_unresolved", "unknown",
+]
+
+
 class TransformDiagnosis(BaseModel):
     """Why a table has no transformation lineage — shown instead of a generic
     "not generated yet" so a no-op build is self-explanatory."""
-    reason_code: str = "unknown"          # no_producer | producer_outside_window | producer_unresolved | unknown
+    reason_code: TransformReasonCode = "unknown"
     title: str = ""
     detail: str = ""
     last_produced_at: Optional[str] = None

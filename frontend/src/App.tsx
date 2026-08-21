@@ -145,6 +145,10 @@ export default function App() {
       useLineageStore.getState().setLineageData({
         nodes: data.nodes,
         edges: data.edges,
+        // Precise (source_table → target_table) pairs. Without forwarding these the
+        // store resets tableEdges to [], and business "Data only" falls back to
+        // cross-producting each entity's inputs × outputs — the dense mesh.
+        tableEdges: data.table_edges ?? [],
         cached: data.cached,
         cachedAt: data.cached_at,
         cacheExpiresAt: data.cache_expires_at,

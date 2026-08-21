@@ -403,6 +403,19 @@ export interface CrossSourceCompare {
   error?: string;
 }
 
+/** Canonical vocabulary for "why is there no (or only partial) transformation
+ *  lineage", shared by every carrier of a reason_code so the panel's
+ *  reason → label mapping is exhaustive rather than silently falling through.
+ *  Mirrors `TransformReasonCode` in backend/models.py — keep the two in sync. */
+export type TransformReasonCode =
+  // producer source / LLM analysis
+  | "access_denied" | "entity_missing" | "no_source" | "no_columns"
+  | "llm_error" | "llm_not_configured"
+  // deep metadata-driven-framework analysis
+  | "config_empty" | "detect_failed"
+  // build-time diagnosis
+  | "no_producer" | "producer_outside_window" | "producer_unresolved" | "unknown";
+
 // Multi-producer comparison: a per-column matrix across N producers of one table.
 export interface ProducerCompareCell {
   producer: string;              // "JOB:123" key matching producers[].key
@@ -442,7 +455,7 @@ export interface ColumnTransformResult {
   cdc_spec?: { keys?: unknown; sequence_by?: string; scd_type?: unknown; source?: string; version?: number };
   detail?: string | null;
   // Actionable failure metadata (present when producer source couldn't be read).
-  reason_code?: "access_denied" | "entity_missing" | "no_source" | "no_columns" | "llm_error" | "llm_not_configured" | null;
+  reason_code?: TransformReasonCode | null;
   denied_paths?: string[] | null;
   app_service_principal?: string | null;
 }
@@ -463,10 +476,16 @@ export interface DeepAnalyzeResultEvent {
   version?: number | null;
   detail?: string;
   derived_via?: string;
+  // Every config table the detection identified (not just the usable ones), so a
+  // failure branch and a success branch report the same set.
   config_tables?: string[];
+  // Subsets of config_tables that couldn't contribute — distinct causes needing
+  // distinct fixes (re-run the pipeline vs. grant SELECT).
+  empty_config_tables?: string[];
+  unreadable_config_tables?: string[];
   // Set on a non-derived result to explain why (e.g. "config_empty" when the
   // framework's config table has no rows to derive from right now).
-  reason_code?: string | null;
+  reason_code?: TransformReasonCode | null;
 }
 export interface DeepAnalyzeErrorEvent { type: "error"; message: string }
 export type DeepAnalyzeEvent = DeepAnalyzeStep | DeepAnalyzeResultEvent | DeepAnalyzeErrorEvent;
