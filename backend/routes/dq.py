@@ -64,6 +64,34 @@ def _validate(value: str, name: str) -> str:
     return v
 
 
+def _validate_column_name(value: str) -> str:
+    """Validate a column name destined for a BACK-QUOTED SQL identifier.
+
+    Deliberately NOT _validate/_IDENTIFIER_RE. Unity Catalog permits hyphens,
+    spaces, dots and unicode in column names — which is precisely why the query
+    builder back-quotes them — so screening against the bare-identifier regex
+    refused real columns like `Order Date` or `my-col`, and marked existing rules
+    on those columns permanently invalid.
+
+    Inside a back-quoted identifier the only character that can end the quoting,
+    and therefore the only one that can reach a code position, is the backtick
+    itself. That is the actual security boundary, so that is what is rejected —
+    together with control characters, for log and SQL hygiene. Everything else is
+    inert once quoted.
+    """
+    v = (value or "").strip()
+    if not v or len(v) > 255:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid column_name: '{str(value)[:50]}'"
+        )
+    if "`" in v or any(ord(c) < 32 or ord(c) == 127 for c in v):
+        raise HTTPException(
+            status_code=400,
+            detail="column_name may not contain a backtick or control characters",
+        )
+    return v
+
+
 def _execute_sql(sql: str) -> list[dict]:
     """C8 FIX: Circuit breaker protects against warehouse timeout cascades."""
     if not WAREHOUSE_ID:
@@ -181,7 +209,7 @@ async def upsert_dq_rule(request: Request, rule: DQRuleIn):
     # so it needs allow-listing, not escaping. Validated here so a bad value is
     # rejected at write time rather than becoming an un-evaluatable stored rule.
     if rule.column_name:
-        _validate(rule.column_name, "column_name")
+        _validate_column_name(rule.column_name)
     # A1 FIX: Validate expression at write time to prevent stored injection
     _validate_expression(rule.expression, rule.rule_type)
     # A1 FIX: escape with the shared sql_str instead of stripping quotes. Quote
@@ -717,10 +745,8 @@ def _build_check_sql(table_fqn: str, column: str, rule_type: str, expression: st
     the injected duplicate alias win. Validating at read time too covers rules
     written before the write-time check existed.
     """
-    if column and not _IDENTIFIER_RE.match(column):
-        raise HTTPException(
-            status_code=400, detail=f"Invalid column_name: '{str(column)[:50]}'"
-        )
+    if column:
+        _validate_column_name(column)
     safe_col = f"`{column}`" if column else "*"
     safe_tbl = table_fqn  # Already validated via _FULL_NAME_RE
 

@@ -590,6 +590,56 @@ class TestBuildCheckSql:
         import backend.routes.dq as d
         assert d._build_check_sql("c.s.t", "col", "OTHER", "", 100) is None
 
+    @pytest.mark.parametrize(
+        "col",
+        [
+            "normal_col",
+            "my-col",         # UC allows hyphens
+            "my col",         # …and spaces
+            "Order Date",     # a real-world column name
+            "col.with.dot",
+            "café_id",        # …and unicode
+        ],
+    )
+    def test_backquoted_column_accepts_every_name_uc_allows(self, col):
+        """The column reaches a code position as a BACK-QUOTED identifier, so
+        anything UC permits is inert once quoted.
+
+        Screening it with the bare-identifier regex (no hyphens, no spaces) broke
+        real tables: writes 400'd and existing rules on such columns were marked
+        permanently invalid, silently dropping the check.
+        """
+        import backend.routes.dq as d
+        sql = d._build_check_sql("c.s.t", col, "NOT_NULL", "", 100)
+        assert f"`{col}`" in sql
+
+    @pytest.mark.parametrize(
+        "col",
+        [
+            # the projection-rewrite payload: a backtick closes the identifier
+            "x`) THEN 1 ELSE 0 END) AS passing_rows, "
+            "(SELECT count(*) FROM main.hr.payroll) AS leak FROM (SELECT * FROM c.s.t LIMIT 1) -- ",
+            "a`b",            # any embedded backtick
+            "a\nb",           # control characters
+            "a" * 256,        # over length
+        ],
+    )
+    def test_backquoted_column_rejects_break_out(self, col):
+        """A backtick is the ONLY character that can end the quoting, so it is the
+        one that must be refused."""
+        import backend.routes.dq as d
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc:
+            d._build_check_sql("c.s.t", col, "NOT_NULL", "", 100)
+        assert exc.value.status_code == 400
+
+    def test_no_column_means_star_not_a_validation_error(self):
+        """A table-scoped CUSTOM rule has no column; that is not an error."""
+        import backend.routes.dq as d
+        assert d._build_check_sql("c.s.t", "", "NOT_NULL", "", 100) is None
+        sql = d._build_check_sql("c.s.t", "", "CUSTOM", "amount > 0", 100)
+        assert "SELECT * FROM c.s.t" in sql
+
 
 class TestScoreToGrade:
     @pytest.mark.parametrize(
