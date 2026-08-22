@@ -24,6 +24,27 @@ os.environ.setdefault("ADMIN_GROUP_NAME", "admins")
 # Ensure LOCAL_DEV_ADMIN_EMAIL is NOT set by default (A14 security)
 os.environ.pop("LOCAL_DEV_ADMIN_EMAIL", None)
 
+# Point the Databricks SDK at a dead loopback address, and away from any real
+# ~/.databrickscfg, so an UNMOCKED warehouse call fails fast instead of reaching a
+# live workspace.
+#
+# DATABRICKS_WAREHOUSE_ID above is fake but TRUTHY, so every `if not WAREHOUSE_ID:`
+# guard passes and execution continues to `_get_client()`. With no host in the env
+# the SDK fell back to the developer's ~/.databrickscfg — so any code path whose SQL
+# helper wasn't patched issued a real API call against the developer's own
+# workspace. On a machine with credentials that call blocks on connect/retry, which
+# is why several test files hung indefinitely mid-suite (test_routes_impact,
+# test_routes_scalability, test_coverage_topups): each mocks the SQL helper its
+# route calls directly, but the capability-cache layer added later has its own
+# helper that stayed unmocked. On a credential-less CI box the same tests "passed"
+# only because the call failed immediately.
+#
+# setdefault, so an integration run that exports real credentials is unaffected.
+os.environ.setdefault("DATABRICKS_HOST", "http://127.0.0.1:1")
+os.environ.setdefault("DATABRICKS_TOKEN", "not-a-real-token")
+os.environ.setdefault("DATABRICKS_AUTH_TYPE", "pat")
+os.environ.setdefault("DATABRICKS_CONFIG_FILE", "/dev/null")
+
 
 @pytest.fixture(autouse=True)
 def _reset_global_state():
@@ -75,6 +96,37 @@ def _reset_global_state():
     _reset()   # before the test
     yield
     _reset()   # and after
+
+
+@pytest.fixture(autouse=True)
+def _never_build_a_real_workspace_client():
+    """Safety net: no unit test may construct a real WorkspaceClient.
+
+    The client fixtures below patch `backend.lineage_service._get_client`, but
+    several modules bind that function BY VALUE at import time —
+    `from backend.lineage_service import _get_client`, e.g.
+    backend/server/capability_cache.py:35 — so the patched attribute on the
+    lineage_service module is never consulted by them. Those callers built a REAL
+    client, which resolves OAuth host metadata over the network and retries with
+    backoff (`databricks/sdk/clock.py: sleep`).
+
+    That is what hung the suite mid-run: `GET /api/impact` and friends go through
+    capability_cache.serve_or_compute, whose `_sql` helper is not the one the test
+    mocked, so the request left the process. On a developer machine with a
+    ~/.databrickscfg it blocked indefinitely against the real workspace; on a
+    credential-less box the same tests "passed" only because the call failed fast.
+
+    Patching the CLASS that _get_client instantiates covers every caller whatever
+    its import style, and clearing the module singleton keeps a real client from an
+    earlier test out of later ones. Tests that want to assert on the client keep
+    using mock_workspace_client / the *_client fixtures; this only removes the
+    ability to reach the network.
+    """
+    import backend.lineage_service as ls
+    ls._client_instance = None
+    with patch.object(ls, "WorkspaceClient", MagicMock()):
+        yield
+    ls._client_instance = None
 
 
 @pytest.fixture

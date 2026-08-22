@@ -181,20 +181,46 @@ class TestSecondOrderInjection:
     executes them, the stored payload fires.
     """
 
-    def test_stored_expression_executes_on_metrics(self, app_client):
-        """Stored CUSTOM expression is executed verbatim against table."""
+    def test_metrics_is_admin_gated(self, app_client):
+        """/api/dq-rules/metrics executes stored expressions as the app service
+        principal, so it is admin-gated. `app_client` is anonymous/non-admin."""
         with patch("backend.routes.dq._execute_sql") as mock_sql:
-            # Simulate stored malicious rule in DQ table
-            mock_sql.side_effect = [
-                [],  # _ensure_dq_table
-                [{"rule_id": "evil", "table_fqn": "main.default.orders",
-                  "column_name": "id", "rule_type": "CUSTOM",
-                  "expression": "1=1) UNION SELECT secret FROM credentials WHERE (1=1",
-                  "severity": "ERROR"}],  # SELECT rules
-                [{"total": "100", "violations": "100"}],  # Execute rule (injection fires)
-            ]
+            mock_sql.return_value = []
             resp = app_client.get("/api/dq-rules/metrics", params={
                 "table_fqn": "main.default.orders"
             })
-            # The endpoint executes the stored expression as SQL
-            assert resp.status_code in (200, 500)
+            assert resp.status_code == 403
+
+    def test_stored_expression_is_validated_before_execution(self, admin_client):
+        """A stored CUSTOM expression is re-validated at READ time and a payload
+        is never executed.
+
+        This test previously asserted the opposite — that the endpoint "executes
+        the stored expression as SQL" (`status_code in (200, 500)`) — which was
+        both stale (the endpoint became admin-gated, so an anonymous client got
+        403) and, once the grammar was fixed, wrong about the security property.
+        A rule stored before the allow-list existed is now marked `invalid` and
+        skipped, so second-order injection has no execution path.
+        """
+        payload = "1=1) UNION SELECT secret FROM credentials WHERE (1=1"
+        with patch("backend.routes.dq._execute_sql") as mock_sql:
+            mock_sql.side_effect = [
+                [],                                   # SELECT 1 … LIMIT 0 preflight
+                [],                                   # _ensure_dq_table
+                [{"rule_id": "evil", "table_fqn": "main.default.orders",
+                  "column_name": "id", "rule_type": "CUSTOM",
+                  "expression": payload, "severity": "ERROR"}],  # SELECT * rules
+            ]
+            resp = admin_client.get("/api/dq-rules/metrics", params={
+                "table_fqn": "main.default.orders"
+            })
+        assert resp.status_code == 200
+        body = resp.json()
+        # the rule is reported as unusable, not silently dropped …
+        assert [m["status"] for m in body["metrics"]] == ["invalid"]
+        assert body["coverage_complete"] is False
+        assert body["quality_grade"] is None
+        # … and the payload never reached the warehouse
+        issued = " ".join(str(c[0][0]) for c in mock_sql.call_args_list)
+        assert "UNION SELECT secret" not in issued
+        assert "credentials" not in issued

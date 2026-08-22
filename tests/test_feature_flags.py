@@ -23,25 +23,41 @@ class TestGetFlagState:
         result = get_flag_state("nonexistent.flag_id")
         assert result is False
 
+    # NOTE on the two tests below: both need the module reloaded so it re-reads
+    # its env kill switch at import time, but `importlib.reload` re-executes the
+    # module body and rebinds its own `_execute_sql` — which DISCARDS the
+    # mock_feature_flags_sql fixture's patch. Any code path that then reaches SQL
+    # calls the real warehouse client and blocks for the full poll timeout, which
+    # is why these must re-patch the reloaded module explicitly.
+
     def test_env_kill_switch_overrides_db(self, mock_feature_flags_sql):
         """When env kill switch is 'false', flag is disabled regardless of DB."""
-        mock_feature_flags_sql.return_value = [{"enabled": "true"}]
         with patch.dict(os.environ, {"ENABLE_PLAN_CAPTURE": "false"}):
             import importlib
             import backend.feature_flags as ff
             importlib.reload(ff)
-            result = ff.get_flag_state("lineage_tracking.plan_capture")
-            assert result is False
+            with patch.object(ff, "_execute_sql", return_value=[{"enabled": "true"}]):
+                assert ff.get_flag_state("lineage_tracking.plan_capture") is False
 
     def test_flag_enabled_when_db_says_true(self, mock_feature_flags_sql):
-        """Flag returns True when DB row says enabled and no kill switch."""
-        mock_feature_flags_sql.return_value = [{"enabled": "true"}]
+        """Flag returns True when the DB row says enabled and no kill switch.
+
+        This test used to hang the entire suite: it reloaded the module (dropping
+        the fixture's patch) and then took the DB path, so `get_flag_state` issued
+        a real `execute_statement` against a warehouse that isn't there. Its
+        assertion — `result is True or result is False` — also accepted any bool,
+        so it verified nothing even when it did complete.
+        """
         with patch.dict(os.environ, {"ENABLE_PLAN_CAPTURE": "true"}):
             import importlib
             import backend.feature_flags as ff
             importlib.reload(ff)
-            result = ff.get_flag_state("lineage_tracking.plan_capture")
-            assert result is True or result is False  # depends on _execute_sql path
+            # _persisted_states() reads flag_id + enabled off each row, so the row
+            # has to carry both — a row of just {"enabled": ...} raises KeyError
+            # inside the loader and degrades to "all flags disabled".
+            rows = [{"flag_id": "lineage_tracking.plan_capture", "enabled": True}]
+            with patch.object(ff, "_execute_sql", return_value=rows):
+                assert ff.get_flag_state("lineage_tracking.plan_capture") is True
 
 
 class TestListFlags:
