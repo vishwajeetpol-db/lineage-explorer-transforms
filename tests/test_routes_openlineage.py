@@ -38,10 +38,16 @@ class TestOpenLineageImport:
 
 
 class TestProducer:
-    def test_get_producer_config_ok(self, app_client):
+    def test_get_producer_config_ok(self, admin_client):
+        # Admin-gated: endpoint_url can carry a credential in its query string.
+        with patch("backend.routes.openlineage._execute_sql", return_value=[]):
+            resp = admin_client.get("/api/openlineage/producer/config")
+        assert resp.status_code == 200
+
+    def test_get_producer_config_rejects_non_admin(self, app_client):
         with patch("backend.routes.openlineage._execute_sql", return_value=[]):
             resp = app_client.get("/api/openlineage/producer/config")
-        assert resp.status_code == 200
+        assert resp.status_code == 403
 
     def test_configure_producer(self, admin_client):
         with patch("backend.routes.openlineage._execute_sql", return_value=[]):

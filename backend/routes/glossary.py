@@ -130,6 +130,57 @@ def _uuid_or_new(value: Optional[str], name: str) -> str:
         raise HTTPException(status_code=400, detail=f"Invalid {name}: must be a UUID")
 
 
+def _like_escape(s: str) -> str:
+    """Escape LIKE pattern metacharacters, for values used inside a LIKE pattern.
+
+    A LIKE pattern is a SECOND escape layer on top of the SQL literal, and
+    sql_str only handles the literal. Feeding its output straight into
+    `LIKE '%…%'` was therefore wrong in both directions:
+
+      * `C:\\data` became the literal `%c:\\data%`, whose `\\d` is an escape
+        character in the middle of a pattern — Spark raises
+        INVALID_FORMAT.ESC_IN_THE_MIDDLE, which the handler's generic except
+        turned into an undiagnosable 500. Before the escaping change, plain
+        quote-doubling left the backslash to be swallowed and search worked.
+      * `%` and `_` were left unescaped, so they silently acted as wildcards.
+
+    Escape for the pattern layer FIRST; sql_str then escapes for the literal
+    layer, and the two unwind in the right order. discovery.py:62 already does
+    this for `%` — same reason.
+    """
+    return (s or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _is_admin(request: Request) -> bool:
+    """Non-raising admin probe, for deciding whether to return attribution
+    columns. Use require_admin() when the whole endpoint should be gated."""
+    from backend.main import _get_user_info
+    try:
+        return bool(_get_user_info(request)[1])
+    except Exception:
+        return False
+
+
+# Columns that hold a real workspace email purely for audit purposes. They are
+# not product data — nothing in the UI renders them — so they are withheld from
+# non-admins. Without this, capture recording the true caller (right) turned four
+# ungated SELECT * reads into a directory of every editor's email (wrong).
+# NOTE: `owner` is deliberately NOT here. It is a user-typed business field shown
+# in GlossaryPanel.tsx; the leak via `owner` is fixed at the write end instead, by
+# no longer defaulting it to the caller's address.
+_ATTRIBUTION_COLS = ("created_by", "updated_by")
+
+
+def _strip_attribution(rows: list[dict], request: Request) -> list[dict]:
+    """Drop audit-only attribution columns unless the caller is an admin."""
+    if _is_admin(request):
+        return rows
+    return [
+        {k: v for k, v in row.items() if k not in _ATTRIBUTION_COLS}
+        for row in rows
+    ]
+
+
 def _caller(request: Request) -> str:
     """Return the requesting user's email for the row's attribution columns.
 
@@ -195,7 +246,8 @@ async def list_terms(
     # the literal and let the rest of it execute as SQL.
     conditions = ["1=1"]
     if q:
-        safe_q = sql_str(q, limit=100).lower()
+        # Pattern layer first (see _like_escape), then the literal layer.
+        safe_q = sql_str(_like_escape(q[:100]).lower())
         conditions.append(f"(lower(name) LIKE '%{safe_q}%' OR lower(definition) LIKE '%{safe_q}%')")
     if domain:
         conditions.append(f"domain = '{sql_str(domain, limit=100)}'")
@@ -211,6 +263,7 @@ async def list_terms(
         rows = await asyncio.to_thread(
             _execute_sql, f"SELECT * FROM {TERMS_TABLE} WHERE {where} ORDER BY name LIMIT {limit}"
         )
+        rows = _strip_attribution(rows, request)
         return {"terms": rows, "count": len(rows)}
     except Exception as e:
         logger.error(f"glossary: list_terms failed: {e}")
@@ -231,7 +284,10 @@ async def get_term(request: Request, term_id: str):
         links = await asyncio.to_thread(
             _execute_sql, f"SELECT * FROM {LINKS_TABLE} WHERE term_id = '{safe_id}'"
         )
-        return {"term": terms[0], "links": links}
+        return {
+            "term": _strip_attribution(terms, request)[0],
+            "links": _strip_attribution(links, request),
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -313,9 +369,14 @@ async def upsert_domain(request: Request, body: DomainIn):
     """Create or update a data domain. Open to all app users, like upsert_term."""
     _lazy_ensure()
     did = _uuid_or_new(body.domain_id, "domain_id")
-    # glossary_domains has no created_by column, so `owner` is the only attribution
-    # this row can carry — fall back to the caller when the body leaves it blank.
-    owner = body.owner or _caller(request)
+    # `owner` is a user-typed business field (GlossaryPanel.tsx renders it), NOT an
+    # attribution column, and this endpoint is open to every app user. Defaulting
+    # it to _caller(request) therefore did two unwanted things: it wrote a real
+    # workspace email into a field the ungated GET /domains hands to everyone, and
+    # it made a blank owner read as a positive claim of ownership rather than as
+    # "unknown". glossary_domains has no created_by column to record the editor in,
+    # so the honest value when the body omits one is empty.
+    owner = body.owner or ""
     now = datetime.now(timezone.utc).isoformat()
     try:
         await asyncio.to_thread(_execute_sql, f"""
@@ -323,7 +384,16 @@ async def upsert_domain(request: Request, body: DomainIn):
             WHEN MATCHED THEN UPDATE SET
                 name = '{sql_str(body.name)}',
                 description = '{sql_str(body.description, limit=1000)}',
-                owner = '{sql_str(owner)}',
+                -- Never overwrite an existing owner. The MERGE key is a
+                -- caller-supplied UUID and GET /domains hands out every
+                -- domain_id, so an unconditional assignment let any user re-POST
+                -- someone else's domain and take it over — a Delta overwrite that
+                -- leaves no trace of the previous owner in the row. Filling in a
+                -- blank owner is still allowed; changing a set one is not.
+                owner = CASE
+                    WHEN t.owner IS NULL OR t.owner = '' THEN '{sql_str(owner)}'
+                    ELSE t.owner
+                END,
                 color = '{sql_str(body.color or "#6366f1")}',
                 updated_at = TIMESTAMP '{now}'
             WHEN NOT MATCHED THEN INSERT (domain_id, name, description, owner, color, created_at, updated_at)

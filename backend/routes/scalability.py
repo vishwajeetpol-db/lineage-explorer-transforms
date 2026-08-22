@@ -34,7 +34,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from databricks.sdk.service.sql import StatementState
-from backend.lineage_service import _get_client
+from backend.lineage_service import _get_client, LINEAGE_WINDOW_DAYS
 from backend.cache_service import get_cache_service
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,10 @@ router = APIRouter(prefix="/api/scalability", tags=["scalability"])
 
 WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")
-LINEAGE_LOOKBACK_DAYS = int(os.environ.get("LINEAGE_WINDOW_DAYS", "90"))
+# Single source of truth: lineage_service owns this window (default 365).
+# Re-reading LINEAGE_WINDOW_DAYS with a local default of 90 made scalability probes
+# disagree with the graph whenever the env var was unset.
+LINEAGE_LOOKBACK_DAYS = LINEAGE_WINDOW_DAYS
 
 _IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_]{1,255}$")
 

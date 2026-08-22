@@ -208,14 +208,23 @@ class TestDelete:
         assert resp.status_code == 403
 
     def test_admin_ok(self, admin_client, mock_sql):
+        # The handler confirms the row exists before reporting success.
+        mock_sql.return_value = [{"1": 1}]
         resp = admin_client.delete("/api/dq-rules/r1")
         assert resp.status_code == 200
         assert resp.json()["status"] == "deleted"
+
+    def test_missing_rule_404(self, admin_client, mock_sql):
+        mock_sql.return_value = []
+        resp = admin_client.delete("/api/dq-rules/r1")
+        assert resp.status_code == 404
 
     def test_error_500(self, admin_client, mock_sql):
         mock_sql.side_effect = RuntimeError("boom")
         resp = admin_client.delete("/api/dq-rules/r1")
         assert resp.status_code == 500
+        # the warehouse message must not reach the client
+        assert "boom" not in resp.text
 
 
 class TestMetrics:
@@ -487,16 +496,41 @@ class TestValidateExpression:
         assert d._validate_expression(expr, "CUSTOM") == expr
 
     def test_regex_rule_keeps_regex_syntax(self):
-        """REGEX expressions land inside a quoted literal, so they only face the
-        keyword/comment floor — real regex metacharacters must survive."""
+        """REGEX expressions land inside a quoted literal, so real regex
+        metacharacters must survive."""
         import backend.routes.dq as d
         assert d._validate_expression(r"^[0-9]{3}-[0-9]{4}$", "REGEX") == r"^[0-9]{3}-[0-9]{4}$"
 
-    def test_regex_rule_still_rejects_keywords(self):
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "^.*/v1/.*$",            # `*/` — a block-comment token
+            "^[0-9]{4}--[0-9]{2}$",  # `--` — a line-comment token
+            "^(select|update)$",     # bare SQL words
+            r"\d{3}-\d{4}",          # backslash classes
+        ],
+    )
+    def test_regex_metacharacters_are_not_keyword_screened(self, expr):
+        """These are all legitimate patterns that the old keyword/comment screen
+        rejected. At a literal position the escaping is the control, so screening
+        keywords on top only broke real regexes — see
+        test_regex_payload_is_neutralised_by_escaping for the property that
+        actually holds."""
         import backend.routes.dq as d
-        from fastapi import HTTPException
-        with pytest.raises(HTTPException):
-            d._validate_expression("x' UNION SELECT 1 --", "REGEX")
+        assert d._validate_expression(expr, "REGEX") == expr
+
+    def test_regex_payload_is_neutralised_by_escaping(self):
+        """The former keyword screen rejected this outright. It is now accepted
+        and rendered inert instead: sql_str escapes it into the RLIKE literal, so
+        no part of it can reach a code position. This is the same guarantee
+        TestBuildCheckSql.test_regex_literal_is_escaped pins for `\\'`."""
+        import backend.routes.dq as d
+        payload = "x' UNION SELECT 1 --"
+        assert d._validate_expression(payload, "REGEX") == payload
+        sql = d._build_check_sql("c.s.t", "col", "REGEX", payload, 100)
+        # the quote is doubled, so UNION SELECT stays inside the literal
+        assert "RLIKE 'x'' UNION SELECT 1 --'" in sql
+        assert "RLIKE 'x' UNION" not in sql
 
 
 class TestBuildCheckSql:

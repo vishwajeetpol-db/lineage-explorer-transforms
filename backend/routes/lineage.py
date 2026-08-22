@@ -20,7 +20,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from databricks.sdk.service.sql import StatementState
-from backend.lineage_service import _get_client
+from backend.lineage_service import _get_client, LINEAGE_WINDOW_DAYS
 from backend.server.entities import resolve_entity, resolve_entities
 from backend.server.producer_source import (
     analyze_producer,
@@ -45,7 +45,19 @@ analyze_router = APIRouter(tags=["lineage-ext"])
 
 WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")
-LINEAGE_LOOKBACK_DAYS = int(os.environ.get("LINEAGE_WINDOW_DAYS", "90"))
+# Import the window rather than re-reading the env var: this module used to
+# default to 90 while lineage_service (which BUILDS the graph) defaults to 365,
+# off the SAME variable. With the var unset — which happens in local runs and,
+# per this repo's deploy notes, after `databricks apps start` wipes the runtime
+# env — the graph would render a producer whose last write was 120 days ago, offer
+# Analyze on it, and then _assert_producer_of would 403 the click. Invisible from
+# an admin account, because the check is skipped for admins.
+#
+# A single import makes the guard's window equal to the graph's by construction.
+LINEAGE_LOOKBACK_DAYS = LINEAGE_WINDOW_DAYS
+
+# Ceiling on the multi-producer comparison fan-out (guard round-trips + LLM calls).
+_MAX_COMPARE_PRODUCERS = 10
 
 _IDENTIFIER_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{1,255}$")  # canonical: backend/validators.py
 _FULL_NAME_RE = __import__("re").compile(r"^[A-Za-z0-9_]{1,255}\.[A-Za-z0-9_]{1,255}\.[A-Za-z0-9_]{1,255}$")
@@ -83,7 +95,11 @@ def _assert_producer_of(entity_type: str, entity_id: str, target_table: str) -> 
             f"WHERE target_table_full_name = '{sql_str(target_table)}' "
             f"  AND upper(entity_type) = '{sql_str(et)}' "
             f"  AND entity_id = '{sql_str(eid)}' "
-            f"  AND event_time >= dateadd(DAY, -{LINEAGE_LOOKBACK_DAYS}, current_timestamp()) "
+            # Same predicate FORM as the graph query (lineage_service.py:1106).
+            # `dateadd(DAY,-N,current_timestamp())` is up to 24h narrower than
+            # `current_date() - INTERVAL N DAYS`, so at the window edge the guard
+            # could reject an edge the graph had just drawn.
+            f"  AND event_time > current_date() - INTERVAL {LINEAGE_LOOKBACK_DAYS} DAYS "
             f"LIMIT 1"
         )
     except Exception as e:
@@ -94,6 +110,49 @@ def _assert_producer_of(entity_type: str, entity_id: str, target_table: str) -> 
                    "The app needs SELECT on system.access.table_lineage.",
         )
     if not rows:
+        raise HTTPException(
+            status_code=403,
+            detail=f"{et} {eid} is not a recorded producer of {target_table} "
+                   f"within the last {LINEAGE_LOOKBACK_DAYS} days.",
+        )
+
+
+def _assert_producers_of(pairs: list[dict], target_table: str) -> None:
+    """Batch form of _assert_producer_of: ONE query answers N producers.
+
+    Called in a loop, the single-pair version made the authorization check its own
+    amplification primitive — each call is a synchronous warehouse round-trip, and
+    the only bound on the caller-supplied producer list was "at least 2", so a
+    request with 500 producers triggered 500 sequential blocking queries.
+
+    Fails CLOSED, exactly like the single-pair version: a lookup error refuses.
+    """
+    if not pairs:
+        return
+    want = {((p.get("entity_type") or "").strip().upper(),
+             (p.get("entity_id") or "").strip()) for p in pairs}
+    type_list = ", ".join(sorted({f"'{sql_str(t)}'" for t, _ in want}))
+    id_list = ", ".join(sorted({f"'{sql_str(i)}'" for _, i in want}))
+    try:
+        rows = _execute_sql(
+            f"SELECT DISTINCT upper(entity_type) AS et, entity_id AS eid "
+            f"FROM system.access.table_lineage "
+            f"WHERE target_table_full_name = '{sql_str(target_table)}' "
+            f"  AND upper(entity_type) IN ({type_list}) "
+            f"  AND entity_id IN ({id_list}) "
+            f"  AND event_time > current_date() - INTERVAL {LINEAGE_LOOKBACK_DAYS} DAYS"
+        )
+    except Exception as e:
+        logger.warning(f"batch producer authorization check failed for {target_table}: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not verify that these producers write the target table. "
+                   "The app needs SELECT on system.access.table_lineage.",
+        )
+    recorded = {((r.get("et") or "").upper(), r.get("eid") or "") for r in rows}
+    missing = want - recorded
+    if missing:
+        et, eid = sorted(missing)[0]
         raise HTTPException(
             status_code=403,
             detail=f"{et} {eid} is not a recorded producer of {target_table} "
@@ -241,8 +300,9 @@ async def column_path(
             "path": path,
             "hop_count": max((h["hop"] for h in path), default=0),
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("lineage: _walk_column_lineage failed")
+        raise HTTPException(status_code=500, detail="Failed to walk column lineage.")
 
 
 # ---------------------------------------------------------------------------
@@ -312,8 +372,9 @@ async def lineage_freshness(
             "edge_count": edge_count,
             "last_event_at": last_event_at,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("lineage: lineage_freshness failed")
+        raise HTTPException(status_code=500, detail="Failed to lineage freshness.")
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +409,7 @@ async def analyze_producer_endpoint(request: Request, body: AnalyzeProducerIn):
     # The source fetch runs as the app SP, so the caller must not be able to
     # nominate an arbitrary workspace object as the "producer".
     if not is_admin:
-        _assert_producer_of(et, eid, body.target_table)
+        await asyncio.to_thread(_assert_producer_of, et, eid, body.target_table)
     try:
         return analyze_producer(
             entity_type=et,
@@ -361,8 +422,9 @@ async def analyze_producer_endpoint(request: Request, body: AnalyzeProducerIn):
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("lineage: analyze_producer_endpoint failed")
+        raise HTTPException(status_code=500, detail="Failed to analyze producer endpoint.")
 
 
 @analyze_router.get("/api/analyze-producer/history")
@@ -405,7 +467,7 @@ async def column_transformations(request: Request, body: ColumnTransformIn):
     from backend.main import _get_user_info
     email, is_admin = _get_user_info(request)
     if et and eid and not is_admin:
-        _assert_producer_of(et, eid, f"{c}.{s}.{t}")
+        await asyncio.to_thread(_assert_producer_of, et, eid, f"{c}.{s}.{t}")
     try:
         return resolve_column_transformations(
             catalog=c, schema=s, table=t,
@@ -416,8 +478,9 @@ async def column_transformations(request: Request, body: ColumnTransformIn):
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("lineage: column_transformations failed")
+        raise HTTPException(status_code=500, detail="Failed to column transformations.")
 
 
 class CTOverviewIn(BaseModel):
@@ -445,7 +508,7 @@ async def column_transformation_overview(request: Request, body: CTOverviewIn):
     from backend.main import _get_user_info
     email, is_admin = _get_user_info(request)
     if et and eid and not is_admin:
-        _assert_producer_of(et, eid, f"{c}.{s}.{t}")
+        await asyncio.to_thread(_assert_producer_of, et, eid, f"{c}.{s}.{t}")
     try:
         return overview_column_transformations(
             catalog=c, schema=s, table=t, entity_type=et, entity_id=eid,
@@ -453,8 +516,9 @@ async def column_transformation_overview(request: Request, body: CTOverviewIn):
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("lineage: column_transformation_overview failed")
+        raise HTTPException(status_code=500, detail="Failed to column transformation overview.")
 
 
 class LineageExplainIn(BaseModel):
@@ -483,8 +547,9 @@ async def explain_lineage(request: Request, body: LineageExplainIn):
             llm_client.explain_lineage_graph,
             body.nodes or [], body.edges or [], focus, detail, body.model,
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("lineage: explain_lineage failed")
+        raise HTTPException(status_code=500, detail="Failed to explain lineage.")
 
 
 class CTDeepAnalyzeIn(BaseModel):
@@ -515,7 +580,7 @@ async def column_transformation_deep_analyze(request: Request, body: CTDeepAnaly
     # Reads the producer's source AND queries config tables as the app SP —
     # verify the producer actually writes this table before either happens.
     if not is_admin:
-        _assert_producer_of(et, eid, full)
+        await asyncio.to_thread(_assert_producer_of, et, eid, full)
 
     def gen():
         try:
@@ -608,17 +673,28 @@ async def column_transformation_compare_producers(request: Request, body: CTComp
             producers.append({"entity_type": et, "entity_id": eid})
     if len(producers) < 2:
         raise HTTPException(status_code=400, detail="Provide at least 2 producers to compare.")
+    # Upper bound as well as a lower one. The list was previously unbounded, and
+    # every entry cost a blocking warehouse round-trip in the guard below plus a
+    # per-producer LLM resolution in compare_producers; a divergence matrix is also
+    # unreadable past a handful of columns.
+    if len(producers) > _MAX_COMPARE_PRODUCERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Compare at most {_MAX_COMPARE_PRODUCERS} producers at a time "
+                   f"({len(producers)} supplied).",
+        )
     from backend.main import _get_user_info
     email, is_admin = _get_user_info(request)
     if not is_admin:
-        for p in producers:
-            _assert_producer_of(p["entity_type"], p["entity_id"], f"{c}.{s}.{t}")
+        # One query for all of them, off the event loop.
+        await asyncio.to_thread(_assert_producers_of, producers, f"{c}.{s}.{t}")
     try:
         return await asyncio.to_thread(
             compare_producers, c, s, t, producers, email or "", body.force_rerun,
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("lineage: column_transformation_compare_producers failed")
+        raise HTTPException(status_code=500, detail="Failed to column transformation compare producers.")
 
 
 class CTVersionIn(BaseModel):
@@ -711,7 +787,7 @@ async def analyze_producer_versions(
     from backend.main import _get_user_info
     _, is_admin = _get_user_info(request)
     if not is_admin:
-        _assert_producer_of(et, eid, target_table)
+        await asyncio.to_thread(_assert_producer_of, et, eid, target_table)
     return {"versions": list_versions(et, eid, target_table)}
 
 
@@ -733,7 +809,7 @@ async def analyze_producer_version(
     from backend.main import _get_user_info
     _, is_admin = _get_user_info(request)
     if not is_admin:
-        _assert_producer_of(et, eid, target_table)
+        await asyncio.to_thread(_assert_producer_of, et, eid, target_table)
     v = get_version(et, eid, target_table, version)
     if v is None:
         raise HTTPException(status_code=404, detail=f"No stored analysis version {version}.")
@@ -761,7 +837,7 @@ async def analyze_producer_compare(
     from backend.main import _get_user_info
     _, is_admin = _get_user_info(request)
     if not is_admin:
-        _assert_producer_of(et, eid, target_table)
+        await asyncio.to_thread(_assert_producer_of, et, eid, target_table)
     a = get_version(et, eid, target_table, from_version)
     b = get_version(et, eid, target_table, to_version)
     if a is None or b is None:

@@ -33,6 +33,16 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/snapshots", tags=["snapshots"])
 
+
+def _is_admin(request: Request) -> bool:
+    """Non-raising admin probe, for deciding whether to project attribution
+    columns. Use require_admin() when the whole endpoint should be gated."""
+    from backend.main import _get_user_info
+    try:
+        return bool(_get_user_info(request)[1])
+    except Exception:  # never let an attribution decision break a read
+        return False
+
 LINEAGE_CATALOG = os.environ.get("LINEAGE_CATALOG", "lattice_lineage")
 LINEAGE_SCHEMA = os.environ.get("LINEAGE_SCHEMA", "lineage")
 SNAPSHOTS_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.graph_snapshots"
@@ -176,14 +186,23 @@ async def list_snapshots(
     scope: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
 ):
-    """List available snapshots."""
+    """List available snapshots.
+
+    `captured_by` is projected for admins only. This endpoint is deliberately
+    ungated so any user can pick versions to compare, but captured_by stopped
+    being the constant 'app' when capture started recording the real caller — so
+    projecting it unconditionally turned an open endpoint into a directory of the
+    workspace email of everyone who has ever captured a snapshot. Recording the
+    caller is right; handing it to every reader is not.
+    """
     # Validate before _lazy_ensure so a bad filter costs no warehouse round-trip.
     where = f"WHERE scope = '{sql_str(_validate_scope(scope))}'" if scope else ""
     _lazy_ensure()
+    attribution = "captured_by, " if _is_admin(request) else ""
     try:
         rows = await asyncio.to_thread(
             _execute_sql,
-            f"SELECT snapshot_id, scope, label, captured_at, captured_by, node_count, edge_count FROM {SNAPSHOTS_TABLE} {where} ORDER BY captured_at DESC LIMIT {limit}"
+            f"SELECT snapshot_id, scope, label, captured_at, {attribution}node_count, edge_count FROM {SNAPSHOTS_TABLE} {where} ORDER BY captured_at DESC LIMIT {limit}"
         )
         return {"snapshots": rows}
     except Exception as e:
@@ -191,32 +210,12 @@ async def list_snapshots(
         raise HTTPException(status_code=500, detail="Failed to list snapshots")
 
 
-@router.get("/{snapshot_id}")
-async def get_snapshot(request: Request, snapshot_id: str):
-    """Retrieve a specific snapshot with full graph data."""
-    _lazy_ensure()
-    safe_id = sql_str(snapshot_id, 100)
-    try:
-        rows = await asyncio.to_thread(
-            _execute_sql, f"SELECT * FROM {SNAPSHOTS_TABLE} WHERE snapshot_id = '{safe_id}'"
-        )
-        if not rows:
-            raise HTTPException(status_code=404, detail="Snapshot not found")
-        row = rows[0]
-        # Parse graph_json back to structured data
-        try:
-            row["graph"] = json.loads(row.get("graph_json", "{}"))
-        except (json.JSONDecodeError, TypeError):
-            row["graph"] = {"nodes": [], "edges": []}
-        del row["graph_json"]  # Don't send raw JSON string back
-        return row
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"snapshot fetch failed: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch snapshot")
-
-
+# ROUTE ORDER IS LOAD-BEARING: Starlette matches in registration order, so
+# `/diff` MUST be declared before `/{snapshot_id}`. With the parameterised route
+# first, GET /api/snapshots/diff bound snapshot_id="diff" and ran get_snapshot,
+# which returned 200 with `{"graph": {"nodes": [], "edges": []}}` — the shape of a
+# snapshot, not a diff. Callers could not tell that apart from "nothing changed",
+# so the whole diff feature read as permanently empty rather than as broken.
 @router.get("/diff")
 async def diff_snapshots(
     request: Request,
@@ -263,6 +262,36 @@ async def diff_snapshots(
     except Exception as e:
         logger.error(f"snapshot diff failed: {e}")
         raise HTTPException(status_code=500, detail="Failed to diff snapshots")
+
+
+# Declared AFTER /diff — see the route-order note above.
+@router.get("/{snapshot_id}")
+async def get_snapshot(request: Request, snapshot_id: str):
+    """Retrieve a specific snapshot with full graph data."""
+    _lazy_ensure()
+    safe_id = sql_str(snapshot_id, 100)
+    try:
+        rows = await asyncio.to_thread(
+            _execute_sql, f"SELECT * FROM {SNAPSHOTS_TABLE} WHERE snapshot_id = '{safe_id}'"
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        row = rows[0]
+        # Parse graph_json back to structured data
+        try:
+            row["graph"] = json.loads(row.get("graph_json", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            row["graph"] = {"nodes": [], "edges": []}
+        del row["graph_json"]  # Don't send raw JSON string back
+        # captured_by is a real workspace email — admins only (see list_snapshots).
+        if not _is_admin(request):
+            row.pop("captured_by", None)
+        return row
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"snapshot fetch failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch snapshot")
 
 
 @router.delete("/{snapshot_id}")

@@ -215,35 +215,63 @@ class TestDQRulesDelete:
             assert resp.status_code == 403
 
     def test_delete_admin_success(self, admin_client):
-        """A2: Admin can delete rules."""
+        """A2: Admin can delete rules.
+
+        The handler now confirms the row exists before reporting success, so the
+        mock has to answer the existence SELECT with a row.
+        """
         with patch("backend.routes.dq._execute_sql") as mock_sql:
-            mock_sql.return_value = []
+            mock_sql.return_value = [{"1": 1}]
             resp = admin_client.delete("/api/dq-rules/rule123")
             assert resp.status_code == 200
             data = resp.json()
             assert data["status"] == "deleted"
 
+    def test_delete_missing_rule_is_404_not_a_false_success(self, admin_client):
+        """The handler used to return {"status": "deleted"} whether or not a row
+        matched, so a typo'd id was indistinguishable from a real delete."""
+        with patch("backend.routes.dq._execute_sql") as mock_sql:
+            mock_sql.return_value = []          # existence SELECT finds nothing
+            resp = admin_client.delete("/api/dq-rules/does-not-exist")
+            assert resp.status_code == 404
+            # and nothing was deleted
+            assert not any(
+                "DELETE FROM" in c[0][0] for c in mock_sql.call_args_list
+            )
+
     def test_delete_sql_injection_in_rule_id(self, admin_client):
-        """A1 FIX: rule_id is truncated then escaped with sql_str, so the quotes
-        stay inside the literal instead of being silently deleted."""
+        """rule_id is now allow-listed, so an injection payload is REJECTED
+        rather than escaped.
+
+        Escaping it was sound but pointless: a rule_id containing quotes could
+        never name a stored rule, because the write path constrains ids to the
+        same character set. Rejecting also closes the round-trip bug — the write
+        path stored the full value while this handler truncated to 64 chars, so a
+        longer id was permanently undeletable.
+        """
         with patch("backend.routes.dq._execute_sql") as mock_sql:
             mock_sql.return_value = []
             resp = admin_client.delete("/api/dq-rules/x' OR '1'='1")
-            assert resp.status_code == 200
-            sent = mock_sql.call_args[0][0]
-            assert "'x'' OR ''1''=''1'" in sent
+            assert resp.status_code == 400
+            mock_sql.assert_not_called()
 
     def test_delete_backslash_quote_rule_id_cannot_close_literal(self, admin_client):
-        r"""A1 FIX: a `\'`-prefixed value. Quote-doubling alone produced `\''`,
-        whose second quote closes the literal on Databricks SQL; sql_str escapes
-        the backslash first so both quotes stay inside."""
+        r"""A `\'`-prefixed value is likewise rejected before reaching SQL."""
         with patch("backend.routes.dq._execute_sql") as mock_sql:
             mock_sql.return_value = []
             resp = admin_client.delete("/api/dq-rules/\\' OR 1=1--")
-            assert resp.status_code == 200
-            sent = mock_sql.call_args[0][0]
-            assert "'\\\\'' OR 1=1--'" in sent
-            assert "'\\''" not in sent  # the bypassable form must not appear
+            assert resp.status_code == 400
+            mock_sql.assert_not_called()
+
+    def test_delete_overlong_rule_id_rejected(self, admin_client):
+        """The round-trip bug directly: 100 chars stored fine but truncated to 64
+        on delete, so the rule became permanently undeletable while its CUSTOM
+        expression kept executing on every metrics call."""
+        with patch("backend.routes.dq._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = admin_client.delete("/api/dq-rules/" + "a" * 100)
+            assert resp.status_code == 400
+            mock_sql.assert_not_called()
 
 
 class TestDQLiveMetrics:

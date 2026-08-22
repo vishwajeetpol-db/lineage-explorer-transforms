@@ -29,7 +29,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client, get_table_lineage, get_schema_column_lineage
-from backend.validators import _validate, require_admin, sql_str
+from backend.validators import _validate, redact_url, require_admin, sql_str
 
 logger = logging.getLogger(__name__)
 
@@ -347,16 +347,32 @@ async def configure_producer(request: Request, body: dict):
         )
 
     import uuid
-    config_id = str(uuid.uuid4())
+    new_config_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    scope = sql_str(body.get("api_key_secret_scope") or "", 200)
-    key = sql_str(body.get("api_key_secret_key") or "", 200)
+    # Distinguish "omitted" from "set to empty". Omitting the secret refs on an
+    # update must leave the stored ones alone; supplying them must rotate them.
+    scope_in = body.get("api_key_secret_scope")
+    key_in = body.get("api_key_secret_key")
+    rotating_secret = scope_in is not None or key_in is not None
+    scope = sql_str(scope_in or "", 200)
+    key = sql_str(key_in or "", 200)
+
+    # An UPDATE that ignored the secret columns entirely made a secret reference
+    # write-once-FOREVER, which broke the ordinary "register now, add auth later"
+    # flow: the second call took WHEN MATCHED, silently discarded the secret, and
+    # still returned 200 with a freshly minted config_id that was never stored.
+    # There is no DELETE endpoint and no row-replace path for this table, so the
+    # documented workaround ("delete and re-create the row") did not exist —
+    # rotation required manual SQL outside the app. This endpoint is admin-gated,
+    # so an explicit rotation is a legitimate admin action; an OMITTED secret is
+    # still preserved, which is what the trust-anchor concern actually needs.
+    secret_update = (
+        f",\n                api_key_secret_scope = '{scope}',"
+        f"\n                api_key_secret_key = '{key}'"
+        if rotating_secret else ""
+    )
 
     try:
-        # WHEN MATCHED deliberately does NOT touch api_key_secret_scope /
-        # api_key_secret_key: an existing row's secret reference is a trust
-        # anchor and must not be silently re-pointed by a later configure call.
-        # Rotating a secret reference means deleting and re-creating the row.
         await asyncio.to_thread(_execute_sql, f"""
             MERGE INTO {PRODUCER_CONFIG_TABLE} t
             USING (SELECT '{sql_str(endpoint_name)}' AS endpoint_name) s
@@ -364,14 +380,27 @@ async def configure_producer(request: Request, body: dict):
             WHEN MATCHED THEN UPDATE SET
                 endpoint_url = '{sql_str(endpoint_url, 2000)}',
                 active = true,
-                updated_at = TIMESTAMP '{now}'
+                updated_at = TIMESTAMP '{now}'{secret_update}
             WHEN NOT MATCHED THEN INSERT
                 (config_id, endpoint_url, endpoint_name, api_key_secret_scope, api_key_secret_key, active, created_at, updated_at)
-            VALUES ('{config_id}', '{sql_str(endpoint_url, 2000)}',
+            VALUES ('{new_config_id}', '{sql_str(endpoint_url, 2000)}',
                     '{sql_str(endpoint_name)}', '{scope}', '{key}',
                     true, TIMESTAMP '{now}', TIMESTAMP '{now}')
         """)
-        return {"status": "ok", "config_id": config_id, "endpoint_name": endpoint_name}
+        # Read the id back rather than returning new_config_id unconditionally —
+        # on the MATCHED path that value was never written to any row.
+        stored = await asyncio.to_thread(
+            _execute_sql,
+            f"SELECT config_id FROM {PRODUCER_CONFIG_TABLE} "
+            f"WHERE endpoint_name = '{sql_str(endpoint_name)}' LIMIT 1",
+        )
+        config_id = (stored[0].get("config_id") if stored else None) or new_config_id
+        return {
+            "status": "ok",
+            "config_id": config_id,
+            "endpoint_name": endpoint_name,
+            "secret_rotated": rotating_secret,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -381,12 +410,24 @@ async def configure_producer(request: Request, body: dict):
 
 @router.get("/api/openlineage/producer/config")
 async def get_producer_config(request: Request):
-    """View all configured OpenLineage producer endpoints."""
+    """View all configured OpenLineage producer endpoints. Admin-gated.
+
+    Dropping the api_key_secret_* columns from the projection was necessary but
+    not sufficient: `endpoint_url` is itself sensitive. configure_producer only
+    checks https+host, so `https://marquez.internal.corp/api/v1/lineage?apiKey=…`
+    is a valid registration — and an ungated read handed every app user the query
+    string plus the internal hostname. That is the same disclosure _redact_url was
+    added for on the sibling webhook list, which got both a gate and redaction in
+    the same commit; this endpoint got neither.
+    """
+    require_admin(request)
     _lazy_ensure_producer()
     try:
         rows = await asyncio.to_thread(
             _execute_sql, f"SELECT config_id, endpoint_url, endpoint_name, active, created_at, updated_at FROM {PRODUCER_CONFIG_TABLE} ORDER BY endpoint_name"
         )
+        for row in rows:
+            row["endpoint_url"] = redact_url(row.get("endpoint_url"))
         return {"endpoints": rows}
     except Exception as e:
         logger.error(f"openlineage producer config read failed: {e}")
@@ -515,17 +556,20 @@ async def producer_events(
 
     Used to monitor production health and debug delivery issues.
     """
-    _lazy_ensure_producer()
     # status_filter lands in the WHERE clause of a query whose rows are returned
     # to the caller. Allow-list it against the statuses the queue actually uses
     # (outside the try, so the 400 isn't rewritten as a 500) and escape the value
     # anyway — defence in depth if PRODUCER_STATUSES ever grows.
+    #
+    # Checked BEFORE _lazy_ensure_producer's DDL, so a rejected filter costs no
+    # warehouse round-trip.
     if status_filter and status_filter not in PRODUCER_STATUSES:
         raise HTTPException(
             status_code=400,
             detail=f"status_filter must be one of: {' | '.join(PRODUCER_STATUSES)}",
         )
     where = f"WHERE status = '{sql_str(status_filter)}'" if status_filter else ""
+    _lazy_ensure_producer()
     try:
         rows = await asyncio.to_thread(
             _execute_sql, f"""

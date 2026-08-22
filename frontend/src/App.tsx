@@ -265,7 +265,9 @@ export default function App() {
   if (route.view === "export") {
     return (
       <div className="h-screen w-screen bg-surface overflow-auto">
-        <ExportPanel />
+        {/* catalog/schema are required — the capture endpoint rejects an empty
+            scope, so mounting without them made "Capture Now" always 400. */}
+        <ExportPanel catalog={catalog} schema={schema} />
       </div>
     );
   }

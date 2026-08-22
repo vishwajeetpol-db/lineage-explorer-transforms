@@ -358,7 +358,7 @@ async def get_external_lineage(
     limit: int = Query(100, ge=1, le=500),
 ):
     """Get external lineage edges, optionally filtered by table or platform."""
-    _lazy_ensure()
+    # Validate the filter before _lazy_ensure's DDL — see get_ol_bridge_events.
     conditions = ["1=1"]
     if table_fqn:
         safe_fqn = sql_str(table_fqn, 300)
@@ -366,6 +366,7 @@ async def get_external_lineage(
     if platform:
         conditions.append(f"source_platform = '{_validate_platform(platform)}'")
     where = " AND ".join(conditions)
+    _lazy_ensure()
     try:
         rows = await asyncio.to_thread(
             _execute_sql, f"SELECT * FROM {EDGES_TABLE} WHERE {where} ORDER BY created_at DESC LIMIT {limit}"
@@ -626,13 +627,18 @@ async def get_ol_bridge_events(
     input/output datasets, and timestamps — enabling operators to verify
     that external platform lineage is flowing correctly before graph integration.
     """
-    _lazy_ensure_bridge()
+    # Build (and therefore validate) the filter BEFORE _lazy_ensure_bridge, which
+    # issues two CREATE TABLE IF NOT EXISTS statements. With the order reversed a
+    # rejected filter still cost two warehouse round-trips, and the property
+    # test_platform_filter_allow_listed asserts — that an off-list platform is
+    # rejected before any SQL runs — was false.
     conditions = ["1=1"]
     if source_id:
         conditions.append(f"source_id = '{sql_str(source_id, 100)}'")
     if platform:
         conditions.append(f"platform = '{_validate_platform(platform)}'")
     where = " AND ".join(conditions)
+    _lazy_ensure_bridge()
     try:
         rows = await asyncio.to_thread(
             _execute_sql,

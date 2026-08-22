@@ -21,6 +21,7 @@ Persisted in app-owned Delta tables:
 from __future__ import annotations
 
 import os
+import math
 import uuid
 import asyncio
 import logging
@@ -243,11 +244,23 @@ def _detect_schema_changes() -> list[dict]:
     """Detect schema changes by comparing information_schema with last-known state."""
     notifications = []
     try:
-        # Get tables with recent schema modifications (last 24h)
+        # Get tables with recent schema modifications (last 24h).
+        #
+        # `last_altered` lives on information_schema.TABLES, not on COLUMNS. The
+        # previous query selected it straight off `columns`, so it raised
+        # UNRESOLVED_COLUMN on every run, was swallowed by the non-fatal except
+        # below, and this detector reported 0 schema changes unconditionally —
+        # while the scan as a whole still reported success. Join to get the
+        # table's alter time alongside the column detail.
         rows = _execute_sql("""
-            SELECT table_catalog, table_schema, table_name, column_name, data_type
-            FROM system.information_schema.columns
-            WHERE last_altered > current_timestamp() - INTERVAL 24 HOURS
+            SELECT c.table_catalog, c.table_schema, c.table_name,
+                   c.column_name, c.data_type
+            FROM system.information_schema.columns c
+            JOIN system.information_schema.tables t
+              ON  t.table_catalog = c.table_catalog
+              AND t.table_schema  = c.table_schema
+              AND t.table_name    = c.table_name
+            WHERE t.last_altered > current_timestamp() - INTERVAL 24 HOURS
             LIMIT 200
         """)
         for row in rows:
@@ -362,9 +375,25 @@ async def upsert_rule(request: Request, body: AlertRuleIn):
     # rendering as the literal `none`.
     rule_type = sql_str(body.rule_type)
     severity = sql_str(body.severity or "warning")
-    pattern = sql_str(body.target_pattern or "*", 500)
+    # `or` swallows a legitimate empty pattern the same way it swallowed 0 below:
+    # `"" or "*"` widens a rule from "no tables" to "every table". Test for None.
+    pattern = sql_str("*" if body.target_pattern is None else body.target_pattern, 500)
     notes = sql_str(body.notes or "", 500)
-    threshold = float(body.threshold or 0.9)
+    # `float(body.threshold or 0.9)` was wrong twice over:
+    #
+    #  * 0 is falsy, so `{"threshold": 0}` was silently stored as 0.9 and GET
+    #    /rules echoed back a value the admin never set and could not express.
+    #  * Infinity survives validation — `json.loads('{"v": 1e999}')` yields inf and
+    #    pydantic's Optional[float] has allow_inf_nan=True by default — and
+    #    f-string-formatting it emits the bare word `inf` into an UNQUOTED SQL
+    #    position, where Spark resolves it as a column reference against the rules
+    #    table and fails. The sibling math.isfinite guard added elsewhere in this
+    #    commit was never applied here.
+    threshold = 0.9 if body.threshold is None else float(body.threshold)
+    if not math.isfinite(threshold):
+        raise HTTPException(
+            status_code=400, detail="threshold must be a finite number"
+        )
     enabled = "true" if (True if body.enabled is None else body.enabled) else "false"
     try:
         await asyncio.to_thread(_execute_sql, f"""

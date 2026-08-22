@@ -531,12 +531,17 @@ class TestSecurity:
         assert "user@test.com" in sql
         assert "'app'" not in sql
 
-    def test_upsert_domain_owner_defaults_to_caller(self, non_admin_client, mock_sql):
-        # glossary_domains has no created_by column, so a blank owner falls back
-        # to the caller — otherwise the row would be unattributable.
+    def test_upsert_domain_blank_owner_is_not_the_caller(self, non_admin_client, mock_sql):
+        """A blank owner must stay blank, NOT default to the caller's address.
+
+        `owner` is a user-typed business field that the ungated GET /domains hands
+        to every app user, so defaulting it to the caller wrote a real workspace
+        email into a public field — and made "I left this blank" read as a
+        positive claim of ownership. Empty reads as unknown, which is the truth.
+        """
         resp = non_admin_client.post("/api/glossary/domains", json={"name": "Finance"})
         assert resp.status_code == 200
-        assert "user@test.com" in _all_sql(mock_sql)
+        assert "user@test.com" not in _all_sql(mock_sql)
 
     def test_upsert_domain_keeps_explicit_owner(self, non_admin_client, mock_sql):
         resp = non_admin_client.post(
@@ -544,6 +549,23 @@ class TestSecurity:
         )
         assert resp.status_code == 200
         assert "cfo@test.com" in _all_sql(mock_sql)
+
+    def test_upsert_domain_cannot_seize_an_existing_owner(self, non_admin_client, mock_sql):
+        """The MERGE's UPDATE arm must not overwrite a non-empty owner.
+
+        domain_id is caller-supplied and GET /domains hands out every id, so an
+        unconditional `SET owner = …` let any user re-POST someone else's domain
+        and take it over, with no record of the previous owner left in the row.
+        """
+        resp = non_admin_client.post(
+            "/api/glossary/domains",
+            json={"domain_id": "11111111-2222-3333-4444-555555555555", "name": "Finance"},
+        )
+        assert resp.status_code == 200
+        sql = _all_sql(mock_sql)
+        # the UPDATE arm preserves t.owner unless it is blank
+        assert "ELSE t.owner" in sql
+        assert "owner = CASE" in sql
 
     # --- ALSO: 500s no longer echo the raw SQL error back to the caller ---
     def test_error_detail_does_not_leak_sql(self, app_client, mock_sql):

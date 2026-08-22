@@ -9,6 +9,8 @@ Usage:
     from backend.validators import _IDENTIFIER_RE, _validate
 """
 import re
+from urllib.parse import urlparse
+
 from fastapi import HTTPException
 
 # Matches valid UC identifier characters: letters, digits, underscore, hyphen.
@@ -50,6 +52,29 @@ def sql_str(s: object, limit: int | None = None) -> str:
     if limit is not None and limit > 0:
         v = v[:limit]
     return v.replace("\\", "\\\\").replace("'", "''")
+
+
+def redact_url(url: object) -> str:
+    """Reduce a URL to scheme://host for display.
+
+    Webhook and ingest URLs routinely carry their delivery secret in the PATH
+    (Slack/Teams `/services/T000/B000/XXXX`) or in the QUERY STRING
+    (`?apiKey=…`), so returning one verbatim leaks a credential. Scheme+host is
+    enough for an admin to recognise which endpoint a row refers to.
+
+    Lives here rather than in a route module because more than one router returns
+    stored URLs — openlineage's producer config and capability_closures' webhook
+    list — and they must not drift apart on what "redacted" means.
+    """
+    if not url:
+        return ""
+    try:
+        parts = urlparse(str(url))
+        if parts.scheme and parts.netloc:
+            return f"{parts.scheme}://{parts.netloc}"
+    except Exception:
+        pass
+    return "(redacted)"
 
 
 def require_admin(request) -> str:
