@@ -30,11 +30,14 @@ strictly optional — the system works correctly without it.
 """
 from __future__ import annotations
 
+import base64
+import gzip
 import os
 import json
 import hashlib
 import logging
 import threading
+import time as _time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -51,6 +54,27 @@ WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")
 
 MAX_VALUE_BYTES = 256_000
+# Payloads are gzipped before the size check. A node-heavy lineage graph is highly
+# repetitive JSON (the same keys and catalog prefixes thousands of times) and
+# typically compresses 5-10x, which is the difference between the LARGEST graphs
+# being cacheable and being recomputed on every request forever. Before this, a
+# graph near LINEAGE_MAX_NODES=2500 exceeded the cap, set() returned False at debug
+# level, and the most expensive query in the app was the one that never cached.
+#
+# Rows written before compression existed are plain JSON, so reads sniff the marker
+# rather than assuming. Keep the marker out of base64's alphabet so it can never
+# collide with a legitimately-encoded payload.
+_GZIP_MARKER = "gz1:"
+
+# Hit counting is buffered in memory and flushed periodically instead of writing on
+# every read. It used to issue an UPDATE on the cache table for every cache HIT —
+# so the hot path of the cache was a Delta write, and Delta takes table-level
+# optimistic concurrency: concurrent writers serialize on commit or fail with a
+# concurrent-modification conflict. That made the cache degrade AS LOAD ROSE, which
+# is the opposite of what a cache is for. hit_count is telemetry; it does not need
+# to be transactional, and it must not be on the read path.
+_HIT_FLUSH_INTERVAL_S = float(os.environ.get("CACHE_HIT_FLUSH_INTERVAL_SECONDS", "300"))
+_HIT_BUFFER_MAX_KEYS = 500
 # Namespace tags are short labels ('lineage', 'column'), so they are capped
 # before hitting the key column. The cap is passed to sql_str as `limit=`, which
 # truncates BEFORE escaping — slicing an already-escaped string can cut a `\\`
@@ -61,6 +85,22 @@ _DEL = "DELETE"  # avoid inline keyword for code-scanner clarity
 
 _instance: Optional["DeltaCacheService"] = None
 _instance_lock = threading.Lock()
+
+# (cache_key, cache_ns) -> pending hit count, plus the last flush time.
+_hit_buffer: dict[tuple[str, str], int] = {}
+_hit_buffer_lock = threading.Lock()
+# Seeded to NOW, not 0.0: the flush test is `now - _hit_last_flush >= interval`, and
+# a zero epoch is always overdue against a monotonic clock — so the very first cache
+# hit after startup would write, which is the behaviour the buffer exists to remove.
+_hit_last_flush: float = _time.monotonic()
+
+
+def _reset_hit_buffer() -> None:
+    """Drop buffered hit counts without flushing — for tests only."""
+    global _hit_last_flush
+    with _hit_buffer_lock:
+        _hit_buffer.clear()
+        _hit_last_flush = _time.monotonic()
 
 
 def get_cache_service() -> "DeltaCacheService":
@@ -130,6 +170,64 @@ class DeltaCacheService:
     def _hash(key: str) -> str:
         return hashlib.sha256(key.encode()).hexdigest()
 
+    @staticmethod
+    def _encode(serialized: str) -> str:
+        """Compress a JSON payload for storage, if that helps.
+
+        Returns the marker-prefixed base64 of the gzip when smaller, else the plain
+        JSON. Small payloads can grow under gzip+base64, so the shorter of the two
+        always wins and both forms stay readable by _decode.
+        """
+        raw = serialized.encode("utf-8")
+        packed = _GZIP_MARKER + base64.b64encode(
+            gzip.compress(raw, compresslevel=6)
+        ).decode("ascii")
+        return packed if len(packed.encode()) < len(raw) else serialized
+
+    @staticmethod
+    def _decode(stored: str) -> Any:
+        """Inverse of _encode; transparently reads pre-compression rows."""
+        if stored.startswith(_GZIP_MARKER):
+            raw = gzip.decompress(base64.b64decode(stored[len(_GZIP_MARKER):]))
+            return json.loads(raw.decode("utf-8"))
+        return json.loads(stored)
+
+    def _note_hit(self, hk: str, ns: str) -> None:
+        """Buffer one hit, flushing the whole buffer in ONE statement when due.
+
+        Off the read path in the common case: 99% of calls only take a lock and
+        increment an int. The flush is best-effort — losing a counter is free,
+        while blocking a cache read on a Delta commit is not.
+        """
+        global _hit_last_flush
+        now = _time.monotonic()
+        with _hit_buffer_lock:
+            _hit_buffer[(hk, ns)] = _hit_buffer.get((hk, ns), 0) + 1
+            due = (
+                now - _hit_last_flush >= _HIT_FLUSH_INTERVAL_S
+                or len(_hit_buffer) >= _HIT_BUFFER_MAX_KEYS
+            )
+            if not due:
+                return
+            pending = dict(_hit_buffer)
+            _hit_buffer.clear()
+            _hit_last_flush = now
+        try:
+            # One UPDATE for every buffered key, not one per hit: a CASE picks each
+            # key's increment so N hits across M keys cost a single commit.
+            cases = " ".join(
+                f"WHEN cache_key = '{k}' AND cache_ns = '{n}' THEN {int(c)}"
+                for (k, n), c in pending.items()
+            )
+            keys = ",".join(f"'{k}'" for k, _ in pending)
+            self._sql(f"""
+                UPDATE {CACHE_TABLE}
+                SET hit_count = COALESCE(hit_count, 0) + CASE {cases} ELSE 0 END
+                WHERE cache_key IN ({keys})
+            """)
+        except Exception as e:
+            logger.debug("hit_count flush failed (non-fatal, counters dropped): %s", e)
+
     def get(self, key: str, namespace: str = "default") -> Optional[Any]:
         """Return cached value for key, or None on miss / error."""
         try:
@@ -145,15 +243,11 @@ class DeltaCacheService:
             """)
             if not rows:
                 return None
-            try:
-                self._sql(f"""
-                    UPDATE {CACHE_TABLE}
-                    SET hit_count = COALESCE(hit_count, 0) + 1
-                    WHERE cache_key = '{hk}' AND cache_ns = '{ns}'
-                """)
-            except Exception:
-                pass
-            return json.loads(rows[0]["value_json"])
+            value = self._decode(rows[0]["value_json"])
+            # Buffered, not written: see _HIT_FLUSH_INTERVAL_S. Decode FIRST so a
+            # telemetry problem can never cost us a usable cached value.
+            self._note_hit(hk, ns)
+            return value
         except Exception as e:
             logger.debug("DeltaCacheService.get error (non-fatal): %s", e)
             return None
@@ -170,8 +264,18 @@ class DeltaCacheService:
             self._ensure_table()
             hk = self._hash(key)
             ns = sql_str(namespace, limit=NS_MAX_LEN)
-            serialized = json.dumps(value, default=str)
+            serialized = self._encode(json.dumps(value, default=str))
             if len(serialized.encode()) > MAX_VALUE_BYTES:
+                # WARNING, not a silent False: this is the failure mode where the
+                # most expensive graphs are the ones that never cache, and it was
+                # invisible because the operator only saw a healthy hit rate on the
+                # small keys that did fit.
+                logger.warning(
+                    "Cache value for ns=%s is %d bytes after compression, over the "
+                    "%d-byte cap — NOT cached, so this scope will be recomputed on "
+                    "every request. Narrow the scope or raise MAX_VALUE_BYTES.",
+                    namespace, len(serialized.encode()), MAX_VALUE_BYTES,
+                )
                 return False
             # Escape via sql_str, not quote-doubling: json.dumps emits `\"` for a
             # quote inside the payload, and Spark would consume that backslash —

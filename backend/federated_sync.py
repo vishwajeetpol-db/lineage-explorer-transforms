@@ -23,6 +23,7 @@ import logging
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client, get_sharing_overview
 from backend.feature_flags import get_flag_state
+from backend.validators import UnsafeOutboundURL, assert_safe_outbound_url
 
 logger = logging.getLogger(__name__)
 
@@ -139,19 +140,45 @@ def verify_peer_trust(peer_alias: str) -> dict:
             base["error"] = "Provider endpoint URL not found in sharing overview; verification skipped"
             return base
 
-        # Live HTTP probe
+        # Live HTTP probe.
+        #
+        # TWO controls here, and the first one is the important one:
+        #
+        # 1. NO CREDENTIAL. This request goes to a host named by `sharing_server_url`
+        #    in Unity Catalog metadata — chosen by whoever registered the sharing
+        #    provider, not by us. It previously carried
+        #    `Authorization: Bearer {client.config.token}`, the app service
+        #    principal's own token, which handed that credential to any host a
+        #    provider registration named. Since every data query in this app runs as
+        #    that SP, the token is the key to everything the app can read. A
+        #    reachability probe does not need to authenticate: an unauthenticated
+        #    401/403 still proves the endpoint is up, which is all this reports.
+        #
+        # 2. URL validation before connecting — https only, no embedded credentials,
+        #    and rejected if the host resolves to a private, loopback, link-local or
+        #    reserved address. Without it the same unvalidated URL reached the app's
+        #    network position, including cloud instance-metadata endpoints (SSRF).
+        import urllib.error
         import urllib.request
-        client = _get_client()
-        token = client.config.token or ""
-        probe_url = f"{provider_url.rstrip('/')}/shares/{share_name}"
-        req = urllib.request.Request(
-            probe_url,
-            headers={"Authorization": f"Bearer {token}"},
-            method="GET",
-        )
+        try:
+            probe_url = assert_safe_outbound_url(
+                f"{provider_url.rstrip('/')}/shares/{share_name}", "provider endpoint"
+            )
+        except UnsafeOutboundURL as e:
+            logger.warning("Refused to probe peer %s: %s", peer_alias, e)
+            base["reachable"] = False
+            base["error"] = f"Provider endpoint rejected as unsafe: {e}"
+            return base
+
+        req = urllib.request.Request(probe_url, method="GET")
         t0 = _time.time()
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            _ = resp.read()
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                _ = resp.read(1024)
+        except urllib.error.HTTPError:
+            # The endpoint answered — with 401/403 for an unauthenticated probe, most
+            # likely. That is reachability, which is what this function reports.
+            pass
         latency_ms = int((_time.time() - t0) * 1000)
         base["reachable"] = True
         base["latency_ms"] = latency_ms

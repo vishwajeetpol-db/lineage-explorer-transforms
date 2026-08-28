@@ -142,11 +142,41 @@ describe("Landing", () => {
     expect(screen.getByText("Admin Dashboard")).toBeInTheDocument();
   });
 
-  it("opens search from the notifications bell", async () => {
+  // The previous test here was named "opens search from the notifications bell" and
+  // asserted exactly that. It was not catching the bug, it was DOCUMENTING it: the
+  // bell's handler called setGlobalSearchOpen(true), so clicking it opened the global
+  // search palette. The test matched the code rather than the intent, which is why it
+  // passed for as long as the bug existed. Notifications are now deferred, so the
+  // control must be inert.
+  it("notifications bell is disabled and opens nothing", async () => {
     const user = userEvent.setup();
     render(<Landing onSelectTable={vi.fn()} />);
-    await user.click(screen.getByTitle("Notifications"));
-    expect(useLineageStore.getState().globalSearchOpen).toBe(true);
+    const bell = screen.getByTitle("Notifications — coming soon");
+    expect(bell).toBeDisabled();
+    await user.click(bell);
+    expect(useLineageStore.getState().globalSearchOpen).toBe(false);
+  });
+
+  it("does not render an unread badge on the disabled bell", () => {
+    render(<Landing onSelectTable={vi.fn()} />);
+    // A count you cannot open is an unresolvable nag.
+    expect(screen.queryByText("9+")).not.toBeInTheDocument();
+  });
+
+  it("workspace selector is present but disabled, reserving the slot", () => {
+    render(<Landing onSelectTable={vi.fn()} />);
+    const ws = screen.getByTitle("Multi-workspace — coming soon");
+    expect(ws).toBeInTheDocument();
+    expect(ws).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("signed-in user is display-only, with no expand affordance", async () => {
+    render(<Landing onSelectTable={vi.fn()} />);
+    // Identity is shown (resolved async from /api/user-info)...
+    const email = await screen.findByText("a@b.com");
+    expect(email).toBeInTheDocument();
+    // ...and it is not a button, so it cannot invite a click it has no answer for.
+    expect(email.closest("button")).toBeNull();
   });
 
   it("closes the picker via its onClose", () => {

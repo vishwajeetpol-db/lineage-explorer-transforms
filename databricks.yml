@@ -46,6 +46,24 @@ variables:
   build_cache_ttl_hours:
     description: "Hours before transformation lineage is considered stale and needs rebuild"
     default: "24"
+  warehouse_max_concurrent_statements:
+    description: "Max SQL statements the app will run at once. Size to the WAREHOUSE's real concurrency (cluster size x max clusters), not to the app's thread count — the app can present ~84 and a warehouse cluster admits ~10."
+    default: "8"
+  enforce_user_identity:
+    description: "When true, data READS run as the calling user so Unity Catalog enforces them. Default false: every user currently sees whatever the app's service principal can read, and switching this on makes users see LESS. Validate against one catalog before enabling."
+    default: "false"
+  lineage_hop_max_rows:
+    description: "Row cap per BFS hop when tracing lineage. Bounds hop WIDTH (a shared conformed dimension can have very many edges); hitting it is reported as a truncated graph."
+    default: "5000"
+  max_builds_in_flight:
+    description: "Max concurrent transformation-lineage builds. Each is a serverless job."
+    default: "5"
+  max_builds_per_day:
+    description: "Daily cap on transformation-lineage builds, across all admins."
+    default: "200"
+  llm_max_calls_per_user_per_day:
+    description: "Daily per-user cap on AI analysis calls. The deep-analysis path is agentic, so one user action can be many model calls."
+    default: "500"
   app_name:
     description: "Databricks App name. Override to avoid collisions in a shared workspace or to run multiple instances."
     default: "bricktrace"
@@ -85,6 +103,8 @@ sync:
     - "setup_full_demo.py"
     - "setup.sql"
     - "grant_app_access.sh"
+    - "grant_build_source_access.sh"
+    - "testbed"
     - "*.png"
     - "ss_*"
     - "screenshot_*"
@@ -160,6 +180,27 @@ targets:
                 value: ${var.transform_cache_ttl_seconds}
               - name: BUILD_CACHE_TTL_HOURS
                 value: ${var.build_cache_ttl_hours}
+              # --- Load, cost and data-boundary controls -------------------
+              # Admission control between the app's threads and the warehouse.
+              # Without it the app presents far more concurrent statements than a
+              # warehouse runs, and a QUEUED statement still holds an app thread for
+              # up to 170s — turning warehouse queuing into app-wide timeouts.
+              - name: WAREHOUSE_MAX_CONCURRENT_STATEMENTS
+                value: ${var.warehouse_max_concurrent_statements}
+              # Makes Unity Catalog the read perimeter instead of the Apps ACL.
+              # OFF by default because switching it on narrows what users see.
+              - name: ENFORCE_USER_IDENTITY
+                value: ${var.enforce_user_identity}
+              - name: LINEAGE_HOP_MAX_ROWS
+                value: ${var.lineage_hop_max_rows}
+              # Serverless spend ceilings. The admin gate stops non-admins spending;
+              # these stop a loop or a bulk pass spending without a ceiling.
+              - name: MAX_BUILDS_IN_FLIGHT
+                value: ${var.max_builds_in_flight}
+              - name: MAX_BUILDS_PER_DAY
+                value: ${var.max_builds_per_day}
+              - name: LLM_MAX_CALLS_PER_USER_PER_DAY
+                value: ${var.llm_max_calls_per_user_per_day}
 
   prod:
     mode: production
@@ -218,3 +259,24 @@ targets:
                 value: ${var.transform_cache_ttl_seconds}
               - name: BUILD_CACHE_TTL_HOURS
                 value: ${var.build_cache_ttl_hours}
+              # --- Load, cost and data-boundary controls -------------------
+              # Admission control between the app's threads and the warehouse.
+              # Without it the app presents far more concurrent statements than a
+              # warehouse runs, and a QUEUED statement still holds an app thread for
+              # up to 170s — turning warehouse queuing into app-wide timeouts.
+              - name: WAREHOUSE_MAX_CONCURRENT_STATEMENTS
+                value: ${var.warehouse_max_concurrent_statements}
+              # Makes Unity Catalog the read perimeter instead of the Apps ACL.
+              # OFF by default because switching it on narrows what users see.
+              - name: ENFORCE_USER_IDENTITY
+                value: ${var.enforce_user_identity}
+              - name: LINEAGE_HOP_MAX_ROWS
+                value: ${var.lineage_hop_max_rows}
+              # Serverless spend ceilings. The admin gate stops non-admins spending;
+              # these stop a loop or a bulk pass spending without a ceiling.
+              - name: MAX_BUILDS_IN_FLIGHT
+                value: ${var.max_builds_in_flight}
+              - name: MAX_BUILDS_PER_DAY
+                value: ${var.max_builds_per_day}
+              - name: LLM_MAX_CALLS_PER_USER_PER_DAY
+                value: ${var.llm_max_calls_per_user_per_day}

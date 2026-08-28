@@ -494,6 +494,7 @@ Before deploying, review the permissions the app needs. The app uses a **bare mi
 | `SELECT` on `system.access.audit` | For transformation-lineage notebook-path resolution | No | Account admin |
 | `SELECT` on `system.query.history` | For the transformation-lineage query-history fallback (entity-less producers). Identity-scoped — needs broad query-history visibility to resolve other users' ad-hoc tables | No | Account admin |
 | `ALL PRIVILEGES` on `LINEAGE_CATALOG.LINEAGE_SCHEMA` (dedicated store) | For writing transformation-lineage tables. **Option A:** this one schema is the *only* place the app writes — **no write on any data catalog** (node ids embed the real catalog) | No | Owner of the dedicated catalog/schema |
+| `CAN_RUN` on the deployed bundle source folder (`${workspace.file_path}`) | For transformation-lineage **builds** — the build job runs `notebooks/run_pipeline` from there as the app SPN, and `bundle deploy` leaves that folder readable only by the deployer + workspace admins | Grants it (it owns the folder) | The deploying identity, via `./grant_build_source_access.sh` |
 | `CAN_USE` on SQL Warehouse | Yes | No | Warehouse owner / admin |
 | `CAN_MANAGE` on SQL Warehouse | No | Yes (if SPN) | Warehouse owner / admin |
 | Workspace membership | Auto (app SPN added) | Must exist in workspace | Workspace admin |
@@ -561,6 +562,25 @@ Then deploy with `--profile my-spn-profile`. See [OAuth M2M authentication](http
 
 1. **Settings > Workspace > Previews** → Enable "Databricks Apps - On-Behalf-Of User Authorization"
 2. **Compute > Apps > lineage-explorer-dev** → Edit → User Authorization → Add scopes: `iam.current-user:read`, `iam.access-control:read`
+
+**Let the app read its own deployed source** (required for transformation-lineage builds):
+
+```bash
+./grant_build_source_access.sh --profile <your-profile> --app bricktrace-dev
+```
+
+`bundle deploy` uploads the source to `/Workspace/Users/<deployer>/.bundle/<bundle>/<target>/files`,
+which only the deployer and workspace admins can touch. Clicking **Generate transformation lineage**
+submits a serverless job that runs `<source>/notebooks/run_pipeline` and imports
+`<source>/transformation_lineage` **as the app's service principal** — so without a grant on that
+folder every build fails with `Unable to access the notebook … lacks the required permissions`.
+
+The script resolves the app's SPN + source path from `apps get` and grants that SPN `CAN_RUN` on the
+folder (children inherit). `CAN_READ` is *not* enough — a `notebook_task` must execute the notebook.
+Run it as the identity that deployed the bundle: it already has `CAN_MANAGE` there, so no metastore
+admin, warehouse, or account admin is involved. It is idempotent (PATCH — existing ACL entries are
+untouched) and `make deploy` runs it for you. Re-run it whenever the bundle root is re-created: a
+first deploy, a deploy from a different identity, a renamed bundle/target, or after `bundle destroy`.
 
 **Grant permissions to the app SPN:**
 
@@ -1061,6 +1081,8 @@ lineage-explorer/
 | Catalog not visible | App SPN lacks `USE CATALOG` | Grant `USE CATALOG` + `BROWSE` |
 | `bundle deploy` host mismatch | Wrong profile | Use `--profile <name>` matching your `~/.databrickscfg` |
 | `bundle deploy` missing variable | No `--var warehouse_id` | Add `--var warehouse_id=<id>` to the deploy command |
+| Build fails: "Unable to access the notebook ... lacks the required permissions" | The app SPN has no `CAN_RUN` on the bundle source folder `bundle deploy` uploaded into the deployer's home | Run `./grant_build_source_access.sh --profile <profile> --app <app>` as the deploying identity, then Regenerate |
+| "The app's service principal cannot reach the deployed build notebook" (503 on Generate) | Same cause, caught by the pre-submit check before any serverless compute is spent | Same fix — the message names the script |
 | 429 Too Many Requests | Rate limit exceeded | Increase `RATE_LIMIT_MAX_REQUESTS` env var. Admin dashboard auto-refreshes every 10s -- set to `200` for dev environments. |
 | 400 "Invalid catalog" | Special chars in identifier | Use only alphanumeric + underscores |
 | Live toggle disabled for all | Workspace preview not enabled | Enable "Databricks Apps - On-Behalf-Of User Authorization Public Preview" in Settings > Workspace > Previews |

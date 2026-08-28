@@ -14,28 +14,54 @@ import pytest
 
 
 class TestAccessRoutes:
-    def test_requires_params(self, app_client):
-        resp = app_client.get("/api/access", params={"catalog": "c", "schema": "s"})
+    """These routes are admin-gated: they report which NAMED people read a table.
+
+    See the module docstring in backend/routes/access.py for why gating beats
+    redaction here.
+    """
+
+    def test_requires_params(self, admin_client):
+        resp = admin_client.get("/api/access", params={"catalog": "c", "schema": "s"})
         assert resp.status_code == 422
 
-    def test_injection_400(self, app_client):
-        resp = app_client.get("/api/access", params={
+    def test_injection_400(self, admin_client):
+        resp = admin_client.get("/api/access", params={
             "catalog": "bad;", "schema": "s", "table": "t"})
         assert resp.status_code == 400
 
-    def test_ok(self, app_client):
+    def test_ok(self, admin_client):
         with patch("backend.routes.access.get_access_summary",
                    return_value={"table_full_name": "c.s.t", "identities": {},
                                  "declared_grants": [], "audit_access": []}):
-            resp = app_client.get("/api/access", params={
+            resp = admin_client.get("/api/access", params={
                 "catalog": "c", "schema": "s", "table": "t"})
         assert resp.status_code == 200
 
-    def test_schema_access_ok(self, app_client):
+    def test_schema_access_ok(self, admin_client):
         with patch("backend.routes.access.get_schema_access_summary", return_value=[]):
-            resp = app_client.get("/api/access/schema", params={"catalog": "c", "schema": "s"})
+            resp = admin_client.get("/api/access/schema", params={"catalog": "c", "schema": "s"})
         assert resp.status_code == 200
         assert "tables" in resp.json()
+
+    def test_non_admin_gets_403(self, non_admin_client):
+        """The gate, and the fact that it precedes the audit query entirely."""
+        with patch("backend.routes.access.get_access_summary") as spy:
+            resp = non_admin_client.get("/api/access", params={
+                "catalog": "c", "schema": "s", "table": "t"})
+        assert resp.status_code == 403
+        spy.assert_not_called()
+
+    def test_non_admin_gets_403_on_schema_route(self, non_admin_client):
+        with patch("backend.routes.access.get_schema_access_summary") as spy:
+            resp = non_admin_client.get("/api/access/schema", params={"catalog": "c", "schema": "s"})
+        assert resp.status_code == 403
+        spy.assert_not_called()
+
+    def test_gate_precedes_validation(self, non_admin_client):
+        """403, not 400: an unauthorized caller learns nothing about the payload."""
+        resp = non_admin_client.get("/api/access", params={
+            "catalog": "bad;", "schema": "s", "table": "t"})
+        assert resp.status_code == 403
 
 
 class TestObservabilityProducers:

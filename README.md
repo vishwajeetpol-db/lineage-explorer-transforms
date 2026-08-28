@@ -128,7 +128,14 @@ Deploying to your own workspace is a short ordered checklist — not every step 
 >
 > **Shortcut — use the `Makefile`.** `make redeploy` runs build → deploy → run in one step and bakes in all of the above `--var` overrides so a config change or restart never drops one. Override defaults on the command line, e.g. `make redeploy PROFILE=<profile> WAREHOUSE_ID=<id> LINEAGE_CATALOG=<cat> LINEAGE_SCHEMA=<schema>`. Run `make help` to list targets.
 
-**3. Grant the app's service principal** (as a **metastore admin**). The SP only exists after step 2. Easiest path — the helper resolves the SP and applies the grants:
+**3. Let the app read its own deployed source** (as the **deploying** identity — no admin rights needed). `bundle deploy` uploads the source into *your* home folder (`/Workspace/Users/<you>/.bundle/...`), which the app's service principal cannot read. The app runs `notebooks/run_pipeline` there as a job to build transformation lineage, so without this grant every "Generate transformation lineage" build fails with *"Unable to access the notebook ... lacks the required permissions"*:
+
+    chmod +x grant_build_source_access.sh   # first time only
+    ./grant_build_source_access.sh --profile <profile> --app <app-name>
+
+> `make deploy` / `make redeploy` run this automatically. Re-run it after anything that re-creates the bundle root — a first deploy, a deploy from a different identity, a renamed bundle or target, or a `bundle destroy`. It is idempotent, and it only ever *adds* an ACL entry (`CAN_RUN` on that one folder for that one SP). Table and column lineage work without it; only transformation-lineage **builds** need it.
+
+**4. Grant the app's service principal** (as a **metastore admin**). The SP only exists after step 2. Easiest path — the helper resolves the SP and applies the grants:
 
     chmod +x grant_app_access.sh    # first time only — the script may land non-executable after clone
     ./grant_app_access.sh --profile <profile> --warehouse <warehouse-id> --catalogs "catalog_a catalog_b"
@@ -137,11 +144,11 @@ Deploying to your own workspace is a short ordered checklist — not every step 
 
 Or do it by hand: fill the `:APP_SP` / `:CATALOG` placeholders in **[`setup.sql`](setup.sql)** and run it. End-to-end traces span catalogs, so grant `BROWSE` on **every** catalog you want visible.
 
-**4. (Optional) Live mode** — enable App on-behalf-of OAuth + scopes `iam.current-user:read`, `iam.access-control:read`, and set `--var admin_group_name=<your-admin-group>` if it isn't `admins`.
+**5. (Optional) Live mode** — enable App on-behalf-of OAuth + scopes `iam.current-user:read`, `iam.access-control:read`, and set `--var admin_group_name=<your-admin-group>` if it isn't `admins`.
 
-**5. Verify** — open `https://<app-url>/api/diagnostics` (or run `make diagnostics`). It reports exactly which prerequisites the SP can reach (warehouse, `system.access`, `system.billing`, `information_schema`, catalog BROWSE), so a misconfigured deploy surfaces a clear reason instead of an empty graph.
+**6. Verify** — open `https://<app-url>/api/diagnostics` (or run `make diagnostics`). It reports exactly which prerequisites the SP can reach (warehouse, `system.access`, `system.billing`, `information_schema`, catalog BROWSE), so a misconfigured deploy surfaces a clear reason instead of an empty graph.
 
-**6. (Optional) Enable opt-in capabilities** — open the app, click the header menu → **Control Panel**, and as a workspace admin toggle on Runtime Plan Capture, Captured-Plan Precedence, and/or Federated Sync. All are OFF by default. See [docs/capabilites.md](docs/capabilites.md) for setup steps. The v2.5.0 API capabilities (governance, impact, observability, access, ML, discovery, DQ, diagnostics) are always-on — no toggle required.
+**7. (Optional) Enable opt-in capabilities** — open the app, click the header menu → **Control Panel**, and as a workspace admin toggle on Runtime Plan Capture, Captured-Plan Precedence, and/or Federated Sync. All are OFF by default. See [docs/capabilites.md](docs/capabilites.md) for setup steps. The v2.5.0 API capabilities (governance, impact, observability, access, ML, discovery, DQ, diagnostics) are always-on — no toggle required.
 
 ## Documentation
 

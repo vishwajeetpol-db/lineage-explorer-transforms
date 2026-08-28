@@ -9,6 +9,7 @@ Covers:
 """
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -92,6 +93,39 @@ def _reset_global_state():
                 _ls._cost_cache_fetched_at = 0.0
         except Exception:
             pass
+        # Build-service globals: the per-table build lock and the source-access
+        # latch. Both are process-wide. test_cache_service calls the REAL
+        # submit_build_job with a MagicMock client, whose workspace.get_status
+        # auto-succeeds — latching whatever path it resolved, so a later test
+        # asserting the preflight actually probes would pass vacuously depending on
+        # file order. A leaked _build_locks entry likewise makes a later build for
+        # the same FQN raise "already in progress".
+        try:
+            import backend.build_service as _bs
+            _bs._reset_source_access_cache()
+            _bs._build_locks.clear()
+            _bs._reset_build_budget()
+        except Exception:
+            pass
+        # Admission-control counters, the cache hit buffer, and the LLM call budget.
+        # All module-global and all cheap to reset; leaking any of them makes a later
+        # test's assertion depend on how many tests ran before it.
+        try:
+            import backend.warehouse_gate as _wg
+            _wg.reset_stats()
+            _wg.clear_request_context()
+        except Exception:
+            pass
+        try:
+            import backend.cache_service as _cs
+            _cs._reset_hit_buffer()
+        except Exception:
+            pass
+        try:
+            import backend.server.llm as _llm
+            _llm._reset_llm_budget()
+        except Exception:
+            pass
 
     _reset()   # before the test
     yield
@@ -124,9 +158,22 @@ def _never_build_a_real_workspace_client():
     """
     import backend.lineage_service as ls
     ls._client_instance = None
-    with patch.object(ls, "WorkspaceClient", MagicMock()):
+    # SdkConfig too, not just WorkspaceClient. `Config.__init__` resolves auth/OIDC
+    # metadata against the host over the NETWORK, so constructing one with a fake host
+    # blocks until it gives up — the same hang this fixture exists to prevent, one
+    # layer down. It went unnoticed because the only pre-existing SdkConfig call site
+    # (main._get_user_info) is patched wholesale by the client fixtures.
+    #
+    # A namespace, not a MagicMock: tests assert on what was passed (cfg.token,
+    # cfg.host), and a MagicMock would make every such assertion silently pass.
+    def _fake_config(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    with patch.object(ls, "WorkspaceClient", MagicMock()), \
+         patch.object(ls, "SdkConfig", _fake_config):
         yield
     ls._client_instance = None
+    ls._reset_user_clients()
 
 
 @pytest.fixture

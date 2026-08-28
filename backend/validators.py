@@ -89,3 +89,82 @@ def require_admin(request) -> str:
     if not is_admin:
         raise HTTPException(status_code=403, detail="Admin required")
     return email or ""
+
+
+# ---------------------------------------------------------------------------
+# Outbound URL safety (SSRF)
+#
+# The app makes exactly one outbound call to a URL it did not author: the Delta
+# Sharing provider probe in federated_sync. That URL comes from Unity Catalog
+# metadata (`sharing_server_url`), which anyone able to register a sharing provider
+# controls — a delegated privilege in most large metastores. Unvalidated, it reaches
+# the app's network position, which includes cloud instance-metadata endpoints and
+# workspace-internal services that trust that position.
+#
+# Validation is only half the fix. The other half is a rule rather than a check:
+# never attach the app's OWN credential to a request aimed at a host the app did not
+# choose. See federated_sync.probe_peer.
+# ---------------------------------------------------------------------------
+_BLOCKED_HOST_LITERALS = {
+    "localhost", "metadata", "metadata.google.internal",
+    "instance-data", "169.254.169.254", "metadata.goog",
+}
+
+
+class UnsafeOutboundURL(ValueError):
+    """The URL is not safe to fetch — private, non-HTTPS, or unresolvable."""
+
+
+def assert_safe_outbound_url(url: object, what: str = "URL") -> str:
+    """Return the URL if it is safe to fetch from the app, else raise.
+
+    Rejects: non-https schemes (http included — these are cross-network calls and a
+    downgrade is a plausible attack, not a convenience); credentials embedded in the
+    netloc; hosts that resolve to loopback, private, link-local, reserved or
+    multicast addresses; and a handful of cloud metadata names that resolve to
+    routable-looking addresses on some platforms.
+
+    Resolution matters: a public hostname can have an A record pointing at
+    169.254.169.254, so checking the literal host is not enough. This still leaves a
+    DNS-rebinding window between the check and the connect, which is why the
+    credential rule above is the primary control and this is defence in depth.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+
+    raw = str(url or "").strip()
+    if not raw:
+        raise UnsafeOutboundURL(f"{what} is empty")
+    try:
+        parts = urlsplit(raw)
+    except Exception as e:
+        raise UnsafeOutboundURL(f"{what} is not parseable: {e}") from e
+
+    if parts.scheme.lower() != "https":
+        raise UnsafeOutboundURL(
+            f"{what} must use https (got {parts.scheme or 'no scheme'!r})"
+        )
+    if parts.username or parts.password:
+        raise UnsafeOutboundURL(f"{what} must not embed credentials")
+    host = (parts.hostname or "").lower()
+    if not host:
+        raise UnsafeOutboundURL(f"{what} has no host")
+    if host in _BLOCKED_HOST_LITERALS:
+        raise UnsafeOutboundURL(f"{what} host {host!r} is not allowed")
+
+    try:
+        infos = socket.getaddrinfo(host, parts.port or 443, proto=socket.IPPROTO_TCP)
+    except OSError as e:
+        raise UnsafeOutboundURL(f"{what} host {host!r} does not resolve: {e}") from e
+
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        ):
+            raise UnsafeOutboundURL(
+                f"{what} host {host!r} resolves to a non-public address ({ip})"
+            )
+    return raw

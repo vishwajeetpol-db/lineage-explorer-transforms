@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import {
   Search, FolderOpen, ChevronRight, Loader2, RefreshCw, Layers, FolderTree, GitBranch,
   Home, GitBranchPlus, Network, ShieldCheck, ScrollText, FileBarChart, Settings as SettingsIcon,
-  Bell, HelpCircle, Sun, Moon, Database, ChevronDown, ChevronRight as ChevronR, ChevronLeft,
+  Bell, HelpCircle, Sun, Moon, Database, ChevronDown, ChevronLeft,
   Activity, TableProperties, Workflow, AlertTriangle, FilePenLine, ArrowRight, Shield,
 } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
@@ -164,43 +164,55 @@ function Landing({ onSelectTable }: Props) {
           })}
         </nav>
 
-        {/* Workspace selector */}
+        {/* Workspace selector — DEFERRED, greyed out on purpose.
+            See "Known gaps" in CHANGELOG.md. This was a plain <div> with a dropdown
+            chevron and no handler, and there is nothing behind it to switch between:
+            the app binds to exactly ONE workspace (a single WorkspaceClient), so a
+            dropdown would have had nothing to list. Left in place and visibly
+            disabled so it reads as "not yet" rather than "broken", and so the slot
+            is reserved for the real multi-workspace feature. */}
         <div className="px-3 pb-3">
           {navCollapsed ? (
-            <div className="flex justify-center py-2 text-[#fecdd3]/75" title="All Workspaces">
+            <div className="flex justify-center py-2 text-[#fecdd3]/30" title="Multi-workspace — coming soon">
               <Database size={16} />
             </div>
           ) : (
-            <div className="rounded-xl border border-white/10 bg-black/25 px-3 py-2.5">
-              <div className="text-[9px] uppercase tracking-wider text-[#fecdd3]/55 font-medium mb-1">Workspace</div>
+            <div
+              aria-disabled="true"
+              title="Multi-workspace — coming soon"
+              className="rounded-xl border border-white/[0.06] bg-black/15 px-3 py-2.5 opacity-45 cursor-not-allowed select-none"
+            >
+              <div className="text-[9px] uppercase tracking-wider text-[#fecdd3]/40 font-medium mb-1">Workspace</div>
               <div className="flex items-center gap-2">
-                <Database size={14} className="text-[#fecdd3]/75" />
-                <span className="text-[12px] text-[#fff1f2] flex-1 truncate">All Workspaces</span>
-                <ChevronDown size={14} className="text-[#fecdd3]/65" />
+                <Database size={14} className="text-[#fecdd3]/45" />
+                <span className="text-[12px] text-[#fecdd3]/60 flex-1 truncate">All Workspaces</span>
+                <ChevronDown size={14} className="text-[#fecdd3]/35" />
               </div>
             </div>
           )}
         </div>
 
-        {/* User */}
+        {/* Signed-in user — display only.
+            This was a <button> carrying a ChevronRight and no onClick handler, so it
+            looked expandable and did nothing on click. Identifying the signed-in user
+            is the entire requirement, so it is now a plain element: no button, no
+            chevron, no hover affordance. Nothing here invites a click it cannot
+            answer. */}
         <div className="px-3 pb-2 border-t border-white/10 pt-3">
-          <button
+          <div
             title={navCollapsed ? (userEmail || "User") : undefined}
-            className={`w-full flex items-center gap-2.5 py-1.5 rounded-xl hover:bg-white/[0.07] transition-colors ${navCollapsed ? "justify-center px-0" : "px-2"}`}
+            className={`w-full flex items-center gap-2.5 py-1.5 ${navCollapsed ? "justify-center px-0" : "px-2"}`}
           >
             <span className="w-9 h-9 rounded-full bg-gradient-to-br from-orange-500 to-rose-600 flex items-center justify-center text-[12px] font-bold text-[#fff1f2] shrink-0">
               {initials}
             </span>
             {!navCollapsed && (
-              <>
-                <div className="text-left flex-1 min-w-0">
-                  <div className="text-[12px] font-semibold text-[#fff1f2] truncate">{userEmail ? userEmail.split("@")[0] : "User"}</div>
-                  <div className="text-[10px] text-[#fecdd3]/65 truncate">{userEmail || "—"}</div>
-                </div>
-                <ChevronR size={14} className="text-[#fecdd3]/65 shrink-0" />
-              </>
+              <div className="text-left flex-1 min-w-0">
+                <div className="text-[12px] font-semibold text-[#fff1f2] truncate">{userEmail ? userEmail.split("@")[0] : "User"}</div>
+                <div className="text-[10px] text-[#fecdd3]/65 truncate">{userEmail || "—"}</div>
+              </div>
             )}
-          </button>
+          </div>
         </div>
 
         {/* Collapse toggle — pinned to the bottom, matching the workspace rail. */}
@@ -220,14 +232,19 @@ function Landing({ onSelectTable }: Props) {
 
         {/* Top-right bar */}
         <div className="flex items-center justify-end gap-3 px-6 h-[68px] shrink-0 relative z-10">
-          <button onClick={() => useLineageStore.getState().setGlobalSearchOpen(true)}
-            className="relative text-slate-400 hover:text-slate-200 transition-colors" title="Notifications">
+          {/* DEFERRED — see "Known gaps" in CHANGELOG.md.
+              This was wired to setGlobalSearchOpen(true), so the bell opened the
+              global SEARCH palette: a mis-pointed handler, not a missing one, which
+              is why clicking it produced a search box. Disabled rather than
+              re-pointed at goNotifications until the notifications view is finished.
+              The unread badge is dropped with it — a count you cannot open is an
+              unresolvable nag, and the data is still on /api/notifications. */}
+          <button
+            disabled
+            aria-disabled="true"
+            className="relative text-slate-600 cursor-not-allowed"
+            title="Notifications — coming soon">
             <Bell size={19} />
-            {unread > 0 && (
-              <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full bg-rose-500 text-white text-[9px] font-bold flex items-center justify-center">
-                {unread > 9 ? "9+" : unread}
-              </span>
-            )}
           </button>
           <button className="text-slate-400 hover:text-slate-200 transition-colors" title="Help"><HelpCircle size={19} /></button>
           <button onClick={toggleTheme} className="text-slate-400 hover:text-slate-200 transition-colors"

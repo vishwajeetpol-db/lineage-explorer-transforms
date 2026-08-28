@@ -56,6 +56,12 @@ from backend.lineage_service import (
     evict_cache_entry,
     get_cache_snapshot,
     _get_client,
+    UserIdentityUnavailable,
+    set_user_token,
+    ENFORCE_USER_IDENTITY,
+    LINEAGE_HOP_MAX_ROWS,
+    LINEAGE_MAX_NODES,
+    LINEAGE_WINDOW_DAYS,
 )
 from backend.transform_service import (
     get_transform_freshness,
@@ -70,7 +76,17 @@ from backend.build_service import (
     get_build_status,
     is_build_configured,
     get_pipeline_notebook_path,
+    BuildSourceAccessError,
     BUILD_STEPS,
+    BuildBudgetError,
+    get_build_budget,
+)
+from backend.server.llm import get_llm_budget
+from backend.warehouse_gate import (
+    ADMISSION_WAIT_S,
+    WarehouseBusyError,
+    get_stats as warehouse_stats,
+    set_request_context,
 )
 from backend.models import BuildJobRequest
 from backend.feature_flags import list_flags, set_flag_state, check_access_requirements
@@ -268,6 +284,17 @@ async def lifespan(app: FastAPI):
     # Default is min(32, os.cpu_count() + 4) = 8 on a 4-core app.
     # 64 threads allows ~20 concurrent SQL queries + user info lookups
     # while keeping single-process shared state (cache, coalescing, rate limits).
+    # A14: the per-request guard on LOCAL_DEV_ADMIN_EMAIL is correct but it is one
+    # condition in a hot path standing between a dev convenience and workspace-wide
+    # admin. Refusing to BOOT is a much louder signal than a log line nobody reads,
+    # and it takes the variable out of the request path entirely on a real deploy.
+    if os.environ.get("LOCAL_DEV_ADMIN_EMAIL") and os.environ.get("DATABRICKS_APP_NAME"):
+        raise RuntimeError(
+            "LOCAL_DEV_ADMIN_EMAIL is set on a deployed App (DATABRICKS_APP_NAME is "
+            "present). That variable grants admin to unauthenticated requests and is "
+            "for local development only. Remove it from the App's env in databricks.yml "
+            "and redeploy."
+        )
     import concurrent.futures
     loop = asyncio.get_running_loop()
     loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=64))
@@ -377,11 +404,32 @@ app.add_middleware(RateLimitMiddleware, max_requests=RATE_LIMIT_MAX_REQUESTS, wi
 
 
 class MetricsMiddleware(BaseHTTPMiddleware):
-    """Records request latency for the admin dashboard."""
+    """Records request latency, and stamps the warehouse-attribution context.
+
+    The attribution stamp belongs in middleware because it must be set ONCE per
+    request, before any handler runs, and reach SQL calls however many threads deep
+    they execute. warehouse_gate uses a ContextVar for exactly that reason —
+    asyncio.to_thread copies the current context into the worker thread.
+
+    Identity comes from the x-forwarded-email header rather than _get_user_info:
+    the header is already present on every proxied request, while _get_user_info
+    costs an SDK round-trip. Attribution is telemetry, so a cheap approximate
+    identity is the right trade — the authorization path still uses the real one.
+    """
 
     async def dispatch(self, request: Request, call_next):
         if not request.url.path.startswith("/api/"):
             return await call_next(request)
+        # route.path (e.g. "/api/lineage/{catalog}") not url.path, so the tag has
+        # bounded cardinality instead of one distinct value per table browsed.
+        route = request.scope.get("route")
+        endpoint = getattr(route, "path", None) or request.url.path
+        set_request_context(endpoint, request.headers.get("x-forwarded-email", ""))
+        # A1: make the caller's own token available to the read paths. Inert unless
+        # ENFORCE_USER_IDENTITY is set — get_read_client returns the app SP's client
+        # otherwise — so this costs one ContextVar write per request today and is the
+        # only plumbing the switch needs when it is turned on.
+        set_user_token(request.headers.get("x-forwarded-access-token", ""))
         start = time.time()
         response = await call_next(request)
         latency_ms = (time.time() - start) * 1000
@@ -390,6 +438,36 @@ class MetricsMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(MetricsMiddleware)
+
+
+@app.exception_handler(UserIdentityUnavailable)
+async def _identity_unavailable_handler(request: Request, exc: UserIdentityUnavailable):
+    """401, not 500: a missing credential is not a defect.
+
+    Only reachable with ENFORCE_USER_IDENTITY on. It means a data path was entered
+    without a forwarded token, so the query was deliberately NOT run as the app's
+    service principal — failing closed is the point of the flag.
+    """
+    logger.warning("No caller identity for %s %s — refused (enforcement is on)",
+                   request.method, request.url.path)
+    return JSONResponse(status_code=401, content={"detail": str(exc)})
+
+
+@app.exception_handler(WarehouseBusyError)
+async def _warehouse_busy_handler(request: Request, exc: WarehouseBusyError):
+    """429, not 500: this is backpressure, not a defect.
+
+    A 500 makes a capacity problem look like a bug and gives the client no reason
+    to retry; a 429 with Retry-After tells it exactly what to do. Retry-After is
+    set past the admission wait so a retry does not arrive into the same queue it
+    was just shed from.
+    """
+    logger.warning("Shed %s %s — warehouse at capacity", request.method, request.url.path)
+    return JSONResponse(
+        status_code=429,
+        content={"detail": str(exc)},
+        headers={"Retry-After": str(int(ADMISSION_WAIT_S) + 5)},
+    )
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -624,6 +702,32 @@ async def api_admin_status(request: Request):
         "user_cache": {
             "entries": len(_user_info_cache),
             "max_entries": USER_INFO_CACHE_MAX,
+        },
+        # E1: the numbers that answer "why is the warehouse busy, and who is doing
+        # it". `shed_rate_pct` above zero means the app is throttling — either the
+        # warehouse needs to be bigger or something is looping.
+        "warehouse_gate": warehouse_stats(),
+        # C2: serverless spend, with the submitting admin attached to each run.
+        "build_budget": get_build_budget(),
+        # C3: AI analysis calls per user per day.
+        "llm_budget": get_llm_budget(),
+        # A1: whether Unity Catalog or the app ACL is the read perimeter right now.
+        "read_perimeter": {
+            "enforce_user_identity": ENFORCE_USER_IDENTITY,
+            "note": (
+                "Reads run as the calling user; Unity Catalog is the perimeter."
+                if ENFORCE_USER_IDENTITY else
+                "Reads run as the app service principal, so every user sees whatever "
+                "it can read and the Apps ACL is the real perimeter. Set "
+                "ENFORCE_USER_IDENTITY=true to make Unity Catalog the perimeter."
+            ),
+        },
+        # C1: the lineage window is the app's biggest cost dial — show it, so a
+        # narrower scan is a visible, attributable choice rather than a hidden default.
+        "lineage_window": {
+            "days": LINEAGE_WINDOW_DAYS,
+            "hop_max_rows": LINEAGE_HOP_MAX_ROWS,
+            "max_nodes": LINEAGE_MAX_NODES,
         },
     }
 
@@ -1165,7 +1269,8 @@ async def api_transform_build(request: Request, body: BuildJobRequest):
         # A force_rebuild also forces a full re-parse (bypass change detection),
         # so "Regenerate" / clear-and-rebuild actually re-runs the parser.
         run_id = await asyncio.to_thread(
-            submit_build_job, table_fqn, catalog, schema, bool(body.force_rebuild)
+            submit_build_job, table_fqn, catalog, schema, bool(body.force_rebuild),
+            email or "",
         )
         return {
             "status": "submitted",
@@ -1173,6 +1278,19 @@ async def api_transform_build(request: Request, body: BuildJobRequest):
             "table_fqn": table_fqn,
             "steps": BUILD_STEPS,
         }
+    except BuildBudgetError as e:
+        # 429, not 403: the caller IS allowed to build, there is just no budget left
+        # right now. A 403 would read as "you lack permission" and send an admin
+        # hunting through ACLs for a spend ceiling.
+        logger.warning(f"Build budget refused {table_fqn} for {email}: {e}")
+        raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": "60"})
+    except BuildSourceAccessError as e:
+        # Curated remediation text, not raw exception detail — surfaced verbatim
+        # (not through _safe_error, which truncates at 200 chars) because the
+        # caller is an admin who needs the exact fix. 503: the build subsystem is
+        # unusable until an operator acts, same as "not configured" above.
+        logger.error(f"Build source unreachable for {table_fqn}: {e}")
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error submitting build job for {table_fqn}: {e}")
         raise HTTPException(status_code=500, detail=_safe_error(e))
