@@ -169,6 +169,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     signed-in user is the whole requirement, so it is now display-only: no button, no chevron,
     no hover state, nothing inviting a click it cannot answer.
 
+- **The sidebar's Admin Dashboard replaced the view you were working in.** It was a
+  `<button onClick={goAdmin}>`, and `goAdmin` called `navigate()` — a `history.pushState` in
+  the current tab — so an admin checking warehouse-gate or budget counters lost whatever
+  lineage graph, DQ run, or impact analysis was on screen and had to rebuild it on the way
+  back. The header menu's own admin entry (`HeaderMenu.tsx`) had always opened a new tab, so
+  the two entry points to the same view behaved differently.
+  - The sidebar entry is now a real `<a href target="_blank" rel="noopener noreferrer">`, not
+    a button with a `window.open` handler. That distinction is the point: only an anchor gives
+    cmd/middle-click, the "open in new tab" context menu, a target URL on hover, and the link
+    role a screen reader announces. `NavItem` gained an `href` field, and the nav loop renders
+    an anchor for entries that set it.
+  - `goAdmin` is **removed** rather than left unused. A new tab parses its route from the
+    query string, so nothing can reach this view by `pushState` any more — leaving a same-tab
+    navigator in the router is how this quietly gets rewired back.
+  - New `routeHref(route)` in `useRouter.ts` builds link URLs from the same
+    route→query mapping `navigate` uses, so a link cannot drift from its route. It is
+    query-only, so it resolves against whatever path the app is served from rather than
+    hardcoding `/` the way `HeaderMenu` still does.
+  - Tests: the click-through test no longer asserts `goAdmin` fired; a new test pins the
+    `href`/`target`/`rel` triple *and* that the item is no longer a button, plus `routeHref`
+    coverage for the admin, parameterised, and empty-search cases. `dist/` rebuilt
+    (`index-1iSsiirw.js`).
+
 ### Known gaps
 
 - **Notifications view is deferred.** The backend is complete and working —

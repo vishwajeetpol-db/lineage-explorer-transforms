@@ -12,7 +12,7 @@ import {
   goSchemaLineage,
   goCatalogLineage,
   goControlPanel,
-  goAdmin,
+  routeHref,
   goDQ,
   goGlossary,
   goNotifications,
@@ -143,7 +143,6 @@ describe("useRouter — routeToSearch via go* helpers", () => {
     expectSearch(() => goSchemaLineage("c", "s"), "?view=schemaLineage&catalog=c&schema=s");
     expectSearch(() => goCatalogLineage("c"), "?view=catalogLineage&catalog=c");
     expectSearch(goControlPanel, "?controlPanel=true");
-    expectSearch(goAdmin, "?admin=true");
     expectSearch(() => goDQ("a.b.c"), "?view=dq&table=a.b.c");
     expectSearch(() => goDQ(), "?view=dq");
     expectSearch(goGlossary, "?view=glossary");
@@ -154,5 +153,15 @@ describe("useRouter — routeToSearch via go* helpers", () => {
     expectSearch(goStreaming, "?view=streaming");
     // landing serializes to empty search
     expectSearch(goLanding, "");
+  });
+
+  // The admin view has no go* helper on purpose: it is opened in a new tab, and a
+  // new document reads its route from the query string, so it needs an href.
+  it("serializes routes to hrefs for links", () => {
+    expect(routeHref({ view: "admin" })).toBe("?admin=true");
+    expect(routeHref({ view: "dq", table: "a.b.c" })).toBe("?view=dq&table=a.b.c");
+    // Landing's empty search would make href="" mean "the current URL", so it
+    // falls back to a bare "?" — which parses back to landing.
+    expect(routeHref({ view: "landing" })).toBe("?");
   });
 });

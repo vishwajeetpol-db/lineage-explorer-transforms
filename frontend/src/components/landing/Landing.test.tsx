@@ -16,14 +16,15 @@ vi.mock("framer-motion", () => ({
   }),
   AnimatePresence: ({ children }: any) => children,
 }));
-const nav = { goCatalogs: vi.fn(), goTableLineage: vi.fn(), goRootCause: vi.fn(), goDQ: vi.fn(), goControlPanel: vi.fn(), goAdmin: vi.fn() };
+const nav = { goCatalogs: vi.fn(), goTableLineage: vi.fn(), goRootCause: vi.fn(), goDQ: vi.fn(), goControlPanel: vi.fn() };
 vi.mock("../../hooks/useRouter", () => ({
   goCatalogs: () => nav.goCatalogs(),
   goTableLineage: () => nav.goTableLineage(),
   goRootCause: () => nav.goRootCause(),
   goDQ: () => nav.goDQ(),
   goControlPanel: () => nav.goControlPanel(),
-  goAdmin: () => nav.goAdmin(),
+  // Admin Dashboard is a link, not a navigate() call — see the new-tab test below.
+  routeHref: (r: { view: string }) => (r.view === "admin" ? "?admin=true" : "?"),
 }));
 vi.mock("./LineagePicker", () => ({ default: ({ mode }: any) => <div data-testid="picker">picker-{mode}</div> }));
 vi.mock("../../api/client", () => ({
@@ -96,12 +97,10 @@ describe("Landing", () => {
     await user.click(screen.getByText("Data Quality"));
     await user.click(screen.getByText("Reports"));
     await user.click(screen.getByText("Settings"));
-    await user.click(screen.getByText("Admin Dashboard"));
     expect(nav.goTableLineage).toHaveBeenCalled();
     expect(nav.goDQ).toHaveBeenCalled();
     expect(nav.goRootCause).toHaveBeenCalled();
     expect(nav.goControlPanel).toHaveBeenCalled();
-    expect(nav.goAdmin).toHaveBeenCalled();
   });
 
   it("opens global search from sidebar and hero button", async () => {
@@ -140,6 +139,21 @@ describe("Landing", () => {
     useLineageStore.setState({ isAdmin: true });
     render(<Landing onSelectTable={vi.fn()} />);
     expect(screen.getByText("Admin Dashboard")).toBeInTheDocument();
+  });
+
+  // It used to be a <button> wired to goAdmin(), which replaced the lineage view
+  // the admin was looking at. An anchor is what makes it a new tab, and what makes
+  // cmd/middle-click work; rel="noopener" keeps the opened tab off window.opener.
+  it("opens Admin Dashboard in a new tab rather than navigating in place", () => {
+    useLineageStore.setState({ isAdmin: true });
+    render(<Landing onSelectTable={vi.fn()} />);
+    const link = screen.getByText("Admin Dashboard").closest("a");
+    expect(link).not.toBeNull();
+    expect(link).toHaveAttribute("href", "?admin=true");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link!.getAttribute("rel")).toContain("noopener");
+    // No same-tab navigator is reachable from this item any more.
+    expect(screen.getByText("Admin Dashboard").closest("button")).toBeNull();
   });
 
   // The previous test here was named "opens search from the notifications bell" and

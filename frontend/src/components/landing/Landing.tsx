@@ -9,7 +9,7 @@ import {
 import { useLineageStore } from "../../store/lineageStore";
 import { api } from "../../api/client";
 import { useThemeStore } from "../../store/themeStore";
-import { goCatalogs, goTableLineage, goRootCause, goDQ, goControlPanel, goAdmin } from "../../hooks/useRouter";
+import { goCatalogs, goTableLineage, goRootCause, goDQ, goControlPanel, routeHref } from "../../hooks/useRouter";
 import LineagePicker from "./LineagePicker";
 
 interface Props {
@@ -17,7 +17,15 @@ interface Props {
 }
 
 // ---- Sidebar nav ----------------------------------------------------------
-type NavItem = { label: string; icon: typeof Home; action?: () => void; active?: boolean; adminOnly?: boolean };
+type NavItem = {
+  label: string;
+  icon: typeof Home;
+  action?: () => void;
+  /** Set instead of `action` to open the destination in a new tab. */
+  href?: string;
+  active?: boolean;
+  adminOnly?: boolean;
+};
 const NAV: NavItem[] = [
   { label: "Home", icon: Home, active: true },
   { label: "Search", icon: Search, action: () => useLineageStore.getState().setGlobalSearchOpen(true) },
@@ -27,7 +35,9 @@ const NAV: NavItem[] = [
   { label: "Data Quality", icon: ShieldCheck, action: () => goDQ() },
   { label: "Reports", icon: FileBarChart, action: goRootCause },
   { label: "Settings", icon: SettingsIcon, action: goControlPanel },
-  { label: "Admin Dashboard", icon: Shield, action: goAdmin, adminOnly: true },
+  // Opens in a new tab so an admin can watch the dashboard without losing the
+  // lineage graph they were working in. Matches the header menu's admin entry.
+  { label: "Admin Dashboard", icon: Shield, href: routeHref({ view: "admin" }), adminOnly: true },
 ];
 
 // ---- Recent activity (from notifications) ---------------------------------
@@ -146,19 +156,40 @@ function Landing({ onSelectTable }: Props) {
         <nav className="flex-1 px-3 py-2 space-y-1 overflow-y-auto overflow-x-hidden">
           {NAV.filter((item) => !item.adminOnly || isAdmin).map((item) => {
             const Icon = item.icon;
-            return (
+            const cls = `w-full flex items-center gap-3 py-2.5 rounded-xl text-[13px] font-medium transition-all whitespace-nowrap ${navCollapsed ? "justify-center px-0" : "px-4"} ${
+              item.active
+                ? "bg-rose-500/30 text-[#fff1f2] border border-rose-300/50 shadow-[inset_0_0_16px_rgba(244,63,94,0.25)]"
+                : "text-[#ffe4e6]/75 hover:text-[#fff1f2] hover:bg-white/[0.07] border border-transparent"
+            }`;
+            const body = (
+              <>
+                <Icon size={17} className="shrink-0" />
+                {!navCollapsed && item.label}
+              </>
+            );
+            // A new-tab destination has to be a real anchor, not a button with a
+            // window.open handler: only a link gives cmd/middle-click, the "open
+            // in new tab" context menu, a visible target URL on hover, and the
+            // link role a screen reader announces.
+            return item.href ? (
+              <a
+                key={item.label}
+                href={item.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={navCollapsed ? item.label : undefined}
+                className={cls}
+              >
+                {body}
+              </a>
+            ) : (
               <button
                 key={item.label}
                 onClick={item.action}
                 title={navCollapsed ? item.label : undefined}
-                className={`w-full flex items-center gap-3 py-2.5 rounded-xl text-[13px] font-medium transition-all whitespace-nowrap ${navCollapsed ? "justify-center px-0" : "px-4"} ${
-                  item.active
-                    ? "bg-rose-500/30 text-[#fff1f2] border border-rose-300/50 shadow-[inset_0_0_16px_rgba(244,63,94,0.25)]"
-                    : "text-[#ffe4e6]/75 hover:text-[#fff1f2] hover:bg-white/[0.07] border border-transparent"
-                }`}
+                className={cls}
               >
-                <Icon size={17} className="shrink-0" />
-                {!navCollapsed && item.label}
+                {body}
               </button>
             );
           })}
