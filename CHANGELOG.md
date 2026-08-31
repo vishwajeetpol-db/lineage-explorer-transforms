@@ -9,10 +9,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 > **Branch scope.** Everything in this section is work on `feature/table-lineage-workspace`,
-> branched from `main` at `df858f9` on **2026-06-18**. As of 2026-08-22 the branch carries
-> **102 commits** — 339 files, ~62k insertions — covering the combined BrickTrace application,
+> branched from `main` at `df858f9` on **2026-06-18**. As of 2026-08-31 the branch carries
+> **109 commits** — 360 files, ~67.5k insertions — covering the combined BrickTrace application,
 > the Table Lineage workspace, on-demand transformation lineage, the backend/frontend test
-> suites and their coverage gates, and the security hardening below.
+> suites and their coverage gates, the security hardening below, and the enterprise-readiness
+> pass.
 
 ### Added
 
@@ -25,6 +26,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Deep framework analysis for metadata-driven pipelines** — when normal analysis finds no column logic (a generic, config-driven ETL engine), an agentic streaming (NDJSON) second pass detects the config mechanism from the source, reads the producer's parameters, queries the identified config table(s), and derives per-column transformations from that config — narrating each step. New `backend/server/framework_analysis.py` + `POST /api/column-transformations/deep-analyze`.
 - **Existing lineage surfaced on open** — when the Column Transformation panel opens without a producer picked, `analysis_store.get_latest_for_table()` finds the newest stored analysis across ANY producer and surfaces it (labelled with its producer), instead of showing a contradictory "No lineage yet".
 - **Maroon collapsible rails + colour-coded panels** — the catalog tree and home sidebar are now a deep-maroon collapsible rail (collapses to a slim icon rail); each capability panel gets its own accent identity (coloured top edge + tinted header + icon chip), home tiles match, and panels can be minimized to a dock of chips pinned to the screen bottom. Light-mode legibility tightened (darkened slate ramp + scoped accent-text remaps).
+
+- **Architecture reference (`docs/bricktrace_architecture.html`).** A standalone diagrammed
+  walkthrough of the app: the request path from the React SPA through FastAPI to Unity Catalog
+  system tables, where the distributed cache and circuit breaker sit, and how on-demand
+  transformation lineage is built and stored. The product-overview PDF
+  (`docs/BrickTrace_Product_Overview.pdf`) and `docs/bricktrace_capabilities.html` were
+  refreshed alongside it.
 
 ### Changed
 
@@ -48,6 +56,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Fixed 42 pre-existing broken tests** (stale `_execute_sql`/`_sql` mock targets, out-of-date response-shape and endpoint-param assertions, admin-gate expectations) and a **suite-isolation defect**: the process-wide FastAPI app's rate-limiter buckets + auth cache + lineage LRU/cost globals leaked across tests, causing order-dependent 429s (the main cause of the original mass failure). A `conftest.py` autouse fixture now resets them before/after each test.
 - **Frontend test suite to a 90%+ gate** (Vitest + React Testing Library + jsdom + v8 coverage): **96% lines / 95% statements / 94% functions / 85% branches**, 572 tests. Covers the api client (100%), stores/hooks/lib (100%), and every panel/component (browse, control-panel, landing, layout, transform-non-canvas, ui, table-lineage — including the new `ColumnOverviewModal`). `frontend/vitest.config.ts` sets the thresholds and excludes the graph/canvas rendering layer (React Flow + ELK), the `App.tsx` shell, and dead code; `src/test/setup.ts` shims jsdom gaps (localStorage/matchMedia/ResizeObserver/pointer-capture). Run `cd frontend && npm run coverage`.
 - **Restored the backend gate after the tab/overview/deep-analysis work.** Those features shipped `framework_analysis.py`, new `llm.py` paths, and new lineage routes without tests, which dropped backend coverage to 87.3% and broke 5 tests whose assertions predated the new behaviour. Added `tests/test_server_framework_analysis.py` (framework_analysis 0→100%), extended the `llm.py` tests (`explain_transformations`/`detect_framework_config`/`derive_columns_from_config`/temperature-retry/content-block flattening → 57→97%) and the column-transformation route tests (new `/overview` + `/deep-analyze` → 67→79%), and updated the 5 stale tests. Backend back to **90.5%, 1471 passing / 0 failing**.
+
+- **The production build broke the first time it ran after the Vitest suite landed.**
+  `npm run build` is `tsc && vite build`, and `tsconfig.json`'s `include: ["src"]` swept in the
+  `*.test.tsx` files, which fail on `global` with no `@types/node` — so `make build` failed on
+  code that was never shipped. Tests are excluded from the production typecheck; Vitest
+  transpiles them through its own pipeline, so they are still type-checked where it matters.
 
 ### Enterprise readiness (load, cost, and the data boundary)
 
@@ -75,15 +89,84 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
-> A code review of the preceding `fix(security)` commit (`bb2689b`) found that several of its
-> controls were bypassable and that its commit message over-claimed in three places. The
-> findings below were each reproduced by executing the code before being fixed.
+> Two passes, in order. First a security review of the branch closed **eight** findings
+> (`bb2689b`); then a code review *of that commit* found several of its own controls
+> bypassable and its message over-claiming in three places (`0d43ab5`). Both are recorded
+> here — the second pass only makes sense against the first. Every finding in both passes was
+> reproduced by executing the code before being fixed.
+>
+> Context that framed every fix: **no `_execute_sql` variant supports bound parameters**, and
+> all SQL runs as the app service principal, never as the caller. So an injection is a
+> privilege escalation to the SP's entire UC and system-tables read scope, and a missing gate
+> is reachable by every app user — there is no auth middleware and no router-level
+> dependencies. All of `backend/routes/` and `backend/server/` is new on this branch, so this
+> was newly introduced surface rather than inherited debt.
+
+#### First pass — eight findings (`bb2689b`)
+
+- **Quote-doubling was not enough to escape a SQL literal, and ~130 call sites relied on it.**
+  Databricks SQL treats `\` as an escape inside single-quoted literals by default, so a value
+  beginning `\'` becomes `\''` — the second quote **closes** the literal and the remainder
+  executes as SQL. Only `analysis_store._sql_str` escaped the backslash first. New
+  `validators.sql_str(value, limit)` escapes **backslash before quote** and truncates *before*
+  escaping so a cap cannot split an escape pair, and was adopted across `capability_cache`,
+  `cache_service`, `analysis_store`, `graph_snapshots`, `external_sources`, `glossary`,
+  `notifications`, `openlineage` and `ml`. Enum-like parameters (`platform`, `severity`,
+  `status`, `status_filter`, `scope`) are additionally allow-listed rather than escaped.
+- **Any user could read any workspace source the app SP could reach.** `entity_id` is
+  free-form (`_ENTITY_ID_RE` permits `/`, `.`, `@`) and the fetch runs as the SP, so a
+  non-admin could aim `/api/analyze-producer/version` or `/compare` at an arbitrary notebook
+  and get it back verbatim — while the sibling `/history` was admin-gated and returned only
+  metadata. New `_assert_producer_of()` requires the `(entity_type, entity_id)` pair to be a
+  producer Unity Catalog actually recorded for the target table, **fails closed**, and is
+  applied to all eight producer-resolving endpoints; `_strip_source()` redacts `source_code`
+  for non-admins (the diff's `source_changed` signal is hash-derived, so it survives
+  redaction).
+- **Four of the eight were injection sites**, each confirmed exploitable by executing it.
+  `openlineage produce` interpolated
+  catalog/schema unvalidated (5-column UNION, with `events_produced` as an in-band oracle);
+  the notifications rules MERGE left `rule_id`/`rule_type`/`severity` unescaped while
+  `target_pattern`/`notes` *on the same statement* were escaped; glossary upserts left term,
+  domain and KPI ids unescaped in both the USING source and the INSERT VALUES; and ml
+  `tables-for-model` validated `model_name` but not `model_version` (a single-line query, so
+  `--` killed ORDER BY/LIMIT). Fixed with allow-lists, `Literal` enums, UUID checks and
+  `sql_str` respectively.
+- **Mutators and ingest endpoints shipped ungated.** Admin gates added to snapshot DELETE (a
+  hard delete with no per-user scoping — while auto-capture on the *same table* already
+  returned 403), external register + source DELETE, notifications scan/rules/rule-DELETE,
+  glossary term DELETE, openlineage import/produce/configure, closures enqueue-delivery,
+  ol-bridge sources listing, and dq metrics. Writes deliberately left open (snapshot capture,
+  glossary upserts — both UI-exposed to every user) now record the **real caller** instead of
+  a hardcoded `'app'`.
+- **Producer config could be hijacked.** `configure` keyed its MERGE on `endpoint_name` with
+  `WHEN MATCHED` overwriting `endpoint_url`, and the ungated GET disclosed the names to
+  target. Now admin-gated with https-only URL validation.
+Also in this pass, as mechanism rather than as findings of their own:
+**`validators.require_admin(request)`** replaced the copied four-line gate block, so a new
+endpoint cannot ship ungated by forgetting to paste it; and raw `SQL failed: …` text stopped
+being returned to callers across the routers this pass touched — the three modules it missed
+are the last item of the second pass below.
+
+#### Second pass — the review of that commit (`0d43ab5`)
 
 - **The DQ expression validator is rebuilt around a single lexer, closing three verified injection bypasses.** A `CUSTOM` expression lands at SQL *code* position inside `SUM(CASE WHEN (<expr>) …)`, so the allow-list grammar — not escaping — is the only control there. The previous implementation had three independent holes, all now closed by tokenizing **once** and running every check over that one token stream (`_tokenize`/`_significant`/`_code_only` in `backend/routes/dq.py`):
   - **Back-quoted function names skipped the allow-list entirely.** The check was guarded by `if token[:1].isalpha() or token[:1] == "_"`, which is `False` for a back-quoted identifier — so ``` `reflect`('java.lang.System','getProperty','user.name') ``` passed while the identical bare `reflect(1) > 0` was correctly rejected. Spark resolves function references through delimited identifiers, so the backticks were transparent to the engine and opaque only to the validator. `reflect`/`java_method` are arbitrary static Java invocation.
   - **Validation and execution scanned different strings.** `_strip_string_literals` was backtick-blind, so a `'` inside a back-quoted identifier opened a phantom literal and blanked an arbitrary region from every downstream check while that region still executed verbatim: ``` `a'` = 1 OR (SELECT 1 FROM main.hr.payroll) > 0 OR `b'` = 1 ``` validated as three harmless tokens. Matching literals and quoted identifiers as single units in one pass makes this class of divergence unrepresentable. Quoted identifiers containing a quote, backslash or semicolon are now rejected outright.
   - **Qualified function names passed on their last part.** The token loop only tested the identifier immediately before `(`, so `maincat.mysch.abs(salary) > 0` cleared the grammar — but Databricks resolves a three-part name to a *Unity Catalog* function, not the builtin. Anyone with `CREATE FUNCTION` on a schema they own could define `mycat.mysch.abs` with a subquery body and restore the scalar-subquery read-oracle the commit set out to close. Qualified calls are now rejected.
 - **`column_name` is validated, not just escaped.** It reaches a code position via the back-quoted `safe_col` in `_build_check_sql`, and back-quoting alone is not a control: an embedded backtick closes the identifier early, so a stored `` x`) THEN 1 ELSE 0 END) AS passing_rows, (SELECT …) AS leak FROM … -- `` rewrote the whole projection — and `dict(zip(columns, row))` let the injected duplicate alias win, returning the leaked value as `passing_rows`. Now allow-listed at both the write site (`upsert_dq_rule`) and the build site, so rules stored before the check existed can't execute either.
+  - **That first `column_name` check then rejected columns Unity Catalog actually allows.**
+    It reused the module's local `_IDENTIFIER_RE` (`^[A-Za-z0-9_]{1,255}$`), which forbids
+    hyphens and spaces — but UC permits both, which is *why* the query builder back-quotes the
+    name. So `Order Date` and `my-col` were refused: writes 400'd, and any **existing** rule on
+    such a column was marked permanently invalid, silently dropping the check while reporting
+    coverage as incomplete. Replaced with `_validate_column_name`, which screens the actual
+    boundary rather than a name shape: the only character that can end back-quoting is the
+    backtick, so that is what is rejected (plus control characters, for log and SQL hygiene).
+    Hyphens, spaces, dots and unicode are inert once quoted and are accepted again; the
+    break-out payload is still refused, verified by test. Found by asking what would happen on
+    deploy rather than trusting a green suite — every existing test used a plain `snake_case`
+    column, so nothing failed.
+
 - **The admin gate on `GET /api/dq-rules/metrics` was decorative.** `root_cause._get_dq_violations` executed the same stored expressions with **no validation at all**, and it is reached from `POST /api/root-cause/analyze` and `POST /api/diagnostics/root-cause` — neither admin-gated. It now validates with the same grammar (forcing the code-position rules, since `NOT ({expr})` is a code position for *every* rule type, unlike dq.py's REGEX/RANGE literal slot) and skips any rule that fails. Its `table_fqn` and `column_name` literals, previously interpolated raw, are now escaped.
 - **`GET /api/openlineage/producer/config` is admin-gated and redacts `endpoint_url`.** The commit message claimed this endpoint was already gated; it was not. Dropping the `api_key_secret_*` columns was necessary but insufficient — `configure_producer` only checks https+host, so `https://marquez.internal.corp/api/v1/lineage?apiKey=…` is a valid registration, and an ungated read handed every app user the query string and internal hostname.
 - **`register_webhook` validates the URL scheme.** It previously did none at all — `urlparse` appeared in the module only inside `_redact_url` — so `http://` and `file://` were accepted and the delivery job would POST notification content (and the row's `secret`) in plaintext.
