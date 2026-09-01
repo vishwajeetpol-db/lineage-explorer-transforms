@@ -277,6 +277,7 @@ class TestRunScanAndAutoScan:
              patch.object(n, "_detect_dq_degradation", return_value=[]), \
              patch.object(n, "_detect_sensitive_flows", return_value=sf), \
              patch.object(n, "_existing_notification_keys", return_value={n._notif_key(sc[0])}), \
+             patch.object(n, "_prune_notifications"), \
              patch.object(n, "_create_notification", side_effect=lambda it: created.append(it)):
             result = n.run_scan()
         assert result["detected"] == {"schema_changes": 1, "dq_degradation": 0, "sensitive_flows": 1}
@@ -291,10 +292,42 @@ class TestRunScanAndAutoScan:
              patch.object(n, "_detect_dq_degradation", return_value=[]), \
              patch.object(n, "_detect_sensitive_flows", return_value=[]), \
              patch.object(n, "_existing_notification_keys", return_value=set()), \
+             patch.object(n, "_prune_notifications") as prune, \
              patch.object(n, "_create_notification", side_effect=lambda it: created.append(it)):
             result = n.run_scan()
         assert result["inserted"] == 2 and result["skipped"] == 0
         assert len(created) == 2
+        prune.assert_called_once_with(n.NOTIFICATION_RETENTION_MAX)  # prune runs after inserts
+
+    def test_run_scan_skips_prune_when_nothing_inserted(self):
+        import backend.routes.notifications as n
+        with patch.object(n, "_detect_schema_changes", return_value=[]), \
+             patch.object(n, "_detect_dq_degradation", return_value=[]), \
+             patch.object(n, "_detect_sensitive_flows", return_value=[]), \
+             patch.object(n, "_existing_notification_keys", return_value=set()), \
+             patch.object(n, "_prune_notifications") as prune, \
+             patch.object(n, "_create_notification"):
+            result = n.run_scan()
+        assert result["inserted"] == 0
+        prune.assert_not_called()
+
+    def test_prune_issues_delete_keeping_newest_n(self):
+        import backend.routes.notifications as n
+        with _patch_sql(return_value=[]) as m:
+            n._prune_notifications(200)
+        sql = m.call_args[0][0]
+        assert "DELETE FROM" in sql and "LIMIT 200" in sql and "detected_at" in sql
+
+    def test_prune_disabled_when_zero(self):
+        import backend.routes.notifications as n
+        with _patch_sql(return_value=[]) as m:
+            n._prune_notifications(0)
+        m.assert_not_called()
+
+    def test_prune_fail_open_on_error(self):
+        import backend.routes.notifications as n
+        with _patch_sql(side_effect=RuntimeError("delete blew up")):
+            n._prune_notifications(200)  # must not raise
 
     def test_autoscan_loop_runs_scan_then_retries_until_cancelled(self):
         import asyncio

@@ -56,6 +56,11 @@ AUTOSCAN_ENABLED = os.environ.get("NOTIFICATION_AUTOSCAN_ENABLED", "true").strip
 SCAN_INTERVAL_SECONDS = max(60, int(os.environ.get("NOTIFICATION_SCAN_INTERVAL_SECONDS", "21600")))  # 6h
 # Delay the first scan so it lands after startup/cost-prefetch and a warm warehouse.
 SCAN_INITIAL_DELAY_SECONDS = max(0, int(os.environ.get("NOTIFICATION_SCAN_INITIAL_DELAY_SECONDS", "90")))
+# Retention cap: keep only the most recent N notifications after each scan. The
+# detectors use LIMIT without a stable ordering, so successive scans surface
+# different slices of the same underlying data and the table would grow unbounded.
+# Pruning to the newest N keeps the table (and Recent Activity) meaningful. 0 = off.
+NOTIFICATION_RETENTION_MAX = max(0, int(os.environ.get("NOTIFICATION_RETENTION_MAX", "200")))
 SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")
 
 
@@ -227,13 +232,38 @@ def _existing_notification_keys(limit: int = 5000) -> set:
     return {_notif_key(r) for r in rows}
 
 
+def _prune_notifications(keep: int) -> None:
+    """Retention cap: delete all but the most recent `keep` notifications, so the
+    table can't grow unbounded across repeated scans. Best-effort and non-fatal.
+
+    Deletes rows older than the keep-th newest (ties at the boundary are kept, so
+    the floor is `keep`). When the table has <= keep rows the cutoff is the oldest
+    row and nothing is deleted."""
+    if keep <= 0:
+        return
+    try:
+        _execute_sql(f"""
+            DELETE FROM {NOTIF_TABLE}
+            WHERE detected_at < (
+                SELECT MIN(detected_at) FROM (
+                    SELECT detected_at FROM {NOTIF_TABLE}
+                    ORDER BY detected_at DESC LIMIT {int(keep)}
+                )
+            )
+        """)
+    except Exception as e:
+        logger.warning(f"notifications: retention prune failed (non-fatal): {e}")
+
+
 def run_scan() -> dict:
-    """Run all detectors and insert only notifications not already stored.
+    """Run all detectors and insert only notifications not already stored, then
+    prune to the retention cap.
 
     Shared by the admin endpoint and the background scheduler. Idempotent across
     runs (dedup by _notif_key), so it is safe to run on a timer. Detector errors
-    propagate so the caller decides how to surface them; the dedup read fails open.
-    Synchronous (blocking SQL) — callers run it via asyncio.to_thread."""
+    propagate so the caller decides how to surface them; the dedup read and the
+    prune both fail open. Synchronous (blocking SQL) — callers run it via
+    asyncio.to_thread."""
     _lazy_ensure()
     existing = _existing_notification_keys()
     detected = {"schema_changes": 0, "dq_degradation": 0, "sensitive_flows": 0}
@@ -253,6 +283,8 @@ def run_scan() -> dict:
             _create_notification(item)
             existing.add(key)
             inserted += 1
+    if inserted:
+        _prune_notifications(NOTIFICATION_RETENTION_MAX)
     return {"detected": detected, "inserted": inserted, "skipped": skipped}
 
 
