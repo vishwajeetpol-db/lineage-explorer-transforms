@@ -252,7 +252,7 @@ def _detect_schema_changes() -> list[dict]:
         # below, and this detector reported 0 schema changes unconditionally —
         # while the scan as a whole still reported success. Join to get the
         # table's alter time alongside the column detail.
-        rows = _execute_sql("""
+        rows = _execute_sql(f"""
             SELECT c.table_catalog, c.table_schema, c.table_name,
                    c.column_name, c.data_type
             FROM system.information_schema.columns c
@@ -261,6 +261,13 @@ def _detect_schema_changes() -> list[dict]:
               AND t.table_schema  = c.table_schema
               AND t.table_name    = c.table_name
             WHERE t.last_altered > current_timestamp() - INTERVAL 24 HOURS
+              -- Exclude noise: the platform's own catalogs and the app-owned
+              -- bookkeeping schema, whose cache/config tables are altered on
+              -- every deploy and are not user-facing data activity.
+              AND c.table_catalog <> 'system'
+              AND c.table_schema  <> 'information_schema'
+              AND NOT (c.table_catalog = '{sql_str(LINEAGE_CATALOG)}'
+                       AND c.table_schema = '{sql_str(LINEAGE_SCHEMA)}')
             LIMIT 200
         """)
         for row in rows:
