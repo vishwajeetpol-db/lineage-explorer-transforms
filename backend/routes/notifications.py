@@ -43,6 +43,19 @@ LINEAGE_SCHEMA = os.environ.get("LINEAGE_SCHEMA", "lineage")
 NOTIF_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.notifications"
 RULES_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.notification_rules"
 WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
+
+# --- Background auto-scan config ------------------------------------------
+# Notifications are only produced by a detection scan. Without a scheduler the
+# table stays empty until an admin clicks Scan, so Recent Activity is blank on a
+# fresh deploy. The scanner below runs the SAME scan on a timer, entirely off the
+# request path — the UI only ever READS the table, so screen render is never
+# blocked by (or waiting on) a scan.
+AUTOSCAN_ENABLED = os.environ.get("NOTIFICATION_AUTOSCAN_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+# How often the background scan runs. Detectors look back 24h (schema) / 7d
+# (sensitive flows), so a few hours keeps Recent Activity fresh without churn.
+SCAN_INTERVAL_SECONDS = max(60, int(os.environ.get("NOTIFICATION_SCAN_INTERVAL_SECONDS", "21600")))  # 6h
+# Delay the first scan so it lands after startup/cost-prefetch and a warm warehouse.
+SCAN_INITIAL_DELAY_SECONDS = max(0, int(os.environ.get("NOTIFICATION_SCAN_INITIAL_DELAY_SECONDS", "90")))
 SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")
 
 
@@ -188,37 +201,98 @@ async def mark_read(request: Request, body: dict):
         raise HTTPException(status_code=500, detail="Failed to mark notifications read.")
 
 
+def _notif_key(item: dict) -> tuple:
+    """Natural identity of a notification for dedup: its type + the table/column it
+    concerns + its title. Detector dicts use `type`; stored rows use `notif_type`."""
+    return (
+        (item.get("type") or item.get("notif_type") or "").strip(),
+        (item.get("table_fqn") or "").strip(),
+        (item.get("column_name") or "").strip(),
+        (item.get("title") or "").strip(),
+    )
+
+
+def _existing_notification_keys(limit: int = 5000) -> set:
+    """Natural keys of notifications already stored, so a re-scan (manual or the
+    background timer) doesn't insert duplicates. Fail-open: on any read error return
+    an empty set — better to risk one duplicate than to silently drop a real alert."""
+    try:
+        rows = _execute_sql(
+            f"SELECT notif_type, table_fqn, column_name, title FROM {NOTIF_TABLE} "
+            f"ORDER BY detected_at DESC LIMIT {int(limit)}"
+        )
+    except Exception as e:
+        logger.debug(f"notifications: could not read existing keys (dedup skipped): {e}")
+        return set()
+    return {_notif_key(r) for r in rows}
+
+
+def run_scan() -> dict:
+    """Run all detectors and insert only notifications not already stored.
+
+    Shared by the admin endpoint and the background scheduler. Idempotent across
+    runs (dedup by _notif_key), so it is safe to run on a timer. Detector errors
+    propagate so the caller decides how to surface them; the dedup read fails open.
+    Synchronous (blocking SQL) — callers run it via asyncio.to_thread."""
+    _lazy_ensure()
+    existing = _existing_notification_keys()
+    detected = {"schema_changes": 0, "dq_degradation": 0, "sensitive_flows": 0}
+    inserted = skipped = 0
+    for bucket, detect in (
+        ("schema_changes", _detect_schema_changes),
+        ("dq_degradation", _detect_dq_degradation),
+        ("sensitive_flows", _detect_sensitive_flows),
+    ):
+        found = detect()
+        detected[bucket] = len(found)
+        for item in found:
+            key = _notif_key(item)
+            if key in existing:
+                skipped += 1
+                continue
+            _create_notification(item)
+            existing.add(key)
+            inserted += 1
+    return {"detected": detected, "inserted": inserted, "skipped": skipped}
+
+
+async def _autoscan_loop() -> None:
+    """Periodic detection scan, started from the app lifespan. Runs entirely off the
+    request path (via asyncio.to_thread), so the UI only ever READS notifications and
+    screen render is never blocked by a scan. Resilient: a failed scan is logged and
+    retried on the next tick; cancellation (shutdown) propagates cleanly."""
+    logger.info(
+        f"notifications: auto-scan enabled — first run in {SCAN_INITIAL_DELAY_SECONDS}s, "
+        f"then every {SCAN_INTERVAL_SECONDS}s."
+    )
+    if SCAN_INITIAL_DELAY_SECONDS:
+        await asyncio.sleep(SCAN_INITIAL_DELAY_SECONDS)
+    while True:
+        try:
+            result = await asyncio.to_thread(run_scan)
+            logger.info(
+                f"notifications: auto-scan inserted {result['inserted']} new "
+                f"(skipped {result['skipped']} existing)."
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"notifications: auto-scan failed (will retry next tick): {e}")
+        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+
+
 @router.post("/scan")
 async def trigger_scan(request: Request):
     """Trigger a detection scan for schema changes, DQ degradation, and sensitive flows.
-    Creates notifications for any detected issues.
+    Creates notifications for any newly-detected issues (dedup: existing ones are skipped).
 
     Admin-gated: the scan runs broad system-table queries as the app service
-    principal and writes rows every user then sees."""
+    principal and writes rows every user then sees. The same scan also runs
+    automatically in the background (see _autoscan_loop)."""
     require_admin(request)
-    _lazy_ensure()
-    results = {"schema_changes": 0, "dq_degradation": 0, "sensitive_flows": 0}
-
     try:
-        # 1. Schema change detection: compare current vs. last-known columns
-        schema_changes = await asyncio.to_thread(_detect_schema_changes)
-        results["schema_changes"] = len(schema_changes)
-        for change in schema_changes:
-            await asyncio.to_thread(_create_notification, change)
-
-        # 2. DQ degradation: check rules with pass rates below threshold
-        dq_issues = await asyncio.to_thread(_detect_dq_degradation)
-        results["dq_degradation"] = len(dq_issues)
-        for issue in dq_issues:
-            await asyncio.to_thread(_create_notification, issue)
-
-        # 3. Sensitive data flow: PII columns flowing downstream without classification
-        sensitive_flows = await asyncio.to_thread(_detect_sensitive_flows)
-        results["sensitive_flows"] = len(sensitive_flows)
-        for flow in sensitive_flows:
-            await asyncio.to_thread(_create_notification, flow)
-
-        return {"status": "ok", "detected": results}
+        result = await asyncio.to_thread(run_scan)
+        return {"status": "ok", **result}
     except Exception as e:
         logger.error(f"notification scan failed: {e}")
         raise HTTPException(status_code=500, detail="Detection scan failed.")

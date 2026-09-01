@@ -318,16 +318,24 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Failed to pre-fetch cost cache (will retry on first lineage load): {e}")
     prefetch_task = asyncio.create_task(_prefetch_cost())
+    # Periodic notification detection scan. Runs entirely in the background, off the
+    # request path, so the home screen only ever READS notifications and its render is
+    # never blocked by (or waiting on) a scan. Enable/interval via NOTIFICATION_* env.
+    from backend.routes.notifications import _autoscan_loop, AUTOSCAN_ENABLED
+    autoscan_task: asyncio.Task | None = None
+    if AUTOSCAN_ENABLED:
+        autoscan_task = asyncio.create_task(_autoscan_loop())
     try:
         yield
     finally:
         logger.info("BrickTrace shutting down — cancelling background tasks, clearing caches")
-        if prefetch_task and not prefetch_task.done():
-            prefetch_task.cancel()
-            try:
-                await prefetch_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        for task in (prefetch_task, autoscan_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
         invalidate_cache()
 
 

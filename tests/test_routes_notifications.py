@@ -246,6 +246,78 @@ class TestScan:
 
 
 # ---------------------------------------------------------------------------
+# run_scan dedup + background auto-scan loop
+# ---------------------------------------------------------------------------
+class TestRunScanAndAutoScan:
+    def test_notif_key_uses_type_or_notif_type(self):
+        import backend.routes.notifications as n
+        assert n._notif_key({"type": "schema_change", "table_fqn": "c.s.t",
+                              "column_name": "a", "title": "T"}) == ("schema_change", "c.s.t", "a", "T")
+        # stored rows carry notif_type, not type
+        assert n._notif_key({"notif_type": "sensitive_flow", "title": "X"}) == ("sensitive_flow", "", "", "X")
+
+    def test_existing_keys_parses_rows(self):
+        import backend.routes.notifications as n
+        rows = [{"notif_type": "schema_change", "table_fqn": "c.s.t", "column_name": "a", "title": "T1"}]
+        with _patch_sql(return_value=rows):
+            keys = n._existing_notification_keys()
+        assert ("schema_change", "c.s.t", "a", "T1") in keys
+
+    def test_existing_keys_fail_open_on_error(self):
+        import backend.routes.notifications as n
+        with _patch_sql(side_effect=RuntimeError("no warehouse")):
+            assert n._existing_notification_keys() == set()
+
+    def test_run_scan_dedup_skips_existing(self):
+        import backend.routes.notifications as n
+        sc = [{"type": "schema_change", "table_fqn": "c.s.t", "column_name": "a", "title": "T1"}]
+        sf = [{"type": "sensitive_flow", "table_fqn": "c.s.u", "column_name": "email", "title": "T2"}]
+        created = []
+        with patch.object(n, "_detect_schema_changes", return_value=sc), \
+             patch.object(n, "_detect_dq_degradation", return_value=[]), \
+             patch.object(n, "_detect_sensitive_flows", return_value=sf), \
+             patch.object(n, "_existing_notification_keys", return_value={n._notif_key(sc[0])}), \
+             patch.object(n, "_create_notification", side_effect=lambda it: created.append(it)):
+            result = n.run_scan()
+        assert result["detected"] == {"schema_changes": 1, "dq_degradation": 0, "sensitive_flows": 1}
+        assert result["inserted"] == 1 and result["skipped"] == 1
+        assert len(created) == 1 and created[0]["type"] == "sensitive_flow"
+
+    def test_run_scan_inserts_all_when_none_existing(self):
+        import backend.routes.notifications as n
+        sc = [{"type": "schema_change", "title": "A"}, {"type": "schema_change", "title": "B"}]
+        created = []
+        with patch.object(n, "_detect_schema_changes", return_value=sc), \
+             patch.object(n, "_detect_dq_degradation", return_value=[]), \
+             patch.object(n, "_detect_sensitive_flows", return_value=[]), \
+             patch.object(n, "_existing_notification_keys", return_value=set()), \
+             patch.object(n, "_create_notification", side_effect=lambda it: created.append(it)):
+            result = n.run_scan()
+        assert result["inserted"] == 2 and result["skipped"] == 0
+        assert len(created) == 2
+
+    def test_autoscan_loop_runs_scan_then_retries_until_cancelled(self):
+        import asyncio
+        import backend.routes.notifications as n
+        scans = []
+
+        async def fake_sleep(_secs):
+            # 1st call = initial delay; after a scan has run, stop the loop.
+            if scans:
+                raise asyncio.CancelledError()
+
+        def fake_run():
+            scans.append(1)
+            return {"detected": {}, "inserted": 0, "skipped": 0}
+
+        with patch.object(n, "run_scan", side_effect=fake_run), \
+             patch.object(n.asyncio, "sleep", side_effect=fake_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(n._autoscan_loop())
+        assert len(scans) == 1  # ran exactly one scan, then the interval sleep cancelled
+
+
+# ---------------------------------------------------------------------------
 # GET/POST /api/notifications/rules  + DELETE
 # ---------------------------------------------------------------------------
 class TestRules:
