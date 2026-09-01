@@ -322,8 +322,11 @@ _FRAMEWORK_DETECT_PROMPT = textwrap.dedent("""\
     From the source code, identify:
       - config_tables: fully-qualified (catalog.schema.table) names of config /
         metadata / mapping tables the code READS to obtain column mappings or
-        rules. If a name is built from a variable/parameter, give your best
-        concrete guess and set "certain": false.
+        rules. Use the catalog/schema the CODE actually references — do NOT
+        assume the config table shares the target table's schema; config
+        frequently lives in a different (often shared) schema. If the name is
+        unqualified or built from a variable/parameter, give your best concrete
+        guess and set "certain": false.
       - parameters: names of pipeline/job parameters, widgets, or spark confs the
         code reads that select/filter which config applies.
       - target_key_columns: column names IN those config tables that identify which

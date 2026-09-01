@@ -167,6 +167,52 @@ def _query_config_table(fqn: str, target_table: str, key_columns: list[str]) -> 
     }
 
 
+def _is_table_not_found(err: Optional[Exception]) -> bool:
+    """True when a config-table read failed because the table/schema doesn't
+    exist (as opposed to a permissions error) — the signal that the LLM likely
+    guessed the wrong schema and we should resolve the real location."""
+    msg = str(err or "").upper()
+    return any(s in msg for s in ("TABLE_OR_VIEW_NOT_FOUND", "SCHEMA_NOT_FOUND", "NOT_FOUND"))
+
+
+def _resolve_config_alternates(name: str, target_table: str) -> list[str]:
+    """Resolve a config table's REAL location(s) by its bare name.
+
+    `detect_framework_config` is asked for a fully-qualified name, but when the
+    framework code references the table unqualified (or builds its name from a
+    parameter) the LLM tends to assume it shares the *target table's*
+    catalog.schema — which is frequently wrong (config commonly lives in a
+    sibling schema). Look the bare table name up in `information_schema.tables`
+    within the target's catalog and return the concrete FQN(s) found, excluding
+    the name we already tried. Best-effort: returns [] on any failure."""
+    bare = (name or "").split(".")[-1]
+    parts = (target_table or "").split(".")
+    if not re.fullmatch(r"[A-Za-z0-9_]+", bare or "") or len(parts) != 3:
+        return []
+    catalog = parts[0]
+    out: list[str] = []
+    try:
+        from backend.lineage_service import _get_client, _execute_sql
+        client = _get_client()
+        if client is None:
+            return []
+        rows = _execute_sql(
+            client,
+            f"SELECT table_schema FROM {catalog}.information_schema.tables "
+            f"WHERE table_name = '{bare}' ORDER BY table_schema",
+        )
+        for r in rows or []:
+            sch = r.get("table_schema")
+            if not sch:
+                continue
+            fqn = f"{catalog}.{sch}.{bare}"
+            if fqn != name and fqn not in out:
+                out.append(fqn)
+    except Exception as e:
+        logger.info(f"framework_analysis: config-table resolution failed for '{name}': {e}")
+    return out
+
+
 def deep_analyze_stream(
     entity_type: str, entity_id: str, target_table: str,
     actor: str = "", model: Optional[str] = None,
@@ -212,25 +258,43 @@ def deep_analyze_stream(
     for t in tables:
         name = t.get("name")
         yield _ev("query_config", "running", f"Querying config table {name}…")
+        res, err = None, None
         try:
             res = _query_config_table(name, target_table, key_cols)
         except Exception as e:
-            yield _ev("query_config", "warn", f"Config table {name} isn't readable ({str(e)[:120]}) — skipping.")
-            continue
+            err = e
+        used = name
+        # The LLM often qualifies an unqualified config table with the TARGET's
+        # schema, which may not exist. When the read fails because the table/schema
+        # isn't found, resolve the real location by its bare name and retry —
+        # rather than giving up and deriving nothing.
+        if res is None and _is_table_not_found(err):
+            for alt in _resolve_config_alternates(name, target_table):
+                yield _ev("query_config", "running", f"{name} not found there — resolving to {alt}…")
+                try:
+                    res = _query_config_table(alt, target_table, key_cols)
+                except Exception as e:
+                    err, res = e, None
+                    continue
+                if res is not None:
+                    used = alt
+                    yield _ev("query_config", "ok", f"Resolved {name} → {alt} (config lives in a different schema).")
+                    break
         if res is None:
-            yield _ev("query_config", "warn", f"Config table {name} is invalid or unreadable — skipping.")
+            detail = f" ({str(err)[:120]})" if err else ""
+            yield _ev("query_config", "warn", f"Config table {name} isn't readable{detail} — skipping.")
             continue
         # An empty config table is a distinct, common case for frameworks that
         # write their config per-run (or truncate between runs): there is simply
         # nothing to derive from right now — call it out rather than proceeding to
         # a generic "no columns" failure.
         if res["total_rows"] == 0:
-            empty_tables.append(name)
-            yield _ev("query_config", "warn", f"Config table {name} is currently empty — no config rows to derive from.")
+            empty_tables.append(used)
+            yield _ev("query_config", "warn", f"Config table {used} is currently empty — no config rows to derive from.")
             continue
         config_data.append(res)
         yield _ev("query_config", "ok",
-                  f"{name}: {len(res['rows'])} relevant row(s)"
+                  f"{used}: {len(res['rows'])} relevant row(s)"
                   + (f" (filtered from {res['total_rows']} by target)" if res["matched"] else f" (sample of {res['total_rows']})") + ".")
 
     # Short-circuit: config table(s) were identified but every one is empty, so

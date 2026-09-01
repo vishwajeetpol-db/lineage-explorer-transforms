@@ -311,3 +311,83 @@ class TestDeepAnalyzeStream:
         r = _result(events)
         assert r["derived"] is True
         assert r["version"] is None
+
+
+# ---------------------------------------------------------------------------
+# config-table schema resolution (the LLM guessed the target's schema)
+# ---------------------------------------------------------------------------
+
+class TestConfigTableResolution:
+    def test_is_table_not_found_matches_uc_error(self):
+        assert fa._is_table_not_found(RuntimeError("SQL failed: [TABLE_OR_VIEW_NOT_FOUND] `c`.`s`.`t`"))
+        assert fa._is_table_not_found(RuntimeError("[SCHEMA_NOT_FOUND] ..."))
+        assert not fa._is_table_not_found(RuntimeError("no perms"))
+        assert not fa._is_table_not_found(None)
+
+    def test_resolve_alternates_finds_sibling_schema(self):
+        with patch("backend.lineage_service._get_client", return_value=MagicMock()), \
+             patch("backend.lineage_service._execute_sql",
+                   return_value=[{"table_schema": "mapping_factory"}]):
+            alts = fa._resolve_config_alternates(
+                "cat.mapping_factory_fin.mf_pipeline_config",
+                "cat.mapping_factory_fin.fact_account_balance")
+        assert alts == ["cat.mapping_factory.mf_pipeline_config"]
+
+    def test_resolve_alternates_bad_target_shape_returns_empty(self):
+        assert fa._resolve_config_alternates("c.s.cfg", "not_a_fqn") == []
+
+    def test_resolve_alternates_swallows_query_failure(self):
+        with patch("backend.lineage_service._get_client", return_value=MagicMock()), \
+             patch("backend.lineage_service._execute_sql", side_effect=RuntimeError("no warehouse")):
+            assert fa._resolve_config_alternates("c.s.cfg", "c.s.t") == []
+
+    def test_deep_analyze_resolves_wrong_schema_and_succeeds(self):
+        # The LLM qualifies the config table with the target's schema (which
+        # doesn't exist); resolution finds the real sibling schema and retries.
+        cfg = {"config_tables": [{"name": "c.mapping_factory_fin.mf_pipeline_config", "certain": False}],
+               "parameters": [], "target_key_columns": [], "notes": ""}
+        good_cols = [{"target_column": "bal", "source_columns": ["a"],
+                      "expression": "a", "category": "PASS_THROUGH"}]
+        good_res = {"table": "x", "columns": ["target_name"],
+                    "rows": [{"target_name": "t"}], "total_rows": 3, "matched": True}
+
+        def _qc(fqn, target, keys):
+            if fqn == "c.mapping_factory_fin.mf_pipeline_config":
+                raise RuntimeError("SQL failed: [TABLE_OR_VIEW_NOT_FOUND] wrong schema")
+            return good_res
+
+        with patch.object(fa, "_fetch_source", return_value="framework code"), \
+             patch.object(fa.llm_client, "detect_framework_config", return_value=cfg), \
+             patch.object(fa, "_fetch_entity_parameters", return_value={}), \
+             patch.object(fa, "_resolve_config_alternates",
+                          return_value=["c.mapping_factory.mf_pipeline_config"]), \
+             patch.object(fa, "_query_config_table", side_effect=_qc), \
+             patch.object(fa, "_fetch_target_columns", return_value=["bal"]), \
+             patch.object(fa.llm_client, "derive_columns_from_config", return_value=good_cols), \
+             patch.object(fa.analysis_store, "save_analysis", return_value=7):
+            events = _events(fa.deep_analyze_stream(
+                "PIPELINE", "p1", "c.mapping_factory_fin.fact_account_balance"))
+        qc = _steps(events, "query_config")
+        assert any(e["status"] == "ok" and "Resolved" in e["message"] for e in qc)
+        assert qc[-1]["status"] == "ok"
+        r = _result(events)
+        assert r["derived"] is True
+        assert r["columns"] == good_cols
+
+    def test_deep_analyze_not_found_with_no_alternates_skips(self):
+        cfg = {"config_tables": [{"name": "c.s.cfg", "certain": False}],
+               "parameters": [], "target_key_columns": [], "notes": ""}
+        good_cols = [{"target_column": "x", "source_columns": ["a"],
+                      "expression": "a", "category": "PASS_THROUGH"}]
+        with patch.object(fa, "_fetch_source", return_value="code"), \
+             patch.object(fa.llm_client, "detect_framework_config", return_value=cfg), \
+             patch.object(fa, "_fetch_entity_parameters", return_value={}), \
+             patch.object(fa, "_resolve_config_alternates", return_value=[]), \
+             patch.object(fa, "_query_config_table",
+                          side_effect=RuntimeError("SQL failed: [TABLE_OR_VIEW_NOT_FOUND] x")), \
+             patch.object(fa, "_fetch_target_columns", return_value=["x"]), \
+             patch.object(fa.llm_client, "derive_columns_from_config", return_value=good_cols), \
+             patch.object(fa.analysis_store, "save_analysis", return_value=3):
+            events = _events(fa.deep_analyze_stream("JOB", "1", "c.s.t"))
+        assert _steps(events, "query_config")[-1]["status"] == "warn"
+        assert _result(events)["derived"] is True
