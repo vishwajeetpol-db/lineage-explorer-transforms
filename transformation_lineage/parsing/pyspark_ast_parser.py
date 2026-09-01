@@ -24,10 +24,93 @@ from __future__ import annotations
 
 import ast
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+# Readability helpers for the edge tooltip. These rewrite raw PySpark column
+# expressions into a compact, insight-friendly form for DISPLAY only (the graph
+# edges/nodes are unaffected). e.g.
+#   F.round(F.col('quantity') * F.col('unit_price'), 2) -> round(quantity * unit_price, 2)
+_COL_WRAP_RE = re.compile(r"""(?:F\.)?col\(\s*['"]([\w.]+)['"]\s*\)""")
+_LIT_WRAP_RE = re.compile(r"""(?:F\.)?lit\(\s*('[^']*'|"[^"]*"|[\w.]+)\s*\)""")
+
+
+def _prettify_expr(expr: str) -> str:
+    """Make a PySpark column expression readable for the tooltip (display only).
+
+    Unwraps `F.col('x')`/`col('x')` -> `x`, `F.lit(y)` -> `y`, and strips the
+    leading `F.` from function calls (`F.sum(` -> `sum(`). Purely cosmetic —
+    never used for parsing, node ids, or categories.
+    """
+    if not expr:
+        return expr
+    s = _COL_WRAP_RE.sub(r"\1", expr)   # F.col('quantity') -> quantity
+    s = _LIT_WRAP_RE.sub(r"\1", s)      # F.lit('unknown')  -> 'unknown'
+    s = re.sub(r"\bF\.", "", s)         # F.sum( -> sum(, F.when( -> when(
+    return s.strip()
+
+
+def _refs_in_alias_map(expr: str, alias_map: dict[str, dict[str, Any]]) -> list[str]:
+    """Column names referenced in `expr` (via col('x')) that are themselves
+    intermediate aliases — i.e. the expr's dependencies that need their own step."""
+    names = _COL_WRAP_RE.findall(expr or "")
+    out: list[str] = []
+    for n in names:
+        if n in alias_map and n not in out:
+            out.append(n)
+    return out
+
+
+def _build_step_expr(
+    expr: str,
+    source_cols: list[str],
+    alias_map: dict[str, dict[str, Any]],
+    output_column: str | None = None,
+) -> str:
+    """Return an insightful, numbered step-wise derivation for the edge tooltip.
+
+    Intermediate (in-code) columns referenced by `expr` — e.g. `net_revenue =
+    completed_revenue - refunded_amount`, where those two are aliases defined
+    earlier in the chain, not real table columns — are expanded into ordered
+    steps (dependencies first), ending with the output column:
+
+        Step 1: completed_revenue = sum(when(order_status == 'completed', total_amount).otherwise(0))
+        Step 2: refunded_amount = sum(when(order_status == 'refunded', total_amount).otherwise(0))
+        Step 3: net_revenue = completed_revenue - refunded_amount
+
+    Single-step derivations (no intermediates) return just the prettified
+    expression, so simple edges stay uncluttered. Graph nodes remain real table
+    columns; this only enriches the hover text.
+    """
+    seen: set[str] = set()
+    if output_column:
+        seen.add(output_column)  # never expand the output column as its own dep
+    order: list[tuple[str, str]] = []  # (intermediate name, prettified expr), deps first
+
+    def visit(refs: list[str]) -> None:
+        for r in refs:
+            if r in seen or r not in alias_map or len(order) >= 20:
+                continue
+            seen.add(r)
+            sub = (alias_map[r].get("expr") or "").strip()
+            # Resolve this intermediate's OWN intermediate deps first (post-order
+            # → dependencies get lower step numbers than the columns using them).
+            visit(_refs_in_alias_map(sub, alias_map))
+            order.append((r, _prettify_expr(sub)))
+
+    visit(source_cols)
+
+    final = _prettify_expr(expr or "")
+    if not order:
+        return final  # single step — just the expression, no numbering clutter
+
+    lines = [f"Step {i}: {name} = {e}" for i, (name, e) in enumerate(order, 1)]
+    lines.append(f"Step {len(order) + 1}: {output_column or 'result'} = {final}")
+    return "\n".join(lines)
 
 
 # Methods that reshape columns; their outputs become new column nodes
@@ -248,9 +331,35 @@ def _trace_root_fqns(node: ast.AST, st: _SymbolTable, seen: set[str] | None = No
     return list(dict.fromkeys(fqns))
 
 
+# Spark functions whose STRING argument is a literal constant, NOT a column
+# reference. `F.lit("unknown")` denotes the value "unknown", so it must never be
+# collected as a source column (it was showing up as a bogus `unknown` node in
+# `coalesce(col, lit("unknown"))` derivations).
+_LITERAL_FNS = {"lit", "typedLit"}
+
+
 def _find_col_refs(node: ast.AST) -> list[str]:
     """Collect column names referenced under `node` via F.col("x"), col("x"), or string literals
-    passed to `F.<fn>("col")`-style aggregate calls. Heuristic; intentionally permissive."""
+    passed to `F.<fn>("col")`-style aggregate calls. Heuristic; intentionally permissive.
+
+    String arguments of literal-producing functions (`F.lit(...)`) are excluded —
+    they are constant values, not columns.
+    """
+    # Pre-collect the id() of every Constant that is an argument to a literal fn
+    # (F.lit("x") / lit("x")); these must not be treated as column references.
+    literal_const_ids: set[int] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            fn = (
+                sub.func.attr if isinstance(sub.func, ast.Attribute)
+                else sub.func.id if isinstance(sub.func, ast.Name)
+                else None
+            )
+            if fn in _LITERAL_FNS:
+                for a in sub.args:
+                    if isinstance(a, ast.Constant):
+                        literal_const_ids.add(id(a))
+
     refs: list[str] = []
     for sub in ast.walk(node):
         if isinstance(sub, ast.Call):
@@ -260,6 +369,8 @@ def _find_col_refs(node: ast.AST) -> list[str]:
                 else sub.func.id if isinstance(sub.func, ast.Name)
                 else None
             )
+            if fn_attr in _LITERAL_FNS:
+                continue  # F.lit(...) — its args are constants, skip entirely
             if fn_attr == "col" and sub.args:
                 if isinstance(sub.args[0], ast.Constant) and isinstance(sub.args[0].value, str):
                     refs.append(sub.args[0].value)
@@ -270,7 +381,11 @@ def _find_col_refs(node: ast.AST) -> list[str]:
             ):
                 # F.sum("x"), F.countDistinct("x"), etc. — string args are usually columns.
                 for a in sub.args:
-                    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                    if (
+                        isinstance(a, ast.Constant)
+                        and isinstance(a.value, str)
+                        and id(a) not in literal_const_ids
+                    ):
                         # Filter obvious non-column literals (single chars, format strings, paths)
                         v = a.value
                         if v and v.replace("_", "").replace(".", "").isalnum() and not v.isdigit():
@@ -523,11 +638,17 @@ def _walk_chain_for_outputs(
             if len(call.args) >= 2 and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
                 name = call.args[0].value
                 expr_node = call.args[1]
-                expr_text = _unparse(call)
+                # Unparse ONLY this column's expression (the 2nd arg), not the
+                # whole `call` — `call` includes the entire receiver chain to its
+                # left (every preceding .withColumn/.filter), which made the edge
+                # tooltip show every column's transformation instead of just this
+                # one's. The select/agg branch already scopes to expr_node this way.
+                expr_text = _unparse(expr_node)
                 src_cols = _find_col_refs(expr_node)
                 _emit_mappings(
                     mappings, artifact_id, name, expr_text, src_cols,
                     single_source_fqn, alias_map, col_first_seen, st.df_alias_map,
+                    output_table_fqn=output_table_fqn,
                 )
 
         elif method == "withColumnRenamed":
@@ -544,6 +665,7 @@ def _walk_chain_for_outputs(
                 _emit_mappings(
                     mappings, artifact_id, new, f'col("{old}")', [old],
                     single_source_fqn, alias_map, col_first_seen, st.df_alias_map,
+                    output_table_fqn=output_table_fqn,
                 )
 
         elif method in {"select", "agg", "groupBy"}:
@@ -552,6 +674,7 @@ def _walk_chain_for_outputs(
                 _emit_mappings(
                     mappings, artifact_id, name, expr_text, src_cols,
                     single_source_fqn, alias_map, col_first_seen, st.df_alias_map,
+                    output_table_fqn=output_table_fqn,
                 )
 
         # Other methods (filter/join/etc.) don't create new output columns at this level.
@@ -569,13 +692,22 @@ def _emit_mappings(
     alias_map: dict[str, dict[str, Any]] | None = None,
     col_first_seen: dict[str, str] | None = None,
     df_alias_map: dict[str, str] | None = None,
+    *,
+    output_table_fqn: str | None = None,  # accepted for call-site compatibility
 ) -> None:
     """Emit one mapping per source column.
 
+    Graph nodes are always REAL TABLE COLUMNS: an intermediate (in-code) column
+    is flattened to the underlying base column(s) it derives from, so the graph
+    never shows a pseudo-node that looks like a table column but is actually a
+    local variable. The step-wise derivation through those intermediates is
+    instead captured in the edge's `expr` (see `_build_step_expr`) and surfaced
+    on hover.
+
     For each `sc` in `source_cols`, resolution priority is:
-        1. `alias_map[sc]`     -- `sc` is itself an alias defined upstream;
-                                  substitute its underlying source columns and
-                                  use its resolved FQN.
+        1. `alias_map[sc]`     -- `sc` is an intermediate alias; substitute its
+                                  underlying source columns + resolved FQN, and
+                                  expand its definition into the step-wise expr.
         2. `col_first_seen[sc]` -- `sc` is a real base column; attribute it to
                                   the table where it was first referenced.
         3. `source_fqn`        -- chain-level fallback (single root FQN).
@@ -583,6 +715,10 @@ def _emit_mappings(
     alias_map = alias_map or {}
     col_first_seen = col_first_seen or {}
     df_alias_map = df_alias_map or {}
+
+    # Step-wise expression: inline any intermediate-variable definitions this
+    # expr references, so the single edge tooltip shows the full derivation.
+    step_expr = _build_step_expr(expr or "", source_cols, alias_map, output_column)
 
     if not source_cols:
         mappings.append(
@@ -592,7 +728,7 @@ def _emit_mappings(
                 "source_ref": "",
                 "source_fqn": None,
                 "source_column": "",
-                "expr": (expr or "")[:2000],
+                "expr": step_expr[:2000],
                 "expr_lang": "pyspark",
             }
         )
@@ -610,7 +746,7 @@ def _emit_mappings(
                     "source_ref": base_col,
                     "source_fqn": alias_fqn,
                     "source_column": base_col,
-                    "expr": (expr or "")[:2000],
+                    "expr": step_expr[:2000],
                     "expr_lang": "pyspark",
                 }
             )
@@ -627,7 +763,7 @@ def _emit_mappings(
                         "source_ref": rsc,
                         "source_fqn": resolved_fqn,
                         "source_column": rsc,
-                        "expr": (expr or "")[:2000],
+                        "expr": step_expr[:2000],
                         "expr_lang": "pyspark",
                     }
                 )
@@ -640,7 +776,7 @@ def _emit_mappings(
                     "source_ref": base_col,
                     "source_fqn": resolved_fqn,
                     "source_column": base_col,
-                    "expr": (expr or "")[:2000],
+                    "expr": step_expr[:2000],
                     "expr_lang": "pyspark",
                 }
             )
@@ -845,8 +981,14 @@ def parse_pyspark_cells_ast(
     # when that cell is processed.
     shared_strings = _shared_bindings(t.string_vars for _, t in cell_tables)
     shared_df_to_table = _shared_bindings(t.df_to_table for _, t in cell_tables)
-    # df_chains hold AST nodes; comparing them across cells is unreliable
-    # and rarely valuable (chains live within a cell). Keep per-cell only.
+    # DataFrame chains bound in exactly one cell are shared so a DataFrame
+    # defined in one cell resolves when it is *written* (saveAsTable) in a
+    # different cell — the dominant notebook pattern (define the chain in a
+    # "Gold - …" cell, write it in a later "Write Tables" cell). Chains hold
+    # AST nodes (not value-comparable), so the safety rule is assignment
+    # uniqueness rather than value equality: a name reassigned across cells is
+    # excluded so the per-cell binding still wins (mirrors _shared_bindings).
+    shared_df_chains = _shared_df_chains(t for _, t in cell_tables)
 
     merged: dict[str, Any] = {
         "artifact_id": artifact_id,
@@ -866,7 +1008,7 @@ def parse_pyspark_cells_ast(
         cell_st = _SymbolTable(
             string_vars=dict(shared_strings),
             df_to_table=dict(shared_df_to_table),
-            df_chains={},
+            df_chains=dict(shared_df_chains),
         )
         try:
             part = parse_pyspark_ast(src, artifact_id=artifact_id, symbol_table=cell_st)
@@ -896,3 +1038,29 @@ def _shared_bindings(per_cell_dicts) -> dict[str, str]:
         for k, v in d.items():
             values.setdefault(k, set()).add(v)
     return {k: next(iter(vs)) for k, vs in values.items() if len(vs) == 1}
+
+
+def _shared_df_chains(cell_tables) -> dict[str, ast.AST]:
+    """Return name -> chain AST for DataFrame chains safe to share across cells.
+
+    Enables the split-cell pattern (define `df = <chain>` in one cell, write it
+    with `.saveAsTable()` in another). AST nodes aren't value-comparable, so the
+    safety rule is *assignment uniqueness* rather than value equality: a chain
+    name is shared only if exactly one cell binds it in `df_chains` and no cell
+    rebinds the same name as a table source (`df_to_table`). A name assigned in
+    more than one cell is volatile and left per-cell, so the local binding wins
+    (mirrors `_shared_bindings`' conflict handling).
+    """
+    chain_counts: dict[str, int] = {}
+    chain_node: dict[str, ast.AST] = {}
+    table_bound: set[str] = set()
+    for st in cell_tables:
+        for name, node in st.df_chains.items():
+            chain_counts[name] = chain_counts.get(name, 0) + 1
+            chain_node[name] = node
+        table_bound.update(st.df_to_table.keys())
+    return {
+        name: chain_node[name]
+        for name, count in chain_counts.items()
+        if count == 1 and name not in table_bound
+    }

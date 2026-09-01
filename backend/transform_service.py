@@ -599,7 +599,16 @@ def load_edges(
             return []
 
         where_parts = [f"pipeline_run_id = '{run_id}'"]
-        where_parts.append("src_fqn IS NOT NULL AND dst_fqn IS NOT NULL")
+        # The DESTINATION must be a fully-resolved column (that's the node the
+        # trace backtracks from). The SOURCE table (src_fqn) may legitimately be
+        # NULL: when a chain reads MULTIPLE tables (a join), the parser cannot
+        # safely attribute a bare column like `total_amount` to one side, so it
+        # leaves src_fqn NULL by design — but the derive edge still carries the
+        # real expression and source COLUMN. Requiring src_fqn NOT NULL here hid
+        # all join-derived column lineage ("No transformation logic found" on a
+        # table that genuinely has it). Keep such edges as long as the source
+        # column is known; the source node just renders without a table label.
+        where_parts.append("dst_fqn IS NOT NULL")
         where_parts.append("src_col IS NOT NULL AND dst_col IS NOT NULL")
         # Drop self-loops (src column node == dst column node). These come from
         # stale/mis-resolved parses attributing a source ref to the output table
