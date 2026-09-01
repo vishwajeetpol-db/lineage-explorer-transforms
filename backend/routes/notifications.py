@@ -413,17 +413,48 @@ def _detect_dq_degradation() -> list[dict]:
     return notifications[:50]
 
 
+def _safe_ident(s: object) -> bool:
+    """True for a plain SQL identifier (letters/digits/underscore) — used to guard a
+    catalog name before interpolating it into an information_schema query."""
+    return bool(s) and all(c.isalnum() or c == "_" for c in str(s))
+
+
+def _classified_columns(catalogs: set) -> set:
+    """Set of (catalog, schema, table, column), lowercased, that carry a UC tag —
+    i.e. are already *classified*. Queried per catalog from
+    information_schema.column_tags. Best-effort and fail-open: a catalog whose tags
+    can't be read contributes nothing, so its columns fall through as unclassified —
+    we would rather over-surface a sensitive flow than silently hide one."""
+    out: set = set()
+    for cat in {c for c in catalogs if _safe_ident(c)}:
+        try:
+            rows = _execute_sql(
+                f"SELECT catalog_name, schema_name, table_name, column_name "
+                f"FROM {cat}.information_schema.column_tags"
+            )
+        except Exception as e:
+            logger.debug(f"notifications: column_tags not readable for {cat}: {e}")
+            continue
+        for r in rows or []:
+            out.add((
+                str(r.get("catalog_name", "")).lower(), str(r.get("schema_name", "")).lower(),
+                str(r.get("table_name", "")).lower(), str(r.get("column_name", "")).lower(),
+            ))
+    return out
+
+
 def _detect_sensitive_flows() -> list[dict]:
-    """Detect sensitive (PII/PCI) columns flowing downstream without classification."""
+    """Detect sensitive (PII/PCI) columns flowing downstream to a target that is NOT
+    classified. A sensitive-named source column is only flagged when the TARGET
+    column it lands on carries no UC classification tag — sensitive data arriving
+    somewhere governance hasn't labelled. Targets already tagged are governed and
+    are skipped (this is the "without classification" the detector's name promises)."""
     notifications = []
     try:
-        # Check column lineage for sensitive columns flowing to untagged targets
         rows = _execute_sql("""
             SELECT DISTINCT
-                cl.source_table_catalog || '.' || cl.source_table_schema || '.' || cl.source_table_name AS source_fqn,
-                cl.source_column_name,
-                cl.target_table_catalog || '.' || cl.target_table_schema || '.' || cl.target_table_name AS target_fqn,
-                cl.target_column_name
+                cl.source_table_catalog, cl.source_table_schema, cl.source_table_name, cl.source_column_name,
+                cl.target_table_catalog, cl.target_table_schema, cl.target_table_name, cl.target_column_name
             FROM system.access.column_lineage cl
             WHERE cl.event_time > current_timestamp() - INTERVAL 7 DAYS
               AND (lower(cl.source_column_name) LIKE '%ssn%'
@@ -433,14 +464,26 @@ def _detect_sensitive_flows() -> list[dict]:
                    OR lower(cl.source_column_name) LIKE '%password%')
             LIMIT 100
         """)
+        if not rows:
+            return []
+        # Skip targets that governance has already classified (carry a UC tag).
+        classified = _classified_columns({r.get("target_table_catalog") for r in rows if r.get("target_table_catalog")})
         for row in rows:
+            tgt_cat, tgt_sch = row.get("target_table_catalog"), row.get("target_table_schema")
+            tgt_tbl, tgt_col = row.get("target_table_name"), row.get("target_column_name")
+            if not (tgt_cat and tgt_sch and tgt_tbl and tgt_col):
+                continue
+            if (tgt_cat.lower(), tgt_sch.lower(), tgt_tbl.lower(), tgt_col.lower()) in classified:
+                continue  # already governed — not a "without classification" flow
+            source_fqn = f"{row['source_table_catalog']}.{row['source_table_schema']}.{row['source_table_name']}"
+            target_fqn = f"{tgt_cat}.{tgt_sch}.{tgt_tbl}"
             notifications.append({
                 "type": "sensitive_flow",
                 "severity": "critical",
                 "title": f"Sensitive column '{row['source_column_name']}' flowing downstream",
-                "detail": f"{row['source_fqn']}.{row['source_column_name']} → {row['target_fqn']}.{row['target_column_name']}",
-                "table_fqn": row["target_fqn"],
-                "column_name": row["target_column_name"],
+                "detail": f"{source_fqn}.{row['source_column_name']} → {target_fqn}.{tgt_col} (target column is unclassified)",
+                "table_fqn": target_fqn,
+                "column_name": tgt_col,
             })
     except Exception as e:
         logger.debug(f"Sensitive flow detection skipped: {e}")

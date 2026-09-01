@@ -601,16 +601,46 @@ class TestDetectionHelpers:
 
     def test_detect_sensitive_flows(self):
         import backend.routes.notifications as n
-        rows = [{"source_fqn": "c.s.a", "source_column_name": "email",
-                 "target_fqn": "c.s.b", "target_column_name": "email"}]
-        with patch.object(n, "_execute_sql", return_value=rows):
+        rows = [{"source_table_catalog": "c", "source_table_schema": "s", "source_table_name": "a",
+                 "source_column_name": "email",
+                 "target_table_catalog": "c", "target_table_schema": "s", "target_table_name": "b",
+                 "target_column_name": "email"}]
+        with patch.object(n, "_execute_sql", return_value=rows), \
+             patch.object(n, "_classified_columns", return_value=set()):
             out = n._detect_sensitive_flows()
         assert out[0]["severity"] == "critical"
+        assert out[0]["table_fqn"] == "c.s.b" and out[0]["column_name"] == "email"
+
+    def test_detect_sensitive_flows_skips_classified_target(self):
+        import backend.routes.notifications as n
+        rows = [{"source_table_catalog": "c", "source_table_schema": "s", "source_table_name": "a",
+                 "source_column_name": "email",
+                 "target_table_catalog": "c", "target_table_schema": "s", "target_table_name": "b",
+                 "target_column_name": "email"}]
+        # Target column is already tagged/classified → must NOT be flagged.
+        with patch.object(n, "_execute_sql", return_value=rows), \
+             patch.object(n, "_classified_columns", return_value={("c", "s", "b", "email")}):
+            out = n._detect_sensitive_flows()
+        assert out == []
 
     def test_detect_sensitive_flows_error(self):
         import backend.routes.notifications as n
         with patch.object(n, "_execute_sql", side_effect=RuntimeError("x")):
             assert n._detect_sensitive_flows() == []
+
+    def test_classified_columns_reads_tags_and_guards_identifier(self):
+        import backend.routes.notifications as n
+        tag_rows = [{"catalog_name": "C", "schema_name": "S", "table_name": "B", "column_name": "Email"}]
+        with patch.object(n, "_execute_sql", return_value=tag_rows) as m:
+            out = n._classified_columns({"good_cat", "bad-cat;DROP"})
+        assert ("c", "s", "b", "email") in out
+        # only the safe identifier was queried; the unsafe one was skipped
+        assert m.call_count == 1
+
+    def test_classified_columns_fail_open(self):
+        import backend.routes.notifications as n
+        with patch.object(n, "_execute_sql", side_effect=RuntimeError("no tags view")):
+            assert n._classified_columns({"cat"}) == set()
 
     def test_create_notification(self):
         import backend.routes.notifications as n

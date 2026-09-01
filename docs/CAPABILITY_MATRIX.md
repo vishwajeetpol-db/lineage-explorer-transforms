@@ -40,7 +40,7 @@
 | 17 | Open Standards | ✅ | OpenLineage export + import + live producer |
 | 18 | Scalability | ✅ | Delta-backed distributed cache + cursor-paginated graph |
 | 19 | Observability | ✅ | `/api/observability` (aggregate health) · **`/api/observability/runs`** (last-N runs w/ per-run cost + health verdict, on every job/pipeline node) |
-| 20 | Notifications | ✅ | detection scan + alert rules + webhooks + delivery queue |
+| 20 | Notifications | ✅ | **background auto-scan** (periodic, off the request path) + alert rules + webhooks + delivery queue; scan dedups by natural key, prunes to a retention cap, and its detectors (schema-change, sensitive-flow, DQ) exclude platform/app-owned schemas and skip UC-classified targets · `/api/notifications/*` |
 
 **Scorecard: 20 ✅ · 0 🟡 · 0 ⬜**
 
