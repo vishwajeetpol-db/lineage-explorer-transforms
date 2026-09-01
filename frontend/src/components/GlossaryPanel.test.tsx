@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { GlossaryPanel } from "./GlossaryPanel";
+import { useLineageStore } from "../store/lineageStore";
 
 function routeFetch(handlers: Record<string, any>) {
   return vi.fn().mockImplementation((url: string) => {
@@ -29,7 +30,10 @@ describe("GlossaryPanel", () => {
   beforeEach(() => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
   });
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    useLineageStore.setState({ isAdmin: false });
+  });
 
   it("loads and shows terms by default", async () => {
     global.fetch = fullFetch() as any;
@@ -72,6 +76,9 @@ describe("GlossaryPanel", () => {
   });
 
   it("deletes a term", async () => {
+    // Term deletion is admin-gated server-side, so the control only renders for
+    // admins — claim an admin identity to drive it.
+    useLineageStore.setState({ isAdmin: true });
     const fetchMock = fullFetch();
     global.fetch = fetchMock as any;
     const user = userEvent.setup();
@@ -81,6 +88,15 @@ describe("GlossaryPanel", () => {
     await waitFor(() => {
       expect(fetchMock.mock.calls.some((c) => c[1]?.method === "DELETE")).toBe(true);
     });
+  });
+
+  it("hides the delete control from non-admins", async () => {
+    // A hard delete of the term plus all its asset links — non-admins get 403,
+    // so the button must not be offered.
+    global.fetch = fullFetch() as any;
+    render(<GlossaryPanel />);
+    await screen.findByText("Revenue");
+    expect(screen.queryByText("×")).not.toBeInTheDocument();
   });
 
   it("shows empty terms state", async () => {

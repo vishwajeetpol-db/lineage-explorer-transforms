@@ -4,9 +4,14 @@ Calls the Databricks Foundation Model API (served_model_name or external
 endpoint configured via env vars) to analyse notebook/query source code
 and infer per-column transformation descriptions.
 
+What leaves the app: producer SOURCE CODE (notebook / query text) plus table and
+column names. The endpoint is constrained to this workspace — see
+_resolve_endpoint_url — so a misconfigured env var cannot turn that into egress.
+
 Config env vars:
-  LLM_ENDPOINT_URL     — full URL to the /chat/completions endpoint.
-                         Default: Databricks FMAPI endpoint in this workspace.
+  LLM_ENDPOINT_URL     — serving-endpoint path, or an absolute URL on THIS
+                         workspace's host. Anything else is refused and the
+                         in-workspace default is used.
   LLM_MODEL_NAME       — model name to pass in the request body.
                          Default: databricks-meta-llama-3-1-70b-instruct
   LLM_API_TOKEN        — bearer token. Default: SPN token from DATABRICKS_TOKEN.
@@ -19,6 +24,8 @@ import os
 import json
 import logging
 import textwrap
+import threading as _threading
+from datetime import datetime as _dt
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -30,6 +37,115 @@ logger = logging.getLogger(__name__)
 LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "databricks-claude-sonnet-4-6")
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "4000"))
 LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", "60"))
+
+# ---------------------------------------------------------------------------
+# Where source code is allowed to go
+#
+# Every call here ships PRODUCER SOURCE CODE — notebook and query text — plus table
+# and column names. That routinely contains regulated identifiers, so the honest
+# answer to "what leaves this app, and to where" has to be something narrower than
+# "whatever LLM_ENDPOINT_URL points at". The override was unvalidated, and the SDK
+# attaches the workspace credential to whatever it is given, so a single
+# misconfigured env var could ship source code off-workspace with a valid token.
+#
+# The override now has to resolve to this workspace: either a relative serving path
+# or an absolute URL on the workspace host. Anything else is refused and the
+# in-workspace default is used instead — a config mistake must not become an egress.
+# ---------------------------------------------------------------------------
+_ALLOWED_URL_PREFIXES = ("/serving-endpoints/", "/api/2.0/serving-endpoints/")
+
+
+class LLMBudgetError(RuntimeError):
+    """A per-user LLM call budget was exhausted; back off rather than retry now."""
+
+
+def _resolve_endpoint_url(endpoint: str) -> str:
+    """Return the URL to POST to, refusing an off-workspace override."""
+    override = (os.environ.get("LLM_ENDPOINT_URL") or "").strip()
+    if not override:
+        return f"/serving-endpoints/{endpoint}/invocations"
+
+    if override.startswith("/"):
+        if override.startswith(_ALLOWED_URL_PREFIXES):
+            return override
+        logger.error(
+            "LLM_ENDPOINT_URL=%r is not a serving-endpoint path; ignoring it and "
+            "using the in-workspace endpoint. Allowed prefixes: %s",
+            override[:120], ", ".join(_ALLOWED_URL_PREFIXES),
+        )
+        return f"/serving-endpoints/{endpoint}/invocations"
+
+    # Absolute URL: only this workspace's own host is acceptable.
+    from urllib.parse import urlsplit
+    try:
+        from backend.lineage_service import _get_client
+        host = urlsplit(_get_client().config.host or "").hostname or ""
+    except Exception:
+        host = ""
+    parts = urlsplit(override)
+    if parts.scheme == "https" and host and parts.hostname == host:
+        return override
+    logger.error(
+        "LLM_ENDPOINT_URL host %r is not this workspace (%r); ignoring it and using "
+        "the in-workspace endpoint. Source code must not leave the workspace via an "
+        "env override.",
+        parts.hostname, host or "unknown",
+    )
+    return f"/serving-endpoints/{endpoint}/invocations"
+
+
+# ---------------------------------------------------------------------------
+# Per-user call budget
+#
+# The deep-analysis path is agentic and streaming: one user action can be many model
+# calls. Nothing bounded that, per user or in total. The actor comes from the
+# warehouse_gate attribution ContextVar, which middleware stamps once per request and
+# which propagates through asyncio.to_thread — so the budget follows the request
+# without every call site having to thread an identity through.
+# ---------------------------------------------------------------------------
+LLM_MAX_CALLS_PER_USER_PER_DAY = int(os.environ.get("LLM_MAX_CALLS_PER_USER_PER_DAY", "500"))
+
+_llm_budget_lock = _threading.Lock()
+_llm_calls: dict[str, int] = {}
+_llm_budget_day: str = ""
+
+
+def _charge_llm_budget() -> None:
+    global _llm_budget_day
+    from backend.warehouse_gate import current_actor
+    actor = current_actor() or "anon"
+    today = _dt.now().strftime("%Y-%m-%d")
+    with _llm_budget_lock:
+        if _llm_budget_day != today:
+            _llm_budget_day = today
+            _llm_calls.clear()
+        used = _llm_calls.get(actor, 0)
+        if used >= LLM_MAX_CALLS_PER_USER_PER_DAY:
+            raise LLMBudgetError(
+                f"You have used the daily limit of {LLM_MAX_CALLS_PER_USER_PER_DAY} "
+                f"AI analysis calls. It resets at midnight."
+            )
+        _llm_calls[actor] = used + 1
+
+
+def get_llm_budget() -> dict:
+    """Budget state, for /api/diagnostics and the admin dashboard."""
+    with _llm_budget_lock:
+        return {
+            "day": _llm_budget_day or _dt.now().strftime("%Y-%m-%d"),
+            "max_per_user_per_day": LLM_MAX_CALLS_PER_USER_PER_DAY,
+            "distinct_users": len(_llm_calls),
+            "calls_today": sum(_llm_calls.values()),
+            "top_users": sorted(_llm_calls.items(), key=lambda kv: -kv[1])[:10],
+        }
+
+
+def _reset_llm_budget() -> None:
+    """Zero the budget — for tests only."""
+    global _llm_budget_day
+    with _llm_budget_lock:
+        _llm_calls.clear()
+        _llm_budget_day = ""
 
 
 _SYSTEM_PROMPT = textwrap.dedent("""\
@@ -261,10 +377,10 @@ def _invoke_chat(messages: list[dict], model: Optional[str] = None, temperature:
     happens we transparently retry once without it, so model choice never breaks
     analysis."""
     from backend.lineage_service import _get_client
+    _charge_llm_budget()
     client = _get_client()
     endpoint = model or LLM_MODEL_NAME
-    override_url = os.environ.get("LLM_ENDPOINT_URL", "")
-    url = override_url or f"/serving-endpoints/{endpoint}/invocations"
+    url = _resolve_endpoint_url(endpoint)
 
     def _do(payload: dict):
         return client.api_client.do("POST", url, body=payload)

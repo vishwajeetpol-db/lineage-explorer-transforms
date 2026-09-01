@@ -33,6 +33,7 @@ from typing import Any, Optional
 
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
+from backend.validators import sql_str
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +64,13 @@ def get_capability_cache() -> "CapabilityCache":
 
 
 def _q(v: str) -> str:
-    """Single-quote-escape a value for inline SQL."""
-    return (v or "").replace("'", "''")
+    """Escape a value for inline SQL via the shared escaper.
+
+    Quote-doubling alone was bypassable: Spark treats `\\'` as an escaped quote,
+    so a value starting `\\'` became `\\''` whose second quote closed the literal.
+    sql_str() escapes the backslash first, which closes that hole.
+    """
+    return sql_str(v)
 
 
 def serve_or_compute(table_fqn: str, tab: str, compute, actor: str = "", refresh: bool = False) -> dict:

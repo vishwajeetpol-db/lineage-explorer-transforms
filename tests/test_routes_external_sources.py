@@ -148,43 +148,44 @@ class TestOLBridgeIngest:
 
 
 class TestOLBridgeSources:
-    """GET /api/external/ol-bridge/sources — list registered sources."""
+    """GET /api/external/ol-bridge/sources — list registered sources.
 
-    def test_returns_sources_list(self, app_client):
+    Admin-gated: the rows carry source_id, which doubles as the ingest
+    credential, so listing them to everyone hands out the injection token.
+    """
+
+    def test_returns_sources_list(self, admin_client):
         with patch("backend.routes.external_sources._execute_sql") as mock_sql:
             mock_sql.return_value = [
                 {"source_id": "s1", "platform": "snowflake",
                  "display_name": "Snowflake Prod", "total_events": "42",
                  "last_push_at": "2026-07-20T12:00:00Z", "active": "true"}
             ]
-            resp = app_client.get("/api/external/ol-bridge/sources")
+            resp = admin_client.get("/api/external/ol-bridge/sources")
             assert resp.status_code == 200
             data = resp.json()
             # Sources are wrapped under a "sources" key with a "count".
             assert isinstance(data, dict)
             assert isinstance(data["sources"], list)
 
-    def test_source_ids_exposed_to_all_users(self, app_client):
-        """A15 BUG: Source listing exposes source_ids (auth tokens) to all users.
-        After fix, should be admin-only or omit source_id from response."""
+    def test_source_ids_admin_only(self, non_admin_client):
+        """A15 FIX: source_id is the ingest credential, so the listing that
+        discloses it is now admin-only — a non-admin gets 403 and no SQL runs."""
         with patch("backend.routes.external_sources._execute_sql") as mock_sql:
-            mock_sql.return_value = [
-                {"source_id": "secret-uuid-123", "platform": "snowflake",
-                 "display_name": "Prod", "total_events": "100",
-                 "last_push_at": "2026-07-20", "active": "true"}
-            ]
-            resp = app_client.get("/api/external/ol-bridge/sources")
-            assert resp.status_code == 200
-            data = resp.json()
-            sources = data["sources"]
-            # BUG: source_id is exposed — this IS the auth credential
-            if sources:
-                assert "source_id" in sources[0]  # Documents the vulnerability
+            resp = non_admin_client.get("/api/external/ol-bridge/sources")
+            assert resp.status_code == 403
+            mock_sql.assert_not_called()
 
-    def test_empty_sources(self, app_client):
+    def test_anonymous_sources_403(self, app_client):
+        with patch("backend.routes.external_sources._execute_sql") as mock_sql:
+            resp = app_client.get("/api/external/ol-bridge/sources")
+            assert resp.status_code == 403
+            mock_sql.assert_not_called()
+
+    def test_empty_sources(self, admin_client):
         with patch("backend.routes.external_sources._execute_sql") as mock_sql:
             mock_sql.return_value = []
-            resp = app_client.get("/api/external/ol-bridge/sources")
+            resp = admin_client.get("/api/external/ol-bridge/sources")
             assert resp.status_code == 200
 
 
@@ -214,10 +215,35 @@ class TestOLBridgeEvents:
             assert resp.status_code == 200
 
     def test_sql_injection_in_source_id_filter(self, app_client):
-        """A1: source_id filter param may be interpolated."""
+        """A1: source_id filter param is interpolated, so it must be escaped
+        backslash-first — quote-doubling alone is bypassable."""
+        payload = "\\' UNION SELECT event_id, source_id, platform, job_namespace, " \
+                  "job_name, event_type, event_time, received_at FROM secrets -- "
         with patch("backend.routes.external_sources._execute_sql") as mock_sql:
             mock_sql.return_value = []
             resp = app_client.get("/api/external/ol-bridge/events", params={
-                "source_id": "x' OR '1'='1"
+                "source_id": payload
             })
-            assert resp.status_code in (200, 400)
+            assert resp.status_code == 200
+            sql = mock_sql.call_args[0][0]
+            assert payload not in sql      # raw payload never reaches SQL
+            assert "\\\\''" in sql         # backslash doubled before the quote
+
+    def test_platform_filter_allow_listed(self, app_client):
+        """platform is enum-like (see _ALLOWED_PLATFORMS), so an off-list value
+        — including the UNION payload — is rejected with 400, never escaped."""
+        with patch("backend.routes.external_sources._execute_sql") as mock_sql:
+            resp = app_client.get("/api/external/ol-bridge/events", params={
+                "platform": "\\' UNION SELECT * FROM secrets -- "
+            })
+            assert resp.status_code == 400
+            mock_sql.assert_not_called()
+
+    def test_platform_filter_case_insensitive(self, app_client):
+        with patch("backend.routes.external_sources._execute_sql") as mock_sql:
+            mock_sql.return_value = []
+            resp = app_client.get("/api/external/ol-bridge/events", params={
+                "platform": "Snowflake"
+            })
+            assert resp.status_code == 200
+            assert "platform = 'snowflake'" in mock_sql.call_args[0][0]

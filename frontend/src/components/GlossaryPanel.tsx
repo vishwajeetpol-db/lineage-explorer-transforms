@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { useLineageStore } from '../store/lineageStore';
 
 interface Term {
   term_id: string;
@@ -30,6 +31,7 @@ interface Kpi {
 }
 
 export function GlossaryPanel() {
+  const isAdmin = useLineageStore((s) => s.isAdmin);
   const [terms, setTerms] = useState<Term[]>([]);
   const [domains, setDomains] = useState<Domain[]>([]);
   const [kpis, setKpis] = useState<Kpi[]>([]);
@@ -196,8 +198,14 @@ export function GlossaryPanel() {
                     {statusBadge(term.status)}
                     {term.domain && <span className="text-xs text-indigo-400">{term.domain}</span>}
                   </div>
-                  <button onClick={() => handleDeleteTerm(term.term_id)}
-                    className="text-red-400 hover:text-red-300 text-sm">×</button>
+                  {/* Deleting a term is an unrecoverable hard delete of the term
+                      and all its asset links, so the backend admin-gates it.
+                      Hide the control rather than let it 403 silently. */}
+                  {isAdmin && (
+                    <button onClick={() => handleDeleteTerm(term.term_id)}
+                      title="Delete term (admin)"
+                      className="text-red-400 hover:text-red-300 text-sm">×</button>
+                  )}
                 </div>
                 <p className="mt-1 text-sm text-gray-400">{term.definition}</p>
                 {term.owner && <p className="mt-1 text-xs text-gray-500">Owner: {term.owner}</p>}

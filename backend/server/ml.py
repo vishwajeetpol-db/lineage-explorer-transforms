@@ -22,6 +22,7 @@ from typing import Optional
 
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
+from backend.validators import sql_str
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +100,7 @@ def list_serving_endpoints() -> list[dict]:
 
 def get_endpoint_usage(endpoint_name: str) -> list[dict]:
     """Return recent request counts for a serving endpoint."""
-    safe = endpoint_name.replace("'", "")
+    safe = sql_str(endpoint_name)
     try:
         rows = _execute_sql(
             f"SELECT "
@@ -146,7 +147,7 @@ def _run_input_tables(client, run_id: str) -> list[str]:
 
 def _endpoints_for_model(client, model_fqn: str) -> list[str]:
     """Serving endpoints currently serving a model FQN (live, from system.serving)."""
-    safe = model_fqn.replace("'", "")
+    safe = sql_str(model_fqn)
     try:
         rows = _execute_sql(
             f"SELECT DISTINCT endpoint_name FROM system.serving.served_entities "
@@ -232,7 +233,7 @@ def get_models_for_table(catalog: str, schema: str, table: str) -> list[dict]:
             f"SELECT model_name, model_version, job_id, run_id, notebook_path, "
             f"       registered_by, registered_at, notes "
             f"FROM {MODEL_LINEAGE_TABLE} "
-            f"WHERE training_table = '{full_name}' "
+            f"WHERE training_table = '{sql_str(full_name)}' "
             f"ORDER BY registered_at DESC "
             f"LIMIT 100"
         )
@@ -243,9 +244,16 @@ def get_models_for_table(catalog: str, schema: str, table: str) -> list[dict]:
 
 
 def get_table_for_model(model_name: str, model_version: Optional[str] = None) -> list[dict]:
-    """Return which training tables a given registered model was built from."""
-    safe_name = model_name.replace("'", "")
-    version_filter = f"AND model_version = '{model_version}'" if model_version else ""
+    """Return which training tables a given registered model was built from.
+
+    Both values are escaped with sql_str even though the route allow-lists them
+    with _NAME_RE: model_version previously reached the WHERE clause with no
+    treatment at all, which made this an in-band UNION injection running as the
+    app service principal. Escaping at the sink means a future caller that skips
+    the route guard can't re-open the hole.
+    """
+    safe_name = sql_str(model_name)
+    version_filter = f"AND model_version = '{sql_str(model_version)}'" if model_version else ""
     try:
         _ensure_model_lineage_table()
         rows = _execute_sql(
@@ -272,9 +280,17 @@ def register_model_lineage(
     actor: str = "",
     notes: str = "",
 ) -> dict:
-    """Record a model → training-table lineage row. Called by training notebooks."""
+    """Record a model → training-table lineage row. Called by training notebooks.
+
+    Every value here comes straight off the request body (no allow-list — model
+    names, notebook paths and free-text notes legitimately contain characters an
+    identifier regex would reject), so sql_str is the only thing standing between
+    the caller and this INSERT. Quote-STRIPPING was not enough: a value ending in
+    a lone backslash escaped the literal's closing quote, shifting the quoting
+    parity so that the *next* field's content was parsed as SQL.
+    """
     _ensure_model_lineage_table()
-    safe = lambda s: (s or "").replace("'", "")
+    safe = sql_str
     parts = training_table.split(".")
     tc = parts[0] if len(parts) > 0 else ""
     ts = parts[1] if len(parts) > 1 else ""

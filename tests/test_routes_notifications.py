@@ -4,12 +4,26 @@ Covers: list, unread-count, mark-read, scan (with detection helpers),
 rules CRUD, plus the module-level _execute_sql helper and _ensure_tables.
 All SQL is mocked (patch the module's own _execute_sql / _get_client); offline.
 The _tables_ensured global is reset per test so _lazy_ensure is deterministic.
+
+Security regressions covered here (see the module's FIX comments):
+  * /scan and both /rules writes are admin-gated  -> admin_client / 403 tests
+  * rule_type + severity are allow-listed         -> 4xx, never reaches SQL
+  * client-supplied rule_id must be a UUID        -> 400
+  * every interpolated value goes through sql_str -> `\\'` cannot close a literal
 """
+import uuid
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from databricks.sdk.service.sql import StatementState
+
+# A payload that defeats plain quote-doubling on Databricks SQL: the leading
+# backslash escapes the quote that doubling adds, so the *second* quote closes
+# the literal and the rest runs as SQL. sql_str must double the backslash too.
+BACKSLASH_INJECTION = "\\' || (SELECT concat_ws(',', collect_list(ssn)) FROM main.pii.customers) || '"
+# What the escaped form must look like once embedded: `\\` then `''`.
+ESCAPED_PREFIX = "\\\\''"
 
 
 @pytest.fixture(autouse=True)
@@ -62,6 +76,54 @@ class TestList:
         with _patch_sql(side_effect=RuntimeError("boom")):
             resp = app_client.get("/api/notifications")
         assert resp.status_code == 500
+
+    def test_list_error_detail_does_not_leak_sql(self, app_client):
+        """500s must not echo the raw `SQL failed: ...` text back to the caller."""
+        with _patch_sql(side_effect=RuntimeError("SQL failed: TABLE_OR_VIEW_NOT_FOUND secret_tbl")):
+            resp = app_client.get("/api/notifications")
+        assert resp.status_code == 500
+        detail = resp.json()["detail"]
+        assert "SQL failed" not in detail
+        assert "secret_tbl" not in detail
+
+    def test_list_rejects_backslash_quote_notif_type(self, app_client):
+        """FIX 2: the `\\'` bypass is refused by the allow-list before any SQL runs."""
+        with _patch_sql(return_value=[]) as m:
+            resp = app_client.get("/api/notifications",
+                                  params={"notif_type": BACKSLASH_INJECTION})
+        assert resp.status_code == 400
+        assert "notif_type" in resp.json()["detail"]
+        assert m.call_count == 0  # never reached the warehouse
+
+    def test_list_rejects_backslash_quote_severity(self, app_client):
+        with _patch_sql(return_value=[]) as m:
+            resp = app_client.get("/api/notifications",
+                                  params={"severity": BACKSLASH_INJECTION})
+        assert resp.status_code == 400
+        assert "severity" in resp.json()["detail"]
+        assert m.call_count == 0
+
+    def test_list_rejects_unknown_notif_type(self, app_client):
+        with _patch_sql(return_value=[]):
+            resp = app_client.get("/api/notifications", params={"notif_type": "not_a_type"})
+        assert resp.status_code == 400
+
+    @pytest.mark.parametrize("value", ["schema_change", "dq_degradation",
+                                       "sensitive_flow", "run_failure", "info"])
+    def test_list_accepts_every_allow_listed_type(self, app_client, value):
+        """Allow-list must cover everything _create_notification can store,
+        including its "info" fallback — otherwise filtering breaks real rows."""
+        with _patch_sql(return_value=[]) as m:
+            resp = app_client.get("/api/notifications", params={"notif_type": value})
+        assert resp.status_code == 200
+        assert f"notif_type = '{value}'" in m.call_args[0][0]
+
+    @pytest.mark.parametrize("value", ["info", "warning", "critical"])
+    def test_list_accepts_every_allow_listed_severity(self, app_client, value):
+        with _patch_sql(return_value=[]) as m:
+            resp = app_client.get("/api/notifications", params={"severity": value})
+        assert resp.status_code == 200
+        assert f"severity = '{value}'" in m.call_args[0][0]
 
 
 # ---------------------------------------------------------------------------
@@ -118,29 +180,69 @@ class TestMarkRead:
             resp = app_client.post("/api/notifications/mark-read", json={"all": True})
         assert resp.status_code == 500
 
+    def test_mark_read_stays_ungated_for_non_admin(self, non_admin_client):
+        """Deliberately NOT admin-gated: it only flips a shared read flag, and
+        gating it would break the notifications panel for every non-admin."""
+        with _patch_sql(return_value=[]):
+            resp = non_admin_client.post("/api/notifications/mark-read", json={"all": True})
+        assert resp.status_code == 200
+
+    def test_mark_read_escapes_backslash_quote_id(self, app_client):
+        """notif_ids are caller-supplied, so they go through sql_str too."""
+        with _patch_sql(return_value=[]) as m:
+            resp = app_client.post("/api/notifications/mark-read",
+                                   json={"notif_ids": [BACKSLASH_INJECTION]})
+        assert resp.status_code == 200
+        sql = m.call_args[0][0]
+        assert ESCAPED_PREFIX in sql          # backslash doubled, quote doubled
+        assert "collect_list" not in sql.split("WHERE notif_id IN (")[0]
+
 
 # ---------------------------------------------------------------------------
 # POST /api/notifications/scan
 # ---------------------------------------------------------------------------
 class TestScan:
-    def test_scan_detects_and_creates(self, app_client):
+    def test_scan_detects_and_creates(self, admin_client):
         import backend.routes.notifications as n
         with patch.object(n, "_detect_schema_changes", return_value=[{"type": "schema_change"}]), \
              patch.object(n, "_detect_dq_degradation", return_value=[{"type": "dq_degradation"}]), \
              patch.object(n, "_detect_sensitive_flows", return_value=[{"type": "sensitive_flow"}]), \
              patch.object(n, "_create_notification") as mk:
-            resp = app_client.post("/api/notifications/scan")
+            resp = admin_client.post("/api/notifications/scan")
         assert resp.status_code == 200
         data = resp.json()
         assert data["detected"] == {
             "schema_changes": 1, "dq_degradation": 1, "sensitive_flows": 1}
         assert mk.call_count == 3
 
-    def test_scan_error_500(self, app_client):
+    def test_scan_error_500(self, admin_client):
         import backend.routes.notifications as n
         with patch.object(n, "_detect_schema_changes", side_effect=RuntimeError("boom")):
-            resp = app_client.post("/api/notifications/scan")
+            resp = admin_client.post("/api/notifications/scan")
         assert resp.status_code == 500
+
+    def test_scan_error_detail_does_not_leak_sql(self, admin_client):
+        import backend.routes.notifications as n
+        with patch.object(n, "_detect_schema_changes",
+                          side_effect=RuntimeError("SQL failed: PERMISSION_DENIED on system.access")):
+            resp = admin_client.post("/api/notifications/scan")
+        assert resp.status_code == 500
+        assert "SQL failed" not in resp.json()["detail"]
+
+    def test_scan_requires_admin(self, non_admin_client):
+        """FIX 3: documented as (admin) since day one but never enforced."""
+        import backend.routes.notifications as n
+        with patch.object(n, "_detect_schema_changes") as det:
+            resp = non_admin_client.post("/api/notifications/scan")
+        assert resp.status_code == 403
+        assert det.call_count == 0  # gate runs before any detection
+
+    def test_scan_requires_admin_anonymous(self, app_client):
+        import backend.routes.notifications as n
+        with patch.object(n, "_detect_schema_changes") as det:
+            resp = app_client.post("/api/notifications/scan")
+        assert resp.status_code == 403
+        assert det.call_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -159,48 +261,206 @@ class TestRules:
             resp = app_client.get("/api/notifications/rules")
         assert resp.status_code == 500
 
-    def test_create_rule_new_id(self, app_client):
+    def test_create_rule_new_id(self, admin_client):
         with _patch_sql(return_value=[]) as m:
-            resp = app_client.post("/api/notifications/rules",
-                                   json={"rule_type": "schema_change"})
+            resp = admin_client.post("/api/notifications/rules",
+                                     json={"rule_type": "schema_change"})
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert data["rule_id"]  # generated uuid
+        assert uuid.UUID(data["rule_id"])  # server-generated uuid
         assert "MERGE INTO" in m.call_args[0][0]
 
-    def test_upsert_rule_existing_id(self, app_client):
+    def test_upsert_rule_existing_id(self, admin_client):
+        rid = str(uuid.uuid4())
         with _patch_sql(return_value=[]) as m:
-            resp = app_client.post("/api/notifications/rules", json={
-                "rule_id": "fixed-id", "rule_type": "dq_degradation",
+            resp = admin_client.post("/api/notifications/rules", json={
+                "rule_id": rid, "rule_type": "dq_degradation",
                 "target_pattern": "main.*", "threshold": 0.8,
                 "severity": "critical", "enabled": False, "notes": "o'brien"})
         assert resp.status_code == 200
-        assert resp.json()["rule_id"] == "fixed-id"
+        assert resp.json()["rule_id"] == rid
         sql = m.call_args[0][0]
         assert "o''brien" in sql       # escaped
         assert "enabled = false" in sql
 
-    def test_create_rule_missing_type_422(self, app_client):
-        resp = app_client.post("/api/notifications/rules", json={})
+    def test_create_rule_missing_type_422(self, admin_client):
+        resp = admin_client.post("/api/notifications/rules", json={})
         assert resp.status_code == 422
 
-    def test_upsert_rule_error_500(self, app_client):
+    def test_upsert_rule_error_500(self, admin_client):
         with _patch_sql(side_effect=RuntimeError("boom")):
-            resp = app_client.post("/api/notifications/rules",
-                                   json={"rule_type": "schema_change"})
+            resp = admin_client.post("/api/notifications/rules",
+                                     json={"rule_type": "schema_change"})
         assert resp.status_code == 500
 
-    def test_delete_rule(self, app_client):
+    def test_upsert_rule_error_detail_does_not_leak_sql(self, admin_client):
+        with _patch_sql(side_effect=RuntimeError("SQL failed: MERGE on lattice_lineage denied")):
+            resp = admin_client.post("/api/notifications/rules",
+                                     json={"rule_type": "schema_change"})
+        assert resp.status_code == 500
+        assert "SQL failed" not in resp.json()["detail"]
+
+    def test_delete_rule(self, admin_client):
         with _patch_sql(return_value=[]) as m:
-            resp = app_client.delete("/api/notifications/rules/r1")
+            resp = admin_client.delete("/api/notifications/rules/r1")
         assert resp.status_code == 200
         assert "DELETE FROM" in m.call_args[0][0]
 
-    def test_delete_rule_error_500(self, app_client):
+    def test_delete_rule_error_500(self, admin_client):
         with _patch_sql(side_effect=RuntimeError("boom")):
-            resp = app_client.delete("/api/notifications/rules/r1")
+            resp = admin_client.delete("/api/notifications/rules/r1")
         assert resp.status_code == 500
+
+    def test_delete_rule_escapes_backslash_quote(self, admin_client):
+        with _patch_sql(return_value=[]) as m:
+            resp = admin_client.delete(f"/api/notifications/rules/{BACKSLASH_INJECTION}")
+        assert resp.status_code == 200
+        assert ESCAPED_PREFIX in m.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# FIX 1/3: admin gate + rule_type/severity allow-list + rule_id UUID check
+# ---------------------------------------------------------------------------
+class TestRulesSecurity:
+    def test_upsert_requires_admin(self, non_admin_client):
+        """Peers dq.py / capability_closures.py both 403 non-admins here."""
+        with _patch_sql(return_value=[]) as m:
+            resp = non_admin_client.post("/api/notifications/rules",
+                                         json={"rule_type": "schema_change"})
+        assert resp.status_code == 403
+        assert m.call_count == 0  # gate runs before any SQL
+
+    def test_upsert_requires_admin_anonymous(self, app_client):
+        with _patch_sql(return_value=[]) as m:
+            resp = app_client.post("/api/notifications/rules",
+                                   json={"rule_type": "schema_change"})
+        assert resp.status_code == 403
+        assert m.call_count == 0
+
+    def test_delete_requires_admin(self, non_admin_client):
+        with _patch_sql(return_value=[]) as m:
+            resp = non_admin_client.delete("/api/notifications/rules/r1")
+        assert resp.status_code == 403
+        assert m.call_count == 0
+
+    def test_delete_requires_admin_anonymous(self, app_client):
+        with _patch_sql(return_value=[]) as m:
+            resp = app_client.delete("/api/notifications/rules/r1")
+        assert resp.status_code == 403
+        assert m.call_count == 0
+
+    def test_rule_type_injection_rejected(self, admin_client):
+        """The confirmed exploit: rule_type carried a scalar subquery into the
+        MATCHED branch. The Literal on AlertRuleIn refuses it before the handler
+        body runs (FastAPI answers a body-schema violation with 422)."""
+        with _patch_sql(return_value=[]) as m:
+            resp = admin_client.post("/api/notifications/rules", json={
+                "rule_id": str(uuid.uuid4()),
+                "rule_type": "x'||CAST((SELECT concat_ws(',', collect_list(ssn)) "
+                             "FROM main.pii.customers) AS STRING)||'y"})
+        assert resp.status_code == 422
+        assert m.call_count == 0
+
+    def test_unknown_rule_type_rejected(self, admin_client):
+        with _patch_sql(return_value=[]) as m:
+            resp = admin_client.post("/api/notifications/rules",
+                                     json={"rule_type": "not_a_rule_type"})
+        assert resp.status_code == 422
+        assert m.call_count == 0
+
+    def test_severity_injection_rejected(self, admin_client):
+        with _patch_sql(return_value=[]) as m:
+            resp = admin_client.post("/api/notifications/rules", json={
+                "rule_type": "schema_change", "severity": BACKSLASH_INJECTION})
+        assert resp.status_code == 422
+        assert m.call_count == 0
+
+    @pytest.mark.parametrize("rule_type", ["schema_change", "dq_degradation",
+                                          "sensitive_flow", "run_failure"])
+    def test_documented_rule_types_still_accepted(self, admin_client, rule_type):
+        """The Literal must not narrow the set the module already documents."""
+        with _patch_sql(return_value=[]) as m:
+            resp = admin_client.post("/api/notifications/rules",
+                                     json={"rule_type": rule_type})
+        assert resp.status_code == 200
+        assert f"rule_type = '{rule_type}'" in m.call_args[0][0]
+
+    @pytest.mark.parametrize("severity", ["info", "warning", "critical"])
+    def test_documented_severities_still_accepted(self, admin_client, severity):
+        with _patch_sql(return_value=[]) as m:
+            resp = admin_client.post("/api/notifications/rules",
+                                     json={"rule_type": "schema_change",
+                                           "severity": severity})
+        assert resp.status_code == 200
+        assert f"severity = '{severity}'" in m.call_args[0][0]
+
+    def test_defaults_preserved(self, admin_client):
+        """Omitting the optional fields must still yield the documented defaults."""
+        with _patch_sql(return_value=[]) as m:
+            resp = admin_client.post("/api/notifications/rules",
+                                     json={"rule_type": "schema_change"})
+        assert resp.status_code == 200
+        sql = m.call_args[0][0]
+        assert "target_pattern = '*'" in sql
+        assert "threshold = 0.9" in sql
+        assert "severity = 'warning'" in sql
+        assert "enabled = true" in sql
+
+    def test_non_uuid_rule_id_rejected(self, admin_client):
+        """FIX 1b: rule_id is server-generated, so a supplied one must be a UUID."""
+        with _patch_sql(return_value=[]) as m:
+            resp = admin_client.post("/api/notifications/rules",
+                                     json={"rule_id": "pwn", "rule_type": "schema_change"})
+        assert resp.status_code == 400
+        assert "rule_id" in resp.json()["detail"]
+        assert m.call_count == 0
+
+    def test_injecting_rule_id_rejected(self, admin_client):
+        with _patch_sql(return_value=[]) as m:
+            resp = admin_client.post("/api/notifications/rules", json={
+                "rule_id": BACKSLASH_INJECTION, "rule_type": "schema_change"})
+        assert resp.status_code == 400
+        assert m.call_count == 0
+
+    def test_target_pattern_and_notes_escape_backslash_quote(self, admin_client):
+        """FIX 1c: these two were quote-doubled only, so `\\'` still closed the
+        literal. Both must now come out with the backslash escaped as well."""
+        with _patch_sql(return_value=[]) as m:
+            resp = admin_client.post("/api/notifications/rules", json={
+                "rule_type": "schema_change",
+                "target_pattern": BACKSLASH_INJECTION,
+                "notes": BACKSLASH_INJECTION})
+        assert resp.status_code == 200
+        sql = m.call_args[0][0]
+        assert sql.count(ESCAPED_PREFIX) >= 4  # pattern + notes, MATCHED + NOT MATCHED
+        # No odd-length backslash run can survive to eat the doubling quote.
+        assert "\\'" not in sql.replace(ESCAPED_PREFIX, "")
+
+    def test_threshold_and_enabled_are_coerced(self, admin_client):
+        """Non-numeric threshold / non-bool enabled cannot reach SQL text."""
+        with _patch_sql(return_value=[]) as m:
+            resp = admin_client.post("/api/notifications/rules", json={
+                "rule_type": "schema_change", "threshold": "1=1; DROP TABLE x",
+                "enabled": "'; DROP TABLE y --"})
+        assert resp.status_code == 422
+        assert m.call_count == 0
+
+    def test_explicit_null_enabled_defaults_true(self, admin_client):
+        """Optional[bool] admits None; it must not render as the literal `none`."""
+        with _patch_sql(return_value=[]) as m:
+            resp = admin_client.post("/api/notifications/rules",
+                                     json={"rule_type": "schema_change", "enabled": None})
+        assert resp.status_code == 200
+        sql = m.call_args[0][0]
+        assert "enabled = true" in sql
+        assert "= none" not in sql.lower()
+
+    def test_list_rules_stays_readable_by_non_admin(self, non_admin_client):
+        """Only the writes are gated; reading rules stays open like GET /."""
+        with _patch_sql(return_value=[]):
+            resp = non_admin_client.get("/api/notifications/rules")
+        assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------------------

@@ -145,6 +145,10 @@ export default function App() {
       useLineageStore.getState().setLineageData({
         nodes: data.nodes,
         edges: data.edges,
+        // Precise (source_table → target_table) pairs. Without forwarding these the
+        // store resets tableEdges to [], and business "Data only" falls back to
+        // cross-producting each entity's inputs × outputs — the dense mesh.
+        tableEdges: data.table_edges ?? [],
         cached: data.cached,
         cachedAt: data.cached_at,
         cacheExpiresAt: data.cache_expires_at,
@@ -261,7 +265,9 @@ export default function App() {
   if (route.view === "export") {
     return (
       <div className="h-screen w-screen bg-surface overflow-auto">
-        <ExportPanel />
+        {/* catalog/schema are required — the capture endpoint rejects an empty
+            scope, so mounting without them made "Capture Now" always 400. */}
+        <ExportPanel catalog={catalog} schema={schema} />
       </div>
     );
   }

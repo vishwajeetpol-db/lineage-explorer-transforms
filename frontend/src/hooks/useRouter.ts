@@ -126,6 +126,16 @@ export function navigate(route: Route, replace = false) {
   window.dispatchEvent(new CustomEvent(ROUTE_CHANGE_EVENT));
 }
 
+/** The URL for a route, for real links — `<a href>` and new-tab opens.
+ *
+ * Query-only, so it resolves against whatever path the app is served from
+ * (`navigate` does the same via `window.location.pathname`). Anything that opens
+ * a route in a NEW tab has to go through an href rather than `navigate`: a new
+ * document parses its route from the query string, and `history.pushState` only
+ * ever rewrites the current one.
+ */
+export const routeHref = (route: Route): string => routeToSearch(route) || "?";
+
 export function useRouter(): Route {
   const [route, setRoute] = useState<Route>(() => parseRoute());
 
@@ -154,7 +164,6 @@ export const goSchemaLineage = (catalog: string, schema: string) =>
 export const goCatalogLineage = (catalog: string) =>
   navigate({ view: "catalogLineage", catalog });
 export const goControlPanel = () => navigate({ view: "controlPanel" });
-export const goAdmin = () => navigate({ view: "admin" });
 export const goDQ = (table?: string) => navigate({ view: "dq", table });
 export const goGlossary = () => navigate({ view: "glossary" });
 export const goNotifications = () => navigate({ view: "notifications" });

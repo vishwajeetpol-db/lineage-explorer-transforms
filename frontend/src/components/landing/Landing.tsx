@@ -3,13 +3,13 @@ import { motion } from "framer-motion";
 import {
   Search, FolderOpen, ChevronRight, Loader2, RefreshCw, Layers, FolderTree, GitBranch,
   Home, GitBranchPlus, Network, ShieldCheck, ScrollText, FileBarChart, Settings as SettingsIcon,
-  Bell, HelpCircle, Sun, Moon, Database, ChevronDown, ChevronRight as ChevronR, ChevronLeft,
+  Bell, HelpCircle, Sun, Moon, Database, ChevronDown, ChevronLeft,
   Activity, TableProperties, Workflow, AlertTriangle, FilePenLine, ArrowRight, Shield,
 } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
 import { api } from "../../api/client";
 import { useThemeStore } from "../../store/themeStore";
-import { goCatalogs, goTableLineage, goRootCause, goDQ, goControlPanel, goAdmin } from "../../hooks/useRouter";
+import { goCatalogs, goTableLineage, goRootCause, goDQ, goControlPanel, routeHref } from "../../hooks/useRouter";
 import LineagePicker from "./LineagePicker";
 
 interface Props {
@@ -17,7 +17,15 @@ interface Props {
 }
 
 // ---- Sidebar nav ----------------------------------------------------------
-type NavItem = { label: string; icon: typeof Home; action?: () => void; active?: boolean; adminOnly?: boolean };
+type NavItem = {
+  label: string;
+  icon: typeof Home;
+  action?: () => void;
+  /** Set instead of `action` to open the destination in a new tab. */
+  href?: string;
+  active?: boolean;
+  adminOnly?: boolean;
+};
 const NAV: NavItem[] = [
   { label: "Home", icon: Home, active: true },
   { label: "Search", icon: Search, action: () => useLineageStore.getState().setGlobalSearchOpen(true) },
@@ -27,7 +35,9 @@ const NAV: NavItem[] = [
   { label: "Data Quality", icon: ShieldCheck, action: () => goDQ() },
   { label: "Reports", icon: FileBarChart, action: goRootCause },
   { label: "Settings", icon: SettingsIcon, action: goControlPanel },
-  { label: "Admin Dashboard", icon: Shield, action: goAdmin, adminOnly: true },
+  // Opens in a new tab so an admin can watch the dashboard without losing the
+  // lineage graph they were working in. Matches the header menu's admin entry.
+  { label: "Admin Dashboard", icon: Shield, href: routeHref({ view: "admin" }), adminOnly: true },
 ];
 
 // ---- Recent activity (from notifications) ---------------------------------
@@ -146,61 +156,94 @@ function Landing({ onSelectTable }: Props) {
         <nav className="flex-1 px-3 py-2 space-y-1 overflow-y-auto overflow-x-hidden">
           {NAV.filter((item) => !item.adminOnly || isAdmin).map((item) => {
             const Icon = item.icon;
-            return (
+            const cls = `w-full flex items-center gap-3 py-2.5 rounded-xl text-[13px] font-medium transition-all whitespace-nowrap ${navCollapsed ? "justify-center px-0" : "px-4"} ${
+              item.active
+                ? "bg-rose-500/30 text-[#fff1f2] border border-rose-300/50 shadow-[inset_0_0_16px_rgba(244,63,94,0.25)]"
+                : "text-[#ffe4e6]/75 hover:text-[#fff1f2] hover:bg-white/[0.07] border border-transparent"
+            }`;
+            const body = (
+              <>
+                <Icon size={17} className="shrink-0" />
+                {!navCollapsed && item.label}
+              </>
+            );
+            // A new-tab destination has to be a real anchor, not a button with a
+            // window.open handler: only a link gives cmd/middle-click, the "open
+            // in new tab" context menu, a visible target URL on hover, and the
+            // link role a screen reader announces.
+            return item.href ? (
+              <a
+                key={item.label}
+                href={item.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={navCollapsed ? item.label : undefined}
+                className={cls}
+              >
+                {body}
+              </a>
+            ) : (
               <button
                 key={item.label}
                 onClick={item.action}
                 title={navCollapsed ? item.label : undefined}
-                className={`w-full flex items-center gap-3 py-2.5 rounded-xl text-[13px] font-medium transition-all whitespace-nowrap ${navCollapsed ? "justify-center px-0" : "px-4"} ${
-                  item.active
-                    ? "bg-rose-500/30 text-[#fff1f2] border border-rose-300/50 shadow-[inset_0_0_16px_rgba(244,63,94,0.25)]"
-                    : "text-[#ffe4e6]/75 hover:text-[#fff1f2] hover:bg-white/[0.07] border border-transparent"
-                }`}
+                className={cls}
               >
-                <Icon size={17} className="shrink-0" />
-                {!navCollapsed && item.label}
+                {body}
               </button>
             );
           })}
         </nav>
 
-        {/* Workspace selector */}
+        {/* Workspace selector — DEFERRED, greyed out on purpose.
+            See "Known gaps" in CHANGELOG.md. This was a plain <div> with a dropdown
+            chevron and no handler, and there is nothing behind it to switch between:
+            the app binds to exactly ONE workspace (a single WorkspaceClient), so a
+            dropdown would have had nothing to list. Left in place and visibly
+            disabled so it reads as "not yet" rather than "broken", and so the slot
+            is reserved for the real multi-workspace feature. */}
         <div className="px-3 pb-3">
           {navCollapsed ? (
-            <div className="flex justify-center py-2 text-[#fecdd3]/75" title="All Workspaces">
+            <div className="flex justify-center py-2 text-[#fecdd3]/30" title="Multi-workspace — coming soon">
               <Database size={16} />
             </div>
           ) : (
-            <div className="rounded-xl border border-white/10 bg-black/25 px-3 py-2.5">
-              <div className="text-[9px] uppercase tracking-wider text-[#fecdd3]/55 font-medium mb-1">Workspace</div>
+            <div
+              aria-disabled="true"
+              title="Multi-workspace — coming soon"
+              className="rounded-xl border border-white/[0.06] bg-black/15 px-3 py-2.5 opacity-45 cursor-not-allowed select-none"
+            >
+              <div className="text-[9px] uppercase tracking-wider text-[#fecdd3]/40 font-medium mb-1">Workspace</div>
               <div className="flex items-center gap-2">
-                <Database size={14} className="text-[#fecdd3]/75" />
-                <span className="text-[12px] text-[#fff1f2] flex-1 truncate">All Workspaces</span>
-                <ChevronDown size={14} className="text-[#fecdd3]/65" />
+                <Database size={14} className="text-[#fecdd3]/45" />
+                <span className="text-[12px] text-[#fecdd3]/60 flex-1 truncate">All Workspaces</span>
+                <ChevronDown size={14} className="text-[#fecdd3]/35" />
               </div>
             </div>
           )}
         </div>
 
-        {/* User */}
+        {/* Signed-in user — display only.
+            This was a <button> carrying a ChevronRight and no onClick handler, so it
+            looked expandable and did nothing on click. Identifying the signed-in user
+            is the entire requirement, so it is now a plain element: no button, no
+            chevron, no hover affordance. Nothing here invites a click it cannot
+            answer. */}
         <div className="px-3 pb-2 border-t border-white/10 pt-3">
-          <button
+          <div
             title={navCollapsed ? (userEmail || "User") : undefined}
-            className={`w-full flex items-center gap-2.5 py-1.5 rounded-xl hover:bg-white/[0.07] transition-colors ${navCollapsed ? "justify-center px-0" : "px-2"}`}
+            className={`w-full flex items-center gap-2.5 py-1.5 ${navCollapsed ? "justify-center px-0" : "px-2"}`}
           >
             <span className="w-9 h-9 rounded-full bg-gradient-to-br from-orange-500 to-rose-600 flex items-center justify-center text-[12px] font-bold text-[#fff1f2] shrink-0">
               {initials}
             </span>
             {!navCollapsed && (
-              <>
-                <div className="text-left flex-1 min-w-0">
-                  <div className="text-[12px] font-semibold text-[#fff1f2] truncate">{userEmail ? userEmail.split("@")[0] : "User"}</div>
-                  <div className="text-[10px] text-[#fecdd3]/65 truncate">{userEmail || "—"}</div>
-                </div>
-                <ChevronR size={14} className="text-[#fecdd3]/65 shrink-0" />
-              </>
+              <div className="text-left flex-1 min-w-0">
+                <div className="text-[12px] font-semibold text-[#fff1f2] truncate">{userEmail ? userEmail.split("@")[0] : "User"}</div>
+                <div className="text-[10px] text-[#fecdd3]/65 truncate">{userEmail || "—"}</div>
+              </div>
             )}
-          </button>
+          </div>
         </div>
 
         {/* Collapse toggle — pinned to the bottom, matching the workspace rail. */}
@@ -220,14 +263,19 @@ function Landing({ onSelectTable }: Props) {
 
         {/* Top-right bar */}
         <div className="flex items-center justify-end gap-3 px-6 h-[68px] shrink-0 relative z-10">
-          <button onClick={() => useLineageStore.getState().setGlobalSearchOpen(true)}
-            className="relative text-slate-400 hover:text-slate-200 transition-colors" title="Notifications">
+          {/* DEFERRED — see "Known gaps" in CHANGELOG.md.
+              This was wired to setGlobalSearchOpen(true), so the bell opened the
+              global SEARCH palette: a mis-pointed handler, not a missing one, which
+              is why clicking it produced a search box. Disabled rather than
+              re-pointed at goNotifications until the notifications view is finished.
+              The unread badge is dropped with it — a count you cannot open is an
+              unresolvable nag, and the data is still on /api/notifications. */}
+          <button
+            disabled
+            aria-disabled="true"
+            className="relative text-slate-600 cursor-not-allowed"
+            title="Notifications — coming soon">
             <Bell size={19} />
-            {unread > 0 && (
-              <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full bg-rose-500 text-white text-[9px] font-bold flex items-center justify-center">
-                {unread > 9 ? "9+" : unread}
-              </span>
-            )}
           </button>
           <button className="text-slate-400 hover:text-slate-200 transition-colors" title="Help"><HelpCircle size={19} /></button>
           <button onClick={toggleTheme} className="text-slate-400 hover:text-slate-200 transition-colors"

@@ -37,6 +37,7 @@ from typing import Optional
 
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
+from backend.validators import sql_str
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +106,13 @@ def _source_hash(source_code: str) -> str:
 
 
 def _sql_str(s: str) -> str:
-    """Escape a value for a single-quoted SQL literal (quotes + backslashes)."""
-    return (s or "").replace("\\", "\\\\").replace("'", "''")
+    """Escape a value for a single-quoted SQL literal (quotes + backslashes).
+
+    Thin alias for the shared backend.validators.sql_str — this module's escape
+    was the original of that helper; keeping the local name means every call site
+    below reads unchanged while there is now exactly one implementation.
+    """
+    return sql_str(s)
 
 
 def _key_where(entity_type: str, entity_id: str, target_table: str) -> str:

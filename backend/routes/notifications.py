@@ -11,8 +11,8 @@ Endpoints:
   POST   /api/notifications/mark-read       — mark notification(s) as read
   POST   /api/notifications/scan            — trigger a detection scan (admin)
   GET    /api/notifications/rules           — list alert rules
-  POST   /api/notifications/rules           — create/update an alert rule
-  DELETE /api/notifications/rules/{id}      — delete an alert rule
+  POST   /api/notifications/rules           — create/update an alert rule (admin)
+  DELETE /api/notifications/rules/{id}      — delete an alert rule (admin)
 
 Persisted in app-owned Delta tables:
   - notifications (id, type, severity, title, detail, table_fqn, ...)
@@ -21,16 +21,18 @@ Persisted in app-owned Delta tables:
 from __future__ import annotations
 
 import os
+import math
 import uuid
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Literal, Optional, get_args
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
+from backend.validators import require_admin, sql_str
 
 logger = logging.getLogger(__name__)
 
@@ -86,12 +88,27 @@ def _lazy_ensure():
         _tables_ensured = True
 
 
+# The only rule/notification types and severities this module produces or
+# consumes — see the _detect_* helpers below (schema_change, dq_degradation,
+# sensitive_flow) plus run_failure, which the rules table has always documented.
+# Declared as Literals so Pydantic rejects anything else with a 422 before the
+# value can reach SQL text, and reused as allow-lists for the query filters.
+RuleType = Literal["schema_change", "dq_degradation", "sensitive_flow", "run_failure"]
+Severity = Literal["info", "warning", "critical"]
+
+# notif_type values that can actually appear in the notifications table: the rule
+# types above plus the "info" fallback _create_notification uses when a detector
+# omits a type.
+NOTIF_TYPES = frozenset(get_args(RuleType)) | {"info"}
+SEVERITIES = frozenset(get_args(Severity))
+
+
 class AlertRuleIn(BaseModel):
-    rule_id: Optional[str] = None
-    rule_type: str  # schema_change | dq_degradation | sensitive_flow | run_failure
+    rule_id: Optional[str] = None  # server-generated UUID; validated when supplied
+    rule_type: RuleType
     target_pattern: Optional[str] = "*"  # glob pattern for table FQNs
     threshold: Optional[float] = 0.9  # for DQ: min pass rate
-    severity: Optional[str] = "warning"  # info | warning | critical
+    severity: Optional[Severity] = "warning"
     enabled: Optional[bool] = True
     notes: Optional[str] = ""
 
@@ -107,10 +124,18 @@ async def list_notifications(
     """List recent notifications."""
     _lazy_ensure()
     conditions = ["1=1"]
+    # Allow-list first, escape second. Both filters land in SQL text whose rows go
+    # straight back to the caller (SELECT *), so a bypass leaks the whole table.
+    # Quote-doubling alone was not enough: `\'` is an escape sequence on Databricks
+    # SQL, so a value starting `\'` closed the literal and ran as SQL.
     if notif_type:
-        conditions.append(f"notif_type = '{notif_type.replace(chr(39), chr(39)*2)}'")
+        if notif_type not in NOTIF_TYPES:
+            raise HTTPException(status_code=400, detail=f"Invalid notif_type: '{notif_type[:50]}'")
+        conditions.append(f"notif_type = '{sql_str(notif_type)}'")
     if severity:
-        conditions.append(f"severity = '{severity.replace(chr(39), chr(39)*2)}'")
+        if severity not in SEVERITIES:
+            raise HTTPException(status_code=400, detail=f"Invalid severity: '{severity[:50]}'")
+        conditions.append(f"severity = '{sql_str(severity)}'")
     if unread_only:
         conditions.append("is_read = false")
     where = " AND ".join(conditions)
@@ -120,7 +145,8 @@ async def list_notifications(
         )
         return {"notifications": rows, "count": len(rows)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"list_notifications failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list notifications.")
 
 
 @router.get("/unread-count")
@@ -132,11 +158,15 @@ async def unread_count(request: Request):
         )
         return {"count": int(rows[0]["cnt"]) if rows else 0}
     except Exception as e:
+        # Badge count is best-effort: never surface the SQL error to the caller.
+        logger.debug(f"unread_count unavailable: {e}")
         return {"count": 0}
 
 
 @router.post("/mark-read")
 async def mark_read(request: Request, body: dict):
+    # Deliberately NOT admin-gated: this only flips a shared read flag and every
+    # user of the notifications panel needs it. Gating it would break normal UI use.
     _lazy_ensure()
     notif_ids = body.get("notif_ids", [])
     mark_all = body.get("all", False)
@@ -147,19 +177,25 @@ async def mark_read(request: Request, body: dict):
                 _execute_sql, f"UPDATE {NOTIF_TABLE} SET is_read = true, read_at = TIMESTAMP '{now}' WHERE is_read = false"
             )
         elif notif_ids:
-            id_list = ",".join(f"'{nid.replace(chr(39), chr(39)*2)}'" for nid in notif_ids[:100])
+            # Caller-supplied ids: sql_str, not quote-doubling (see FIX above).
+            id_list = ",".join(f"'{sql_str(nid, 100)}'" for nid in notif_ids[:100])
             await asyncio.to_thread(
                 _execute_sql, f"UPDATE {NOTIF_TABLE} SET is_read = true, read_at = TIMESTAMP '{now}' WHERE notif_id IN ({id_list})"
             )
         return {"status": "ok"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"mark_read failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to mark notifications read.")
 
 
 @router.post("/scan")
 async def trigger_scan(request: Request):
     """Trigger a detection scan for schema changes, DQ degradation, and sensitive flows.
-    Creates notifications for any detected issues."""
+    Creates notifications for any detected issues.
+
+    Admin-gated: the scan runs broad system-table queries as the app service
+    principal and writes rows every user then sees."""
+    require_admin(request)
     _lazy_ensure()
     results = {"schema_changes": 0, "dq_degradation": 0, "sensitive_flows": 0}
 
@@ -184,20 +220,23 @@ async def trigger_scan(request: Request):
 
         return {"status": "ok", "detected": results}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"notification scan failed: {e}")
+        raise HTTPException(status_code=500, detail="Detection scan failed.")
 
 
 def _create_notification(notif: dict) -> None:
     nid = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+    # Every field here carries system-table content (table/column/type names), so
+    # it goes through sql_str rather than bare quote-doubling.
     _execute_sql(f"""
         INSERT INTO {NOTIF_TABLE} (notif_id, notif_type, severity, title, detail, table_fqn, column_name, detected_at, is_read, metadata)
-        VALUES ('{nid}', '{notif.get("type", "info")}', '{notif.get("severity", "warning")}',
-                '{notif.get("title", "").replace(chr(39), chr(39)*2)[:500]}',
-                '{notif.get("detail", "").replace(chr(39), chr(39)*2)[:2000]}',
-                '{notif.get("table_fqn", "").replace(chr(39), chr(39)*2)}',
-                '{notif.get("column_name", "").replace(chr(39), chr(39)*2)}',
-                TIMESTAMP '{now}', false, '{notif.get("metadata", "").replace(chr(39), chr(39)*2)[:2000]}')
+        VALUES ('{nid}', '{sql_str(notif.get("type") or "info", 100)}', '{sql_str(notif.get("severity") or "warning", 50)}',
+                '{sql_str(notif.get("title", ""), 500)}',
+                '{sql_str(notif.get("detail", ""), 2000)}',
+                '{sql_str(notif.get("table_fqn", ""))}',
+                '{sql_str(notif.get("column_name", ""))}',
+                TIMESTAMP '{now}', false, '{sql_str(notif.get("metadata", ""), 2000)}')
     """)
 
 
@@ -205,11 +244,23 @@ def _detect_schema_changes() -> list[dict]:
     """Detect schema changes by comparing information_schema with last-known state."""
     notifications = []
     try:
-        # Get tables with recent schema modifications (last 24h)
+        # Get tables with recent schema modifications (last 24h).
+        #
+        # `last_altered` lives on information_schema.TABLES, not on COLUMNS. The
+        # previous query selected it straight off `columns`, so it raised
+        # UNRESOLVED_COLUMN on every run, was swallowed by the non-fatal except
+        # below, and this detector reported 0 schema changes unconditionally —
+        # while the scan as a whole still reported success. Join to get the
+        # table's alter time alongside the column detail.
         rows = _execute_sql("""
-            SELECT table_catalog, table_schema, table_name, column_name, data_type
-            FROM system.information_schema.columns
-            WHERE last_altered > current_timestamp() - INTERVAL 24 HOURS
+            SELECT c.table_catalog, c.table_schema, c.table_name,
+                   c.column_name, c.data_type
+            FROM system.information_schema.columns c
+            JOIN system.information_schema.tables t
+              ON  t.table_catalog = c.table_catalog
+              AND t.table_schema  = c.table_schema
+              AND t.table_name    = c.table_name
+            WHERE t.last_altered > current_timestamp() - INTERVAL 24 HOURS
             LIMIT 200
         """)
         for row in rows:
@@ -291,38 +342,90 @@ async def list_rules(request: Request):
         rows = await asyncio.to_thread(_execute_sql, f"SELECT * FROM {RULES_TABLE} ORDER BY rule_type, created_at")
         return {"rules": rows}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"list_rules failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list alert rules.")
 
 
 @router.post("/rules")
 async def upsert_rule(request: Request, body: AlertRuleIn):
+    """Create or update an alert rule.
+
+    Admin-gated, like the peer rule writers (dq.py, capability_closures.py):
+    rules drive scans that run as the app service principal, and every stored
+    field is echoed back to all users by GET /rules."""
+    require_admin(request)
     _lazy_ensure()
-    rid = body.rule_id or str(uuid.uuid4())
+    # rule_id is server-generated in the normal flow. A client-supplied one is only
+    # accepted as a UUID, so it can never carry SQL text into the MERGE below —
+    # previously it was interpolated verbatim, which let a second request rewrite a
+    # stored column into a scalar subquery that GET /rules then echoed back.
+    if body.rule_id:
+        try:
+            rid = str(uuid.UUID(str(body.rule_id)))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(status_code=400, detail="Invalid rule_id: must be a UUID")
+    else:
+        rid = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+    # rule_type/severity are Literal-constrained on the model, target_pattern/notes
+    # are free text: every one goes through sql_str (backslash-then-quote), since
+    # quote-doubling alone is bypassable on Databricks SQL. threshold (float) and
+    # enabled (bool) are Pydantic-coerced, so they cannot carry SQL text — but
+    # enabled is Optional, so an explicit null is normalised here rather than
+    # rendering as the literal `none`.
+    rule_type = sql_str(body.rule_type)
+    severity = sql_str(body.severity or "warning")
+    # `or` swallows a legitimate empty pattern the same way it swallowed 0 below:
+    # `"" or "*"` widens a rule from "no tables" to "every table". Test for None.
+    pattern = sql_str("*" if body.target_pattern is None else body.target_pattern, 500)
+    notes = sql_str(body.notes or "", 500)
+    # `float(body.threshold or 0.9)` was wrong twice over:
+    #
+    #  * 0 is falsy, so `{"threshold": 0}` was silently stored as 0.9 and GET
+    #    /rules echoed back a value the admin never set and could not express.
+    #  * Infinity survives validation — `json.loads('{"v": 1e999}')` yields inf and
+    #    pydantic's Optional[float] has allow_inf_nan=True by default — and
+    #    f-string-formatting it emits the bare word `inf` into an UNQUOTED SQL
+    #    position, where Spark resolves it as a column reference against the rules
+    #    table and fails. The sibling math.isfinite guard added elsewhere in this
+    #    commit was never applied here.
+    threshold = 0.9 if body.threshold is None else float(body.threshold)
+    if not math.isfinite(threshold):
+        raise HTTPException(
+            status_code=400, detail="threshold must be a finite number"
+        )
+    enabled = "true" if (True if body.enabled is None else body.enabled) else "false"
     try:
         await asyncio.to_thread(_execute_sql, f"""
             MERGE INTO {RULES_TABLE} t USING (SELECT '{rid}' AS rule_id) s ON t.rule_id = s.rule_id
             WHEN MATCHED THEN UPDATE SET
-                rule_type = '{body.rule_type}', target_pattern = '{(body.target_pattern or "*").replace(chr(39), chr(39)*2)}',
-                threshold = {body.threshold or 0.9}, severity = '{body.severity or "warning"}',
-                enabled = {str(body.enabled).lower()}, notes = '{(body.notes or "").replace(chr(39), chr(39)*2)[:500]}',
+                rule_type = '{rule_type}', target_pattern = '{pattern}',
+                threshold = {threshold}, severity = '{severity}',
+                enabled = {enabled}, notes = '{notes}',
                 updated_at = TIMESTAMP '{now}'
             WHEN NOT MATCHED THEN INSERT (rule_id, rule_type, target_pattern, threshold, severity, enabled, created_by, created_at, updated_at, notes)
-            VALUES ('{rid}', '{body.rule_type}', '{(body.target_pattern or "*").replace(chr(39), chr(39)*2)}',
-                    {body.threshold or 0.9}, '{body.severity or "warning"}', {str(body.enabled).lower()},
-                    'app', TIMESTAMP '{now}', TIMESTAMP '{now}', '{(body.notes or "").replace(chr(39), chr(39)*2)[:500]}')
+            VALUES ('{rid}', '{rule_type}', '{pattern}',
+                    {threshold}, '{severity}', {enabled},
+                    'app', TIMESTAMP '{now}', TIMESTAMP '{now}', '{notes}')
         """)
         return {"status": "ok", "rule_id": rid}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"upsert_rule failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save alert rule.")
 
 
 @router.delete("/rules/{rule_id}")
 async def delete_rule(request: Request, rule_id: str):
+    """Delete an alert rule. Admin-gated, matching POST /rules."""
+    require_admin(request)
     _lazy_ensure()
-    safe_id = rule_id.replace("'", "''")[:100]
+    # Not UUID-constrained: rows predating the UUID check above may carry any id.
+    safe_id = sql_str(rule_id, 100)
     try:
         await asyncio.to_thread(_execute_sql, f"DELETE FROM {RULES_TABLE} WHERE rule_id = '{safe_id}'")
         return {"status": "ok"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"delete_rule failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete alert rule.")

@@ -1,16 +1,22 @@
 import { useState } from 'react';
+import { useLineageStore } from '../store/lineageStore';
 
 /**
  * ExportPanel - Provides OpenLineage export/import and graph snapshot functionality.
  * Covers capabilities 07 (Versioned Lineage) and 17 (Open Standards).
  */
 export function ExportPanel({ catalog = '', schema = '' }: { catalog?: string; schema?: string }) {
+  // Importing OpenLineage events injects lineage into the shared graph, so the
+  // backend admin-gates it. Hide the tab for non-admins rather than showing a
+  // control that always 403s.
+  const isAdmin = useLineageStore((s) => s.isAdmin);
   const [activeTab, setActiveTab] = useState<'export' | 'import' | 'snapshots'>('export');
   const [exporting, setExporting] = useState(false);
   const [importData, setImportData] = useState('');
   const [importResult, setImportResult] = useState<any>(null);
   const [snapshots, setSnapshots] = useState<any[]>([]);
   const [snapshotLoading, setSnapshotLoading] = useState(false);
+  const [captureError, setCaptureError] = useState<string | null>(null);
 
   const handleExportOpenLineage = async () => {
     setExporting(true);
@@ -64,17 +70,40 @@ export function ExportPanel({ catalog = '', schema = '' }: { catalog?: string; s
   };
 
   const captureSnapshot = async () => {
+    setCaptureError(null);
+    // The backend validates scope and rejects an empty catalog, so without this
+    // the button 400s and — because fetch() does not reject on 4xx and the
+    // response was never checked — reported "Snapshot captured: undefined nodes,
+    // undefined edges". The panel is mounted from App.tsx with the current
+    // catalog/schema now, but guard anyway: this component is prop-driven and a
+    // future mount could omit them again.
+    if (!catalog) {
+      setCaptureError('Select a catalog before capturing a snapshot.');
+      return;
+    }
     try {
       const res = await fetch('/api/snapshots/capture', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ catalog, schema_name: schema || null }),
       });
+      if (!res.ok) {
+        let detail = `Capture failed (HTTP ${res.status})`;
+        try {
+          const body = await res.json();
+          if (body?.detail) detail = String(body.detail);
+        } catch {
+          /* non-JSON error body — keep the status-code message */
+        }
+        setCaptureError(detail);
+        return;
+      }
       const data = await res.json();
       alert(`Snapshot captured: ${data.node_count} nodes, ${data.edge_count} edges`);
       loadSnapshots();
     } catch (e) {
       console.error('Capture failed:', e);
+      setCaptureError('Capture failed — could not reach the server.');
     }
   };
 
@@ -84,7 +113,7 @@ export function ExportPanel({ catalog = '', schema = '' }: { catalog?: string; s
 
       {/* Tabs */}
       <div className="flex gap-1 mb-6 bg-gray-800 rounded-lg p-1">
-        {(['export', 'import', 'snapshots'] as const).map(tab => (
+        {(['export', 'import', 'snapshots'] as const).filter(t => t !== 'import' || isAdmin).map(tab => (
           <button key={tab} onClick={() => { setActiveTab(tab); if (tab === 'snapshots') loadSnapshots(); }}
             className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
               activeTab === tab ? 'bg-indigo-600 text-white' : 'text-gray-400 hover:text-white'
@@ -135,10 +164,16 @@ export function ExportPanel({ catalog = '', schema = '' }: { catalog?: string; s
           <div className="flex items-center justify-between">
             <p className="text-gray-400 text-sm">Point-in-time graph snapshots for historical comparison.</p>
             <button onClick={captureSnapshot} disabled={!catalog}
+              title={!catalog ? 'Select a catalog first' : undefined}
               className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700 disabled:opacity-50">
               Capture Now
             </button>
           </div>
+          {captureError && (
+            <div className="rounded border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+              {captureError}
+            </div>
+          )}
           {snapshotLoading ? <p className="text-gray-500">Loading...</p> :
             snapshots.length === 0 ? <p className="text-gray-500">No snapshots yet. Capture one to start tracking changes.</p> :
             <div className="space-y-2">

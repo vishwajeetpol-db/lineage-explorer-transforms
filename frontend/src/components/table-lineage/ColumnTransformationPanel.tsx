@@ -13,6 +13,7 @@ import {
   type CrossSourceCompare,
   type ProducerCompare,
   type DeepAnalyzeStep,
+  type TransformReasonCode,
 } from "../../api/client";
 import { useLineageStore } from "../../store/lineageStore";
 import { NoTable, parseFqn } from "./panelShared";
@@ -206,6 +207,44 @@ function ProducerCompareMatrix({ cmp, onRefresh }: { cmp: ProducerCompare; onRef
   );
 }
 
+/** Headline + next step for each way deep analysis can come back empty. Keyed by
+ *  the backend's reason_code so the outcome is never a bare "no columns". */
+const DEEP_REASONS: Partial<Record<TransformReasonCode, { title: string; cta: string }>> = {
+  config_empty: {
+    title: "Config table is empty right now",
+    cta: "Run the producing pipeline for this table, then re-run deep analysis.",
+  },
+  no_source: {
+    title: "Producer source code isn't readable",
+    cta: "Grant the app's service principal access to the producer's notebook or file.",
+  },
+  detect_failed: {
+    title: "Couldn't detect the config mechanism",
+    cta: "The framework's source didn't reveal how it loads column config — try a different model.",
+  },
+  no_columns: {
+    title: "No column logic found in the config",
+    cta: "The config was readable but didn't describe per-column transformations for this target.",
+  },
+};
+
+/** Terminal outcome of a deep run that derived nothing. Rendered as its own
+ *  notice (not another log line) so the actionable reason can't scroll out of
+ *  the capped log box. */
+function DeepOutcome({ reason, detail }: { reason: TransformReasonCode | null; detail: string }) {
+  const meta = reason ? DEEP_REASONS[reason] : undefined;
+  return (
+    <div className="rounded-lg border border-amber-500/30 bg-amber-500/[0.07] px-2.5 py-2 space-y-1">
+      <div className="flex items-start gap-1.5">
+        <AlertTriangle size={12} className="text-amber-400 shrink-0 mt-0.5" />
+        <span className="text-[11px] font-semibold text-amber-100">{meta?.title || "Deep analysis found no columns"}</span>
+      </div>
+      <p className="text-[10px] text-slate-300 leading-relaxed">{detail}</p>
+      {meta?.cta && <p className="text-[10px] text-amber-200/80 leading-relaxed">{meta.cta}</p>}
+    </div>
+  );
+}
+
 /** Live commentary log for the deep framework analysis. */
 function DeepLog({ steps, running }: { steps: DeepAnalyzeStep[]; running: boolean }) {
   const icon = (s: DeepAnalyzeStep["status"]) =>
@@ -278,6 +317,8 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
   // Deep framework fallback (metadata-driven producers): live commentary log.
   const [deepRunning, setDeepRunning] = useState(false);
   const [deepLog, setDeepLog] = useState<DeepAnalyzeStep[]>([]);
+  // Terminal reason when a deep run derives nothing (rendered as its own notice).
+  const [deepOutcome, setDeepOutcome] = useState<{ reason: TransformReasonCode | null; detail: string } | null>(null);
 
   const parts = parseFqn(table);
 
@@ -360,7 +401,7 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
     } finally { setLoading(false); }
   }, [table, entityType, entityId, model, loadVersions]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => { setData(null); setError(null); setEntityId(""); setCompareData(null); setAllVersions([]); setViewingVersion(null); setProducerCmp(null); setActiveTab("columns"); setColumnFilter(""); setShowLegend(false); setOverviewOpen(false); setDeepLog([]); setDeepRunning(false); }, [table]);
+  useEffect(() => { setData(null); setError(null); setEntityId(""); setCompareData(null); setAllVersions([]); setViewingVersion(null); setProducerCmp(null); setActiveTab("columns"); setColumnFilter(""); setShowLegend(false); setOverviewOpen(false); setDeepLog([]); setDeepOutcome(null); setDeepRunning(false); }, [table]);
   // Kick off an initial resolve (captured plan / stored) whenever the table changes.
   useEffect(() => { if (parts) resolve(); }, [table]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -392,7 +433,7 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
     const et = (data?.entity_type || entityType || "").toUpperCase();
     const eid = data?.entity_id || entityId;
     if (!et || !eid) { setError("Pick a producer first, then run deep analysis."); return; }
-    setDeepRunning(true); setDeepLog([]); setError(null);
+    setDeepRunning(true); setDeepLog([]); setDeepOutcome(null); setError(null);
     try {
       await api.deepAnalyzeColumnTransformations(
         { catalog: parts.catalog, schema_name: parts.schema, table: parts.table, entity_type: et, entity_id: eid, model: model || undefined },
@@ -402,14 +443,17 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
           } else if (ev.type === "error") {
             setDeepLog((l) => [...l, { type: "step", step: "error", status: "error", message: ev.message }]);
           } else if (ev.type === "result") {
-            setDeepLog((l) => [...l, {
-              type: "step", step: "done",
-              status: ev.derived ? "ok" : "warn",
-              message: ev.derived
-                ? `Done — derived ${ev.columns.length} column(s)${ev.version ? ` (v${ev.version})` : ""}. See the Columns tab.`
-                : (ev.detail || "No columns could be derived."),
-            }]);
-            if (ev.derived) resolve({ et, eid }); // pull in the newly-saved version
+            if (ev.derived) {
+              setDeepLog((l) => [...l, {
+                type: "step", step: "done", status: "ok",
+                message: `Done — derived ${ev.columns.length} column(s)${ev.version ? ` (v${ev.version})` : ""}. See the Columns tab.`,
+              }]);
+              resolve({ et, eid }); // pull in the newly-saved version
+            } else {
+              // Not another log line: the reason gets its own notice with a
+              // headline and a next step, so it can't scroll out of the log box.
+              setDeepOutcome({ reason: ev.reason_code ?? null, detail: ev.detail || "No columns could be derived." });
+            }
           }
         },
       );
@@ -642,10 +686,11 @@ export default function ColumnTransformationPanel({ table }: { table: string | n
               {!deepRunning && (
                 <button onClick={runDeep}
                   className="ai-glow w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-gradient-to-r from-fuchsia-500/25 to-violet-500/20 hover:from-fuchsia-500/35 hover:to-violet-500/30 border border-fuchsia-400/40 text-fuchsia-900 dark:text-fuchsia-100 text-[12px] font-semibold transition-colors">
-                  <Wand2 size={13} className="text-fuchsia-600 dark:text-fuchsia-200" /> {deepLog.length ? "Re-run deep analysis" : "Run deep framework analysis"}
+                  <Wand2 size={13} className="text-fuchsia-600 dark:text-fuchsia-200" /> {deepLog.length || deepOutcome ? "Re-run deep analysis" : "Run deep framework analysis"}
                 </button>
               )}
               {(deepRunning || deepLog.length > 0) && <DeepLog steps={deepLog} running={deepRunning} />}
+              {!deepRunning && deepOutcome && <DeepOutcome reason={deepOutcome.reason} detail={deepOutcome.detail} />}
             </div>
           )}
 

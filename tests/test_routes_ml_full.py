@@ -5,6 +5,12 @@ tables-for-model, register-lineage paths (mocking backend.server.ml.*),
 plus the extension endpoints (feature-tables, vector-indexes, vector-lineage,
 prompt-lineage, inference-tables) which use the module-level _execute_sql.
 No backend/ edits; everything mocked; fast + offline.
+
+CAVEAT: the `mock_sql` fixture below replaces `backend.routes.ml._execute_sql`
+wholesale, so nothing in this file can prove that executor actually runs — that
+is how a missing `_get_client` import survived here as a latent NameError. The
+real-executor coverage lives in tests/test_routes_ml.py
+(TestFeatureTablesRealSqlPath); don't move it here.
 """
 from unittest.mock import MagicMock, patch
 
@@ -140,6 +146,11 @@ class TestFeatureTables:
         resp = app_client.get("/api/ml/feature-tables", params={"catalog": "c"})
         assert resp.status_code == 200
 
+    def test_bad_catalog_400(self, app_client, mock_sql):
+        resp = app_client.get("/api/ml/feature-tables", params={"catalog": "c;x"})
+        assert resp.status_code == 400
+        mock_sql.assert_not_called()
+
     def test_error_500(self, app_client, mock_sql):
         mock_sql.side_effect = RuntimeError("boom")
         resp = app_client.get("/api/ml/feature-tables")
@@ -188,10 +199,13 @@ class TestVectorLineage:
 
 
 class TestPromptLineage:
+    # NOTE: get_endpoint_usage must be patched in the ROUTE's namespace — the
+    # handler resolves the name it imported, so patching backend.server.ml leaves
+    # the real function in place and it builds a live WorkspaceClient.
     def test_ok_rag(self, app_client, mock_sql):
         mock_sql.return_value = [{"index_name": "i1", "source_table": "c.s.t"}]
         with patch("backend.routes.ml.get_models_for_table", return_value=[]), patch(
-            "backend.server.ml.get_endpoint_usage", return_value=[]
+            "backend.routes.ml.get_endpoint_usage", return_value=[]
         ):
             resp = app_client.get("/api/ml/prompt-lineage", params={"endpoint_name": "e1"})
         assert resp.status_code == 200
@@ -201,7 +215,7 @@ class TestPromptLineage:
         # vector index query raises (swallowed) -> vector_sources empty -> model_serving
         mock_sql.side_effect = RuntimeError("no vector table")
         with patch("backend.routes.ml.get_models_for_table", return_value=[]), patch(
-            "backend.server.ml.get_endpoint_usage", return_value=[]
+            "backend.routes.ml.get_endpoint_usage", return_value=[]
         ):
             resp = app_client.get("/api/ml/prompt-lineage", params={"endpoint_name": "e1"})
         assert resp.status_code == 200
@@ -233,6 +247,9 @@ class TestInferenceTables:
 
 
 class TestExecuteSqlInternal:
+    """Note: these patch `_get_client` WITHOUT create=True on purpose — the
+    module must really export it, or patch.object raises AttributeError."""
+
     def test_no_warehouse(self):
         import backend.routes.ml as m
         import os
@@ -254,7 +271,7 @@ class TestExecuteSqlInternal:
         resp.manifest.schema.columns = [col]
         client.statement_execution.execute_statement.return_value = resp
         with patch.dict(os.environ, {"DATABRICKS_WAREHOUSE_ID": "wh"}), patch.object(
-            m, "_get_client", create=True, return_value=client
+            m, "_get_client", return_value=client
         ):
             assert m._execute_sql("SELECT a") == [{"a": "v1"}]
 
@@ -269,7 +286,7 @@ class TestExecuteSqlInternal:
         resp.result = None
         client.statement_execution.execute_statement.return_value = resp
         with patch.dict(os.environ, {"DATABRICKS_WAREHOUSE_ID": "wh"}), patch.object(
-            m, "_get_client", create=True, return_value=client
+            m, "_get_client", return_value=client
         ):
             assert m._execute_sql("SELECT 1") == []
 
@@ -284,7 +301,7 @@ class TestExecuteSqlInternal:
         resp.status.error.message = "bad"
         client.statement_execution.execute_statement.return_value = resp
         with patch.dict(os.environ, {"DATABRICKS_WAREHOUSE_ID": "wh"}), patch.object(
-            m, "_get_client", create=True, return_value=client
+            m, "_get_client", return_value=client
         ):
             with pytest.raises(RuntimeError, match="SQL failed"):
                 m._execute_sql("SELECT 1")

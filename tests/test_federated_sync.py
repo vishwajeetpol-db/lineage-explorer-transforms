@@ -134,21 +134,33 @@ class TestVerifyPeerTrust:
         assert out["reachable"] is None
         assert "verification skipped" in out["error"]
 
+    @staticmethod
+    def _probe_ctx(peers, overview, urlopen_kw):
+        """Patches shared by the probe tests.
+
+        `assert_safe_outbound_url` is stubbed to pass through so these tests exercise
+        the PROBE. The validator has its own tests in test_validators.py, and leaving
+        it live here would reject the fixtures' unresolvable `prov` host before the
+        probe ever ran.
+        """
+        return (
+            patch.object(fs, "get_flag_state", return_value=True),
+            patch.object(fs, "list_federated_peers", return_value=peers),
+            patch.object(fs, "get_sharing_overview", return_value=overview),
+            patch.object(fs, "assert_safe_outbound_url", side_effect=lambda u, *a, **k: u),
+            patch("urllib.request.urlopen", **urlopen_kw),
+        )
+
     def test_live_http_success(self):
         peers = [{"peer_alias": "p", "share_name": "sh"}]
         overview = {"providers": [{"name": "sh", "sharing_server_url": "https://prov/"}]}
-        client = MagicMock()
-        client.config.token = "tok"
         fake_resp = MagicMock()
         fake_resp.read.return_value = b"{}"
         cm = MagicMock()
         cm.__enter__.return_value = fake_resp
         cm.__exit__.return_value = False
-        with patch.object(fs, "get_flag_state", return_value=True), \
-             patch.object(fs, "list_federated_peers", return_value=peers), \
-             patch.object(fs, "get_sharing_overview", return_value=overview), \
-             patch.object(fs, "_get_client", return_value=client), \
-             patch("urllib.request.urlopen", return_value=cm):
+        a, b, c, d, e = self._probe_ctx(peers, overview, {"return_value": cm})
+        with a, b, c, d, e:
             out = fs.verify_peer_trust("p")
         assert out["reachable"] is True
         assert isinstance(out["latency_ms"], int)
@@ -156,16 +168,61 @@ class TestVerifyPeerTrust:
     def test_http_error(self):
         peers = [{"peer_alias": "p", "share_name": "sh"}]
         overview = {"providers": [{"name": "sh", "sharing_server_url": "https://prov"}]}
-        client = MagicMock()
-        client.config.token = "tok"
-        with patch.object(fs, "get_flag_state", return_value=True), \
-             patch.object(fs, "list_federated_peers", return_value=peers), \
-             patch.object(fs, "get_sharing_overview", return_value=overview), \
-             patch.object(fs, "_get_client", return_value=client), \
-             patch("urllib.request.urlopen", side_effect=RuntimeError("conn refused")):
+        a, b, c, d, e = self._probe_ctx(peers, overview, {"side_effect": RuntimeError("conn refused")})
+        with a, b, c, d, e:
             out = fs.verify_peer_trust("p")
         assert out["reachable"] is False
         assert "conn refused" in out["error"]
+
+    def test_probe_sends_no_credential(self):
+        """The app must never hand its own token to a metastore-supplied host.
+
+        `sharing_server_url` is chosen by whoever registered the sharing provider.
+        This probe used to carry `Authorization: Bearer {client.config.token}` — the
+        app SP's token, which is the key to everything the app can read, since every
+        data query runs as that SP. A reachability probe needs no credential.
+        """
+        peers = [{"peer_alias": "p", "share_name": "sh"}]
+        overview = {"providers": [{"name": "sh", "sharing_server_url": "https://prov"}]}
+        fake_resp = MagicMock()
+        fake_resp.read.return_value = b"{}"
+        cm = MagicMock()
+        cm.__enter__.return_value = fake_resp
+        cm.__exit__.return_value = False
+        a, b, c, d, e = self._probe_ctx(peers, overview, {"return_value": cm})
+        with a, b, c, d, e as mock_open:
+            fs.verify_peer_trust("p")
+
+        req = mock_open.call_args[0][0]
+        headers = {k.lower(): v for k, v in req.header_items()}
+        assert "authorization" not in headers, f"credential leaked: {headers}"
+        assert not any("bearer" in str(v).lower() for v in headers.values())
+
+    def test_unauthenticated_401_still_counts_as_reachable(self):
+        """An endpoint that answers 401 is up — which is all this function reports."""
+        import urllib.error
+        peers = [{"peer_alias": "p", "share_name": "sh"}]
+        overview = {"providers": [{"name": "sh", "sharing_server_url": "https://prov"}]}
+        err = urllib.error.HTTPError("https://prov/shares/sh", 401, "Unauthorized", {}, None)
+        a, b, c, d, e = self._probe_ctx(peers, overview, {"side_effect": err})
+        with a, b, c, d, e:
+            out = fs.verify_peer_trust("p")
+        assert out["reachable"] is True
+
+    def test_unsafe_provider_url_is_refused_before_connecting(self):
+        """SSRF: a private/metadata address must be rejected without a request."""
+        peers = [{"peer_alias": "p", "share_name": "sh"}]
+        overview = {"providers": [
+            {"name": "sh", "sharing_server_url": "https://169.254.169.254"}
+        ]}
+        with patch.object(fs, "get_flag_state", return_value=True), \
+             patch.object(fs, "list_federated_peers", return_value=peers), \
+             patch.object(fs, "get_sharing_overview", return_value=overview), \
+             patch("urllib.request.urlopen") as mock_open:
+            out = fs.verify_peer_trust("p")
+        mock_open.assert_not_called()
+        assert out["reachable"] is False
+        assert "unsafe" in out["error"].lower()
 
 
 class TestTriggerPeerSyncJob:

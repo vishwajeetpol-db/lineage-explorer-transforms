@@ -59,20 +59,20 @@ class TestImpactCaching:
 
 
 class TestAccessCaching:
-    def test_access_attaches_cache_meta(self, app_client):
+    def test_access_attaches_cache_meta(self, admin_client):
         hit = {"data": {"table_full_name": "main.default.orders", "identities": {},
                         "declared_grants": [], "audit_access": [], "recent_events": [],
                         "dormant_grants": [], "unique_empirical_users": 0, "grantee_count": 0,
                         "read_count": 0, "write_count": 0, "lookback_days": 14},
                "cached_at": "t", "cached_by": "a@b.com", "stale": True}
         with patch("backend.server.capability_cache.CapabilityCache.get", return_value=hit):
-            resp = app_client.get("/api/access", params={
+            resp = admin_client.get("/api/access", params={
                 "catalog": "main", "schema": "default", "table": "orders"})
         assert resp.status_code == 200
         assert resp.json()["_cache"]["stale"] is True
 
-    def test_access_invalid_param_still_400(self, app_client):
-        resp = app_client.get("/api/access", params={
+    def test_access_invalid_param_still_400(self, admin_client):
+        resp = admin_client.get("/api/access", params={
             "catalog": "bad;", "schema": "s", "table": "t"})
         assert resp.status_code == 400
 

@@ -2,6 +2,13 @@ import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ExportPanel } from "./ExportPanel";
+import { useLineageStore } from "../store/lineageStore";
+
+/** Importing OpenLineage events is admin-gated server-side, so the tab only
+ *  renders for admins. Tests that drive it must claim an admin identity. */
+function asAdmin() {
+  useLineageStore.setState({ isAdmin: true });
+}
 
 function routeFetch(handlers: Record<string, any>) {
   return vi.fn().mockImplementation((url: string) => {
@@ -20,7 +27,24 @@ describe("ExportPanel", () => {
     // jsdom anchor click is a noop; ensure it doesn't throw
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
   });
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    useLineageStore.setState({ isAdmin: false });
+  });
+
+  it("hides the import tab from non-admins", () => {
+    // The backend admin-gates POST /api/import/openlineage, so a non-admin must
+    // not be shown a control that can only 403.
+    render(<ExportPanel catalog="main" />);
+    expect(screen.queryByText("Import Events")).not.toBeInTheDocument();
+    expect(screen.getByText("OpenLineage Export")).toBeInTheDocument();
+  });
+
+  it("shows the import tab to admins", () => {
+    asAdmin();
+    render(<ExportPanel catalog="main" />);
+    expect(screen.getByText("Import Events")).toBeInTheDocument();
+  });
 
   it("renders export tab by default", () => {
     render(<ExportPanel catalog="main" schema="s" />);
@@ -41,6 +65,7 @@ describe("ExportPanel", () => {
   });
 
   it("imports events and shows result", async () => {
+    asAdmin();
     global.fetch = routeFetch({ "import/openlineage": { imported: 2 } }) as any;
     const user = userEvent.setup();
     render(<ExportPanel catalog="main" />);
@@ -53,6 +78,7 @@ describe("ExportPanel", () => {
   });
 
   it("shows import parse error", async () => {
+    asAdmin();
     global.fetch = routeFetch({}) as any;
     const user = userEvent.setup();
     render(<ExportPanel catalog="main" />);

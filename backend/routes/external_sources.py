@@ -37,6 +37,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
+from backend.validators import require_admin, sql_str
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,25 @@ def _lazy_ensure():
         _tables_ensured = True
 
 
+# Every platform token this module accepts from a caller: the union of the two
+# request models' documented enums below plus the OL-native emitters named in the
+# bridge notes further down. Both the write paths and the read filters run values
+# through _validate_platform, so a stored platform is always one of these and a
+# filter value can never carry SQL text (rejected with 400, not escaped).
+_ALLOWED_PLATFORMS = frozenset({
+    "dbt", "dbt_cloud", "airflow", "snowflake", "bigquery", "oracle",
+    "spark", "flink", "trino", "great_expectations", "custom",
+})
+
+
+def _validate_platform(value: str, field: str = "platform") -> str:
+    """Lower-case and allow-list a platform token, else HTTP 400."""
+    v = (value or "").strip().lower()
+    if v not in _ALLOWED_PLATFORMS:
+        raise HTTPException(status_code=400, detail=f"Invalid {field}: '{(value or '')[:50]}'")
+    return v
+
+
 class ExternalSourceIn(BaseModel):
     platform: str  # dbt | airflow | snowflake | bigquery | oracle | custom
     name: str
@@ -142,12 +162,13 @@ async def import_dbt_manifest(request: Request, body: dict):
     try:
         # Register dbt as an external source
         src_id = str(uuid.uuid4())
+        safe_project = sql_str(project_name, 300)
         _execute_sql(f"""
             MERGE INTO {SOURCES_TABLE} t
-            USING (SELECT 'dbt' AS platform, '{project_name.replace(chr(39), chr(39)*2)}' AS name) s
+            USING (SELECT 'dbt' AS platform, '{safe_project}' AS name) s
             ON t.platform = s.platform AND t.name = s.name
             WHEN NOT MATCHED THEN INSERT (source_id, platform, name, description, created_by, created_at, updated_at)
-            VALUES ('{src_id}', 'dbt', '{project_name.replace(chr(39), chr(39)*2)}', 'Imported from dbt manifest',
+            VALUES ('{src_id}', 'dbt', '{safe_project}', 'Imported from dbt manifest',
                     'app', TIMESTAMP '{now}', TIMESTAMP '{now}')
             WHEN MATCHED THEN UPDATE SET updated_at = TIMESTAMP '{now}'
         """)
@@ -158,10 +179,10 @@ async def import_dbt_manifest(request: Request, body: dict):
             if node.get("resource_type") not in ("model", "snapshot"):
                 continue
 
-            model_name = node.get("name", "")
+            model_name = sql_str(node.get("name", ""), 255)
             # Get the target table (if materialized to a UC table)
-            db = node.get("database", "").replace("'", "''")
-            schema_name = node.get("schema", "").replace("'", "''")
+            db = sql_str(node.get("database", ""), 255)
+            schema_name = sql_str(node.get("schema", ""), 255)
             target_fqn = f"{db}.{schema_name}.{model_name}"
 
             # Extract upstream dependencies
@@ -171,13 +192,13 @@ async def import_dbt_manifest(request: Request, body: dict):
                 if not dep_node:
                     continue
 
-                dep_db = dep_node.get("database", "").replace("'", "''")
-                dep_schema = dep_node.get("schema", "").replace("'", "''")
-                dep_name = dep_node.get("name", "").replace("'", "''")
+                dep_db = sql_str(dep_node.get("database", ""), 255)
+                dep_schema = sql_str(dep_node.get("schema", ""), 255)
+                dep_name = sql_str(dep_node.get("name", ""), 255)
                 source_fqn = f"{dep_db}.{dep_schema}.{dep_name}"
 
                 edge_id = str(uuid.uuid4())
-                raw_sql = (node.get("raw_sql", "") or node.get("raw_code", ""))[:2000].replace("'", "''")
+                raw_sql = sql_str(node.get("raw_sql", "") or node.get("raw_code", ""), 2000)
 
                 _execute_sql(f"""
                     INSERT INTO {EDGES_TABLE}
@@ -196,7 +217,9 @@ async def import_dbt_manifest(request: Request, body: dict):
             "models_processed": len([n for n in nodes.values() if n.get("resource_type") == "model"]),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Detail stays server-side: the raw text is SQL/SDK error output.
+        logger.error(f"dbt manifest import failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to import dbt manifest")
 
 
 @router.post("/airflow/import")
@@ -219,11 +242,18 @@ async def import_airflow_lineage(request: Request, body: dict):
 
     try:
         for dag in dags[:50]:  # Cap at 50 DAGs per import
-            dag_id = dag.get("dag_id", "unknown").replace("'", "''")[:200]
+            # Raw values feed the metadata JSON; the *_safe copies go into SQL.
+            # Escaping before json.dumps would double-escape the stored JSON.
+            raw_dag_id = str(dag.get("dag_id", "unknown"))[:200]
+            dag_id = sql_str(raw_dag_id)
             tasks = dag.get("tasks", [])
 
             for task in tasks:
-                task_id = task.get("task_id", "").replace("'", "''")[:200]
+                raw_task_id = str(task.get("task_id", ""))[:200]
+                task_id = sql_str(raw_task_id)
+                metadata_json = sql_str(
+                    json.dumps({"dag_id": raw_dag_id, "task_id": raw_task_id})
+                )
                 inlets = task.get("inlets", [])  # Input datasets
                 outlets = task.get("outlets", [])  # Output datasets
 
@@ -235,60 +265,89 @@ async def import_airflow_lineage(request: Request, body: dict):
                             (edge_id, source_platform, source_asset, source_asset_type, target_asset, target_asset_type,
                              relationship, transformation, confidence, created_at, metadata)
                             VALUES ('{edge_id}', 'airflow',
-                                    '{str(inlet).replace(chr(39), chr(39)*2)[:500]}', 'dataset',
-                                    '{str(outlet).replace(chr(39), chr(39)*2)[:500]}', 'dataset',
+                                    '{sql_str(inlet, 500)}', 'dataset',
+                                    '{sql_str(outlet, 500)}', 'dataset',
                                     'transforms', '{dag_id}/{task_id}', 'verified',
-                                    TIMESTAMP '{now}', '{json.dumps({"dag_id": dag_id, "task_id": task_id}).replace(chr(39), chr(39)*2)}')
+                                    TIMESTAMP '{now}', '{metadata_json}')
                         """)
                         imported += 1
 
         return {"status": "ok", "imported_edges": imported}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"airflow lineage import failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to import Airflow lineage")
 
 
 @router.post("/register")
 async def register_external_edge(request: Request, body: ExternalEdgeIn):
-    """Manually register a single external lineage edge."""
+    """Manually register a single external lineage edge.
+
+    Admin-gated: this writes external_lineage_edges — the same table and the same
+    action as /dbt/import and /airflow/import. Non-admins should not be able to
+    inject lineage edges that later render as trusted graph edges.
+    """
+    require_admin(request)
     _lazy_ensure()
     edge_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+    platform = _validate_platform(body.source_platform, "source_platform")
     try:
         _execute_sql(f"""
             INSERT INTO {EDGES_TABLE}
             (edge_id, source_platform, source_asset, source_asset_type, target_asset, target_asset_type,
              relationship, transformation, confidence, created_at)
-            VALUES ('{edge_id}', '{body.source_platform.replace(chr(39), chr(39)*2)}',
-                    '{body.source_asset.replace(chr(39), chr(39)*2)[:500]}', '{(body.source_asset_type or "table").replace(chr(39), chr(39)*2)}',
-                    '{body.target_asset.replace(chr(39), chr(39)*2)[:500]}', '{(body.target_asset_type or "table").replace(chr(39), chr(39)*2)}',
-                    '{(body.relationship or "produces").replace(chr(39), chr(39)*2)}',
-                    '{(body.transformation or "").replace(chr(39), chr(39)*2)[:2000]}',
-                    '{(body.confidence or "manual").replace(chr(39), chr(39)*2)}', TIMESTAMP '{now}')
+            VALUES ('{edge_id}', '{platform}',
+                    '{sql_str(body.source_asset, 500)}', '{sql_str(body.source_asset_type or "table", 100)}',
+                    '{sql_str(body.target_asset, 500)}', '{sql_str(body.target_asset_type or "table", 100)}',
+                    '{sql_str(body.relationship or "produces", 100)}',
+                    '{sql_str(body.transformation or "", 2000)}',
+                    '{sql_str(body.confidence or "manual", 100)}', TIMESTAMP '{now}')
         """)
         return {"status": "ok", "edge_id": edge_id}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"external edge registration failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to register external edge")
 
 
 @router.get("/sources")
 async def list_sources(request: Request):
+    """List registered external sources.
+
+    Open to all app users, but NEVER `SELECT *`: `connection_info` holds
+    connection metadata for the external platform (hosts, accounts, and
+    potentially credentials), and this endpoint is ungated. Select columns
+    explicitly so a future column added to the table isn't published by default.
+    """
     _lazy_ensure()
     try:
-        rows = await asyncio.to_thread(_execute_sql, f"SELECT * FROM {SOURCES_TABLE} ORDER BY platform, name")
+        rows = await asyncio.to_thread(
+            _execute_sql,
+            f"SELECT source_id, platform, name, description, metadata, "
+            f"       created_by, created_at, updated_at "
+            f"FROM {SOURCES_TABLE} ORDER BY platform, name",
+        )
         return {"sources": rows}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"external source list failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list external sources")
 
 
 @router.delete("/sources/{source_id}")
 async def delete_source(request: Request, source_id: str):
+    """Delete a registered external source.
+
+    Admin-gated: a hard DELETE with no per-user scoping, mirroring the gate on
+    the /register write into the same set of app-owned tables.
+    """
+    require_admin(request)
     _lazy_ensure()
-    safe_id = source_id.replace("'", "''")[:100]
+    safe_id = sql_str(source_id, 100)
     try:
         await asyncio.to_thread(_execute_sql, f"DELETE FROM {SOURCES_TABLE} WHERE source_id = '{safe_id}'")
         return {"status": "ok"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"external source delete failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete external source")
 
 
 @router.get("/lineage")
@@ -299,21 +358,23 @@ async def get_external_lineage(
     limit: int = Query(100, ge=1, le=500),
 ):
     """Get external lineage edges, optionally filtered by table or platform."""
-    _lazy_ensure()
+    # Validate the filter before _lazy_ensure's DDL — see get_ol_bridge_events.
     conditions = ["1=1"]
     if table_fqn:
-        safe_fqn = table_fqn.replace("'", "''")[:300]
+        safe_fqn = sql_str(table_fqn, 300)
         conditions.append(f"(source_asset = '{safe_fqn}' OR target_asset = '{safe_fqn}')")
     if platform:
-        conditions.append(f"source_platform = '{platform.replace(chr(39), chr(39)*2)}'")
+        conditions.append(f"source_platform = '{_validate_platform(platform)}'")
     where = " AND ".join(conditions)
+    _lazy_ensure()
     try:
         rows = await asyncio.to_thread(
             _execute_sql, f"SELECT * FROM {EDGES_TABLE} WHERE {where} ORDER BY created_at DESC LIMIT {limit}"
         )
         return {"edges": rows, "count": len(rows)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"external lineage query failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch external lineage")
 
 
 # ===========================================================================
@@ -402,9 +463,9 @@ async def register_ol_bridge_source(request: Request, body: OLBridgeSourceIn):
     _lazy_ensure_bridge()
     source_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    platform_safe = body.platform.replace("'", "''")[:100]
-    name_safe = body.name.replace("'", "''")[:300]
-    desc_safe = (body.description or "").replace("'", "''")[:1000]
+    platform_safe = _validate_platform(body.platform)
+    name_safe = sql_str(body.name, 300)
+    desc_safe = sql_str(body.description or "", 1000)
     try:
         _execute_sql(f"""
             INSERT INTO {OL_BRIDGE_SOURCES_TABLE}
@@ -427,7 +488,8 @@ async def register_ol_bridge_source(request: Request, body: OLBridgeSourceIn):
             ),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"ol bridge registration failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to register OL bridge source")
 
 
 @router.post("/ol-bridge/ingest/{source_id}")
@@ -450,7 +512,7 @@ async def ingest_ol_bridge_events(request: Request, source_id: str, body: dict):
     _UUID_RE = re.compile(r"^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$")
     if not _UUID_RE.match(source_id):
         raise HTTPException(status_code=400, detail="Invalid source_id format")
-    safe_id = source_id.replace("'", "''")[:100]
+    safe_id = sql_str(source_id, 100)
 
     # Validate source exists and is active
     try:
@@ -460,14 +522,17 @@ async def ingest_ol_bridge_events(request: Request, source_id: str, body: dict):
             f"WHERE source_id = '{safe_id}' AND active = true LIMIT 1",
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"ol bridge source lookup failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to validate bridge source")
 
     if not rows:
         # A15 FIX: Do NOT reveal whether the UUID exists — prevent enumeration
         raise HTTPException(status_code=403, detail="Authentication failed")
 
     platform = rows[0]["platform"]
-    platform_safe = platform.replace("'", "''")[:100]
+    # Re-escaped rather than allow-listed: this is a value read back out of the
+    # table, and rows predating the write-side allow-list may hold anything.
+    platform_safe = sql_str(platform, 100)
 
     # Normalize to event list
     if "events" in body:
@@ -488,14 +553,13 @@ async def ingest_ol_bridge_events(request: Request, source_id: str, body: dict):
             eid = str(uuid.uuid4())
             job = event.get("job", {})
             run = event.get("run", {})
-            ns = job.get("namespace", "").replace("'", "''")[:500]
-            jname = job.get("name", "").replace("'", "''")[:500]
-            run_id_val = run.get("runId", "").replace("'", "''")[:200]
-            evt_type = event.get("eventType", "COMPLETE").replace("'", "''")[:50]
-            raw_evt_time = str(event.get("eventTime", now))
-            evt_time = raw_evt_time.replace("'", "''")[:50]
-            inputs_json = json.dumps(event.get("inputs", [])).replace("'", "''")[:4000]
-            outputs_json = json.dumps(event.get("outputs", [])).replace("'", "''")[:4000]
+            ns = sql_str(job.get("namespace", ""), 500)
+            jname = sql_str(job.get("name", ""), 500)
+            run_id_val = sql_str(run.get("runId", ""), 200)
+            evt_type = sql_str(event.get("eventType", "COMPLETE"), 50)
+            evt_time = sql_str(event.get("eventTime", now), 50)
+            inputs_json = sql_str(json.dumps(event.get("inputs", [])), 4000)
+            outputs_json = sql_str(json.dumps(event.get("outputs", [])), 4000)
 
             _execute_sql(f"""
                 INSERT INTO {OL_BRIDGE_EVENTS_TABLE}
@@ -519,7 +583,8 @@ async def ingest_ol_bridge_events(request: Request, source_id: str, body: dict):
 
         return {"status": "ok", "ingested": ingested, "source_id": source_id, "platform": platform}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"ol bridge ingest failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to ingest OL events")
 
 
 @router.get("/ol-bridge/sources")
@@ -528,7 +593,12 @@ async def list_ol_bridge_sources(request: Request):
 
     Shows which external platforms are configured, when they last pushed,
     and the total number of events received from each.
+
+    Admin-gated: the response includes source_id, which doubles as the ingest
+    credential (see the ingest handler) — listing it to every user hands out the
+    token that lets a caller inject lineage events.
     """
+    require_admin(request)
     _lazy_ensure_bridge()
     try:
         rows = await asyncio.to_thread(
@@ -540,7 +610,8 @@ async def list_ol_bridge_sources(request: Request):
         )
         return {"sources": rows, "count": len(rows)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"ol bridge source list failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list OL bridge sources")
 
 
 @router.get("/ol-bridge/events")
@@ -556,13 +627,18 @@ async def get_ol_bridge_events(
     input/output datasets, and timestamps — enabling operators to verify
     that external platform lineage is flowing correctly before graph integration.
     """
-    _lazy_ensure_bridge()
+    # Build (and therefore validate) the filter BEFORE _lazy_ensure_bridge, which
+    # issues two CREATE TABLE IF NOT EXISTS statements. With the order reversed a
+    # rejected filter still cost two warehouse round-trips, and the property
+    # test_platform_filter_allow_listed asserts — that an off-list platform is
+    # rejected before any SQL runs — was false.
     conditions = ["1=1"]
     if source_id:
-        conditions.append(f"source_id = '{source_id.replace(chr(39), chr(39)*2)[:100]}'")
+        conditions.append(f"source_id = '{sql_str(source_id, 100)}'")
     if platform:
-        conditions.append(f"platform = '{platform.replace(chr(39), chr(39)*2)[:100]}'")
+        conditions.append(f"platform = '{_validate_platform(platform)}'")
     where = " AND ".join(conditions)
+    _lazy_ensure_bridge()
     try:
         rows = await asyncio.to_thread(
             _execute_sql,
@@ -575,4 +651,5 @@ async def get_ol_bridge_events(
         )
         return {"events": rows, "count": len(rows)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"ol bridge event query failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch OL bridge events")

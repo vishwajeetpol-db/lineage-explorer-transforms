@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useLineageStore } from '../store/lineageStore';
 
 interface DQMetric {
   rule_id: string;
@@ -28,6 +29,10 @@ interface Props {
 }
 
 export function DQMetricsPanel({ tableFqn = '' }: Props) {
+  // Running checks executes stored CUSTOM rule expressions as the app service
+  // principal, so the backend admin-gates it. Say so up front instead of letting
+  // the button return a bare 403.
+  const isAdmin = useLineageStore((s) => s.isAdmin);
   const [inputFqn, setInputFqn] = useState(tableFqn);
   const [result, setResult] = useState<DQResult | null>(null);
   const [loading, setLoading] = useState(false);
@@ -85,11 +90,18 @@ export function DQMetricsPanel({ tableFqn = '' }: Props) {
           className="flex-1 px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500"
           onKeyDown={e => e.key === 'Enter' && runMetrics()}
         />
-        <button onClick={runMetrics} disabled={loading || !inputFqn}
+        <button onClick={runMetrics} disabled={loading || !inputFqn || !isAdmin}
+          title={isAdmin ? undefined : 'Running DQ checks requires admin'}
           className="px-6 py-2 bg-indigo-600 text-white rounded-lg font-medium hover:bg-indigo-700 disabled:opacity-50">
           {loading ? 'Running...' : 'Run Checks'}
         </button>
       </div>
+
+      {!isAdmin && (
+        <p className="text-amber-400/90 text-sm mb-4">
+          Running DQ checks executes rule expressions against your data and is restricted to admins.
+        </p>
+      )}
 
       {error && <p className="text-red-400 text-sm mb-4">{error}</p>}
 

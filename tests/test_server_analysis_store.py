@@ -82,6 +82,23 @@ class TestHelpers:
         assert store._sql_str("a'b\\c") == "a''b\\\\c"
         assert store._sql_str(None) == ""
 
+    def test_sql_str_delegates_to_shared_helper(self):
+        """The local _sql_str is now a thin alias for backend.validators.sql_str —
+        one escaper for the whole app instead of a per-module copy."""
+        from backend.validators import sql_str
+        for value in ("a'b\\c", None, "", "plain", "\\' OR 1=1--"):
+            assert store._sql_str(value) == sql_str(value)
+
+    def test_sql_str_escapes_backslash_before_quote(self):
+        r"""Backslash FIRST: a leading `\'` must become `\\''`, not `\''` — the
+        latter's second quote closes the literal on Databricks SQL."""
+        assert store._sql_str("\\' OR 1=1--") == "\\\\'' OR 1=1--"
+
+    def test_key_where_escapes_backslash_quote(self):
+        w = store._key_where("JOB", "\\' OR 1=1--", "c.s.t")
+        assert "entity_id = '\\\\'' OR 1=1--'" in w
+        assert "entity_id = '\\''" not in w
+
     def test_key_where(self):
         w = store._key_where("JOB", "1", "c.s.t")
         assert "entity_type = 'JOB'" in w

@@ -83,6 +83,39 @@ class TestCapabilityCacheSetFallback:
             sent = mock_sql.call_args[0][0]
             assert "o''brien" in sent  # escaped, not raw
 
+    def test_set_escapes_backslash_before_quote(self):
+        r"""_q must escape the backslash FIRST. Quote-doubling alone turned a
+        leading `\'` into `\''`: Spark reads `\'` as an escaped quote, so the
+        second quote CLOSED the literal and the rest executed as SQL."""
+        from backend.server.capability_cache import get_capability_cache
+        svc = get_capability_cache()
+        with patch.object(svc, "_ensure_table"), patch.object(svc, "_sql", return_value=[]) as mock_sql:
+            svc.set("cat.sch.tbl", "impact", {"x": 1}, actor="\\' OR 1=1--")
+            sent = mock_sql.call_args[0][0]
+            assert "'\\\\'' OR 1=1--'" in sent   # backslash doubled, then quote
+            assert "'\\''" not in sent            # bypassable form absent
+
+    def test_get_escapes_backslash_before_quote(self):
+        r"""Same for the read path's WHERE clause."""
+        from backend.server.capability_cache import get_capability_cache
+        svc = get_capability_cache()
+        with patch.object(svc, "_ensure_table"), patch.object(svc, "_sql", return_value=[]) as mock_sql:
+            svc.get("\\' OR 1=1--", "impact")
+            sent = mock_sql.call_args[0][0]
+            assert "'\\\\'' OR 1=1--'" in sent
+            assert "'\\''" not in sent
+
+    def test_payload_json_backslashes_are_escaped(self):
+        r"""json.dumps emits `\"` for a quote inside the payload. Quote-doubling
+        alone left that backslash bare, so Spark consumed it and the stored JSON
+        was corrupt on read; sql_str doubles it, keeping the payload verbatim."""
+        from backend.server.capability_cache import get_capability_cache
+        svc = get_capability_cache()
+        with patch.object(svc, "_ensure_table"), patch.object(svc, "_sql", return_value=[]) as mock_sql:
+            svc.set("cat.sch.tbl", "impact", {"note": 'he said "hi"'})
+            sent = mock_sql.call_args[0][0]
+            assert '\\\\"hi\\\\"' in sent
+
 
 class TestCapabilityCacheEviction:
     def test_evict_entry_issues_delete(self):

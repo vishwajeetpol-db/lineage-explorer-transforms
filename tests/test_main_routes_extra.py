@@ -387,6 +387,26 @@ class TestTransformBuild:
             resp = admin_client.post("/api/transform/build", json={"table_fqn": "c.s.t"})
         assert resp.status_code == 500
 
+    def test_source_unreachable_503_with_full_remediation(self, admin_client):
+        """The curated fix must reach the client intact — _safe_error would cut it at 200 chars."""
+        # Take the class off backend.main, not backend.build_service: other test
+        # modules importlib.reload() build_service, which rebinds the class object
+        # while main.py keeps its original reference. main.py's except clause is
+        # what this test exercises, so use exactly the class it compares against.
+        from backend.main import BuildSourceAccessError
+        from backend.build_service import _SOURCE_ACCESS_HINT
+
+        with patch("backend.main.is_build_configured", return_value=True), \
+             patch("backend.main.get_transform_freshness",
+                   return_value=_freshness(exists=False, is_stale=True)), \
+             patch("backend.main.submit_build_job",
+                   side_effect=BuildSourceAccessError(_SOURCE_ACCESS_HINT)):
+            resp = admin_client.post("/api/transform/build", json={"table_fqn": "c.s.t"})
+
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == _SOURCE_ACCESS_HINT
+        assert "grant_build_source_access.sh" in resp.json()["detail"]
+
 
 class TestCapturedExpression:
     def test_ok(self, app_client):

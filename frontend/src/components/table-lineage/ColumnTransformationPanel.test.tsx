@@ -139,6 +139,50 @@ describe("ColumnTransformationPanel", () => {
     expect(api.deepAnalyzeColumnTransformations).toHaveBeenCalled();
   });
 
+  it("shows a reason-specific notice with a next step when deep analysis derives nothing", async () => {
+    // A non-derived result must not be just another log line: reason_code drives a
+    // headline + CTA so the actionable advice can't scroll out of the capped log.
+    (api.resolveColumnTransformations as any).mockResolvedValue({
+      source: "unavailable", source_label: "LLM unavailable", columns: [],
+      reason_code: "no_columns", entity_type: "PIPELINE", entity_id: "pipe-1",
+      detail: "metadata-driven framework",
+    });
+    (api.deepAnalyzeColumnTransformations as any).mockImplementation(async (_body: any, onEvent: any) => {
+      onEvent({ type: "step", step: "query_config", status: "warn", message: "Config table c.s.cfg is currently empty" });
+      onEvent({
+        type: "result", derived: false, columns: [], reason_code: "config_empty",
+        config_tables: ["c.s.cfg"], empty_config_tables: ["c.s.cfg"],
+        detail: "The config table(s) c.s.cfg are currently empty. This framework writes its column config per run, so run the producing pipeline for this target, then re-analyze.",
+      });
+    });
+    const user = userEvent.setup();
+    render(<ColumnTransformationPanel table={TABLE} />);
+    await waitFor(() => expect(api.resolveColumnTransformations).toHaveBeenCalled());
+    await user.click(screen.getByRole("tab", { name: /Analyze/i }));
+    await user.click(screen.getByRole("button", { name: /deep framework analysis/i }));
+    // reason-specific headline + CTA, not a generic "no columns"
+    expect(await screen.findByText(/Config table is empty right now/i)).toBeInTheDocument();
+    expect(screen.getByText(/Run the producing pipeline for this table, then re-run deep analysis/i)).toBeInTheDocument();
+    expect(screen.getByText(/are currently empty/i)).toBeInTheDocument();
+  });
+
+  it("falls back to a generic deep-analysis headline when no reason_code is sent", async () => {
+    (api.resolveColumnTransformations as any).mockResolvedValue({
+      source: "unavailable", source_label: "LLM unavailable", columns: [],
+      reason_code: "no_columns", entity_type: "PIPELINE", entity_id: "pipe-1",
+    });
+    (api.deepAnalyzeColumnTransformations as any).mockImplementation(async (_body: any, onEvent: any) => {
+      onEvent({ type: "result", derived: false, columns: [], detail: "Nothing usable." });
+    });
+    const user = userEvent.setup();
+    render(<ColumnTransformationPanel table={TABLE} />);
+    await waitFor(() => expect(api.resolveColumnTransformations).toHaveBeenCalled());
+    await user.click(screen.getByRole("tab", { name: /Analyze/i }));
+    await user.click(screen.getByRole("button", { name: /deep framework analysis/i }));
+    expect(await screen.findByText(/Deep analysis found no columns/i)).toBeInTheDocument();
+    expect(screen.getByText(/Nothing usable/i)).toBeInTheDocument();
+  });
+
   it("surfaces existing stored lineage (with producer name) when opened without a producer", async () => {
     // A prior analysis exists for a producer of this table — the backend
     // resolves it on open (no producer picked) and names the producer.

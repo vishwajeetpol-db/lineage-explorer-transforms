@@ -6,7 +6,8 @@ Covers:
 - happy JSON-array parse (default endpoint)
 - markdown-fence stripping
 - {"columns": [...]} dict envelope
-- LLM_ENDPOINT_URL override path
+- LLM_ENDPOINT_URL override: honoured only when it stays in this workspace
+- per-user call budget
 - target_columns hint branch
 - exception -> [] path
 - is_llm_configured true/false
@@ -18,10 +19,19 @@ import pytest
 import backend.server.llm as llm
 
 
-def _client_returning(content):
+def _client_returning(content, host="https://myworkspace.cloud.databricks.com"):
     client = MagicMock()
     client.api_client.do.return_value = {"choices": [{"message": {"content": content}}]}
+    client.config.host = host
     return client
+
+
+@pytest.fixture(autouse=True)
+def _reset_llm_budget():
+    """The per-user call budget is module-global; keep it out of sibling tests."""
+    llm._reset_llm_budget()
+    yield
+    llm._reset_llm_budget()
 
 
 class TestAnalyzeSourceCode:
@@ -54,13 +64,87 @@ class TestAnalyzeSourceCode:
             out = llm.analyze_source_code("SELECT 1", "c.s.t")
         assert out == [{"target_column": "y"}]
 
-    def test_endpoint_url_override(self):
+    def test_off_workspace_override_is_refused(self):
+        """An override pointing off-workspace must NOT be used.
+
+        This call ships producer source code. The override was previously honoured
+        verbatim and the SDK attaches the workspace credential to whatever it is
+        given, so one wrong env var shipped regulated source text to a third party
+        with a valid token. A config mistake must not become an egress — so the bad
+        value is refused and the in-workspace endpoint is used instead.
+        """
         client = _client_returning('[]')
         with patch("backend.lineage_service._get_client", return_value=client), \
-             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": "https://x/invocations"}):
+             patch.object(llm.os, "environ",
+                          {**llm.os.environ, "LLM_ENDPOINT_URL": "https://evil.example.com/invocations"}):
             llm.analyze_source_code("SELECT 1", "c.s.t")
-        args = client.api_client.do.call_args
-        assert args[0][1] == "https://x/invocations"
+        url = client.api_client.do.call_args[0][1]
+        assert "evil.example.com" not in url
+        assert url == f"/serving-endpoints/{llm.LLM_MODEL_NAME}/invocations"
+
+    def test_same_host_absolute_override_is_honoured(self):
+        """A legitimate absolute URL on the workspace's own host still works."""
+        host = "https://myworkspace.cloud.databricks.com"
+        client = _client_returning('[]', host=host)
+        override = f"{host}/serving-endpoints/custom/invocations"
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ", {**llm.os.environ, "LLM_ENDPOINT_URL": override}):
+            llm.analyze_source_code("SELECT 1", "c.s.t")
+        assert client.api_client.do.call_args[0][1] == override
+
+    def test_relative_serving_path_override_is_honoured(self):
+        client = _client_returning('[]')
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ",
+                          {**llm.os.environ, "LLM_ENDPOINT_URL": "/serving-endpoints/custom/invocations"}):
+            llm.analyze_source_code("SELECT 1", "c.s.t")
+        assert client.api_client.do.call_args[0][1] == "/serving-endpoints/custom/invocations"
+
+    def test_non_serving_relative_override_is_refused(self):
+        """A relative path outside the serving namespace is still a redirect."""
+        client = _client_returning('[]')
+        with patch("backend.lineage_service._get_client", return_value=client), \
+             patch.object(llm.os, "environ",
+                          {**llm.os.environ, "LLM_ENDPOINT_URL": "/api/2.0/workspace/export"}):
+            llm.analyze_source_code("SELECT 1", "c.s.t")
+        assert client.api_client.do.call_args[0][1] == f"/serving-endpoints/{llm.LLM_MODEL_NAME}/invocations"
+
+
+class TestLLMBudget:
+    """The deep-analysis path is agentic: one user action can be many model calls."""
+
+    def test_budget_exhaustion_raises(self):
+        with patch.object(llm, "LLM_MAX_CALLS_PER_USER_PER_DAY", 3):
+            for _ in range(3):
+                llm._charge_llm_budget()
+            with pytest.raises(llm.LLMBudgetError, match="daily limit"):
+                llm._charge_llm_budget()
+
+    def test_budget_is_per_user(self):
+        from backend import warehouse_gate as wg
+        with patch.object(llm, "LLM_MAX_CALLS_PER_USER_PER_DAY", 2):
+            wg.set_request_context("/api/x", "alice@example.com")
+            llm._charge_llm_budget()
+            llm._charge_llm_budget()
+            with pytest.raises(llm.LLMBudgetError):
+                llm._charge_llm_budget()
+            # A different person is unaffected by Alice's spend.
+            wg.set_request_context("/api/x", "bob@example.com")
+            llm._charge_llm_budget()
+
+    def test_budget_resets_on_a_new_day(self):
+        with patch.object(llm, "LLM_MAX_CALLS_PER_USER_PER_DAY", 1):
+            llm._charge_llm_budget()
+            with pytest.raises(llm.LLMBudgetError):
+                llm._charge_llm_budget()
+            llm._llm_budget_day = "1999-01-01"   # simulate the day rolling over
+            llm._charge_llm_budget()
+
+    def test_status_reports_usage(self):
+        llm._charge_llm_budget()
+        st = llm.get_llm_budget()
+        assert st["calls_today"] == 1
+        assert st["max_per_user_per_day"] == llm.LLM_MAX_CALLS_PER_USER_PER_DAY
 
     def test_target_columns_hint_and_model_override(self):
         client = _client_returning('[]')

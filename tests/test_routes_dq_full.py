@@ -208,49 +208,68 @@ class TestDelete:
         assert resp.status_code == 403
 
     def test_admin_ok(self, admin_client, mock_sql):
+        # The handler confirms the row exists before reporting success.
+        mock_sql.return_value = [{"1": 1}]
         resp = admin_client.delete("/api/dq-rules/r1")
         assert resp.status_code == 200
         assert resp.json()["status"] == "deleted"
+
+    def test_missing_rule_404(self, admin_client, mock_sql):
+        mock_sql.return_value = []
+        resp = admin_client.delete("/api/dq-rules/r1")
+        assert resp.status_code == 404
 
     def test_error_500(self, admin_client, mock_sql):
         mock_sql.side_effect = RuntimeError("boom")
         resp = admin_client.delete("/api/dq-rules/r1")
         assert resp.status_code == 500
+        # the warehouse message must not reach the client
+        assert "boom" not in resp.text
 
 
 class TestMetrics:
-    def test_missing_param_422(self, app_client, mock_sql):
-        resp = app_client.get("/api/dq-rules/metrics")
+    """A2 FIX: /metrics executes stored expressions, so it is admin-gated —
+    every case here needs an admin caller."""
+
+    def test_non_admin_403(self, non_admin_client, mock_sql):
+        resp = non_admin_client.get(
+            "/api/dq-rules/metrics", params={"table_fqn": "c.s.t"}
+        )
+        assert resp.status_code == 403
+        mock_sql.assert_not_called()
+
+    def test_missing_param_422(self, admin_client, mock_sql):
+        resp = admin_client.get("/api/dq-rules/metrics")
         assert resp.status_code == 422
 
-    def test_bad_fqn_400(self, app_client, mock_sql):
-        resp = app_client.get("/api/dq-rules/metrics", params={"table_fqn": "bad;x"})
+    def test_bad_fqn_400(self, admin_client, mock_sql):
+        resp = admin_client.get("/api/dq-rules/metrics", params={"table_fqn": "bad;x"})
         assert resp.status_code == 400
 
-    def test_permission_denied_403(self, app_client, mock_sql):
+    def test_permission_denied_403(self, admin_client, mock_sql):
         mock_sql.side_effect = Exception("INSUFFICIENT_PERMISSIONS on table")
-        resp = app_client.get(
+        resp = admin_client.get(
             "/api/dq-rules/metrics", params={"table_fqn": "c.s.t"}
         )
         assert resp.status_code == 403
 
-    def test_table_not_found_404(self, app_client, mock_sql):
+    def test_table_not_found_404(self, admin_client, mock_sql):
         mock_sql.side_effect = Exception("TABLE_OR_VIEW_NOT_FOUND: c.s.t")
-        resp = app_client.get(
+        resp = admin_client.get(
             "/api/dq-rules/metrics", params={"table_fqn": "c.s.t"}
         )
         assert resp.status_code == 404
 
-    def test_no_rules(self, app_client, mock_sql):
+    def test_no_rules(self, admin_client, mock_sql):
         # preflight ok, ensure ok, rules query returns []
         mock_sql.return_value = []
-        resp = app_client.get(
+        resp = admin_client.get(
             "/api/dq-rules/metrics", params={"table_fqn": "c.s.t"}
         )
         assert resp.status_code == 200
         assert resp.json()["note"] == "No DQ rules defined"
 
-    def test_full_evaluation(self, app_client, mock_sql):
+    def test_full_evaluation(self, admin_client, mock_sql):
         rules = [
             {"rule_id": "r1", "column_name": "x", "rule_type": "NOT_NULL",
              "expression": "", "severity": "ERROR"},
@@ -272,7 +291,7 @@ class TestMetrics:
             return []
 
         mock_sql.side_effect = _se
-        resp = app_client.get(
+        resp = admin_client.get(
             "/api/dq-rules/metrics", params={"table_fqn": "c.s.t"}
         )
         assert resp.status_code == 200
@@ -281,7 +300,7 @@ class TestMetrics:
         statuses = {m["rule_id"]: m["status"] for m in data["metrics"]}
         assert statuses["r3"] == "skipped"
 
-    def test_rule_eval_no_data_and_error(self, app_client, mock_sql):
+    def test_rule_eval_no_data_and_error(self, admin_client, mock_sql):
         rules = [
             {"rule_id": "r1", "column_name": "x", "rule_type": "NOT_NULL",
              "expression": "", "severity": "ERROR"},
@@ -303,7 +322,7 @@ class TestMetrics:
             return []
 
         mock_sql.side_effect = _se
-        resp = app_client.get(
+        resp = admin_client.get(
             "/api/dq-rules/metrics", params={"table_fqn": "c.s.t"}
         )
         assert resp.status_code == 200
@@ -311,14 +330,45 @@ class TestMetrics:
         assert statuses["r1"] == "no_data"
         assert statuses["r2"] == "error"
 
-    def test_error_500(self, app_client, mock_sql):
+    def test_legacy_invalid_expression_marked_not_executed(self, admin_client, mock_sql):
+        """A1 FIX: a rule stored before the allow-list existed (second-order
+        injection) is reported as `invalid` and never executed — and it does not
+        take the rest of the panel down with it."""
+        rules = [
+            {"rule_id": "evil", "column_name": "id", "rule_type": "CUSTOM",
+             "expression": "1=1) UNION SELECT secret FROM credentials WHERE (1=1",
+             "severity": "ERROR"},
+            {"rule_id": "ok", "column_name": "x", "rule_type": "NOT_NULL",
+             "expression": "", "severity": "ERROR"},
+        ]
+
+        def _se(sql):
+            assert "UNION SELECT secret" not in sql  # never reaches the warehouse
+            if "LIMIT 0" in sql or "CREATE TABLE" in sql:
+                return []
+            if sql.strip().startswith("SELECT * FROM") and "dq_rules" in sql:
+                return rules
+            if "total_rows" in sql:
+                return [{"total_rows": 10, "passing_rows": 10}]
+            return []
+
+        mock_sql.side_effect = _se
+        resp = admin_client.get(
+            "/api/dq-rules/metrics", params={"table_fqn": "c.s.t"}
+        )
+        assert resp.status_code == 200
+        statuses = {m["rule_id"]: m["status"] for m in resp.json()["metrics"]}
+        assert statuses["evil"] == "invalid"
+        assert statuses["ok"] == "pass"
+
+    def test_error_500(self, admin_client, mock_sql):
         def _se(sql):
             if "LIMIT 0" in sql:
                 return []
             raise RuntimeError("boom")
 
         mock_sql.side_effect = _se
-        resp = app_client.get(
+        resp = admin_client.get(
             "/api/dq-rules/metrics", params={"table_fqn": "c.s.t"}
         )
         assert resp.status_code == 500
@@ -361,6 +411,10 @@ class TestPropagation:
 
 
 class TestValidateExpression:
+    """The CUSTOM expression check is an ALLOW-list (positive grammar), not a
+    deny-list: a CUSTOM expression is interpolated at SQL *code* position by
+    _build_check_sql, where only an enumerated grammar is sound."""
+
     def test_empty_ok(self):
         import backend.routes.dq as d
         assert d._validate_expression("", "CUSTOM") == ""
@@ -386,6 +440,97 @@ class TestValidateExpression:
     def test_valid(self):
         import backend.routes.dq as d
         assert d._validate_expression("(a > 1)", "CUSTOM") == "(a > 1)"
+
+    def test_scalar_subquery_rejected(self):
+        """The read-oracle payload: needs no quotes and matched none of the old
+        deny-list patterns, but names SELECT/FROM/WHERE."""
+        import backend.routes.dq as d
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc:
+            d._validate_expression(
+                "(SELECT count(*) FROM main.hr.payroll WHERE salary > 250000) > 0",
+                "CUSTOM",
+            )
+        assert exc.value.status_code == 400
+        assert "SELECT" in exc.value.detail
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "amount > 0 OR EXISTS (x)",           # EXISTS opens a subquery
+            "a = 1 /* comment */ AND b = 2",      # block comment
+            "a = 1 -- trailing",                  # line comment
+            "a = 1; SET spark.x = 1",             # statement separator
+            "my_udf(col) > 0",                    # non-allow-listed function
+            "col & 1 = 1",                        # character outside the grammar
+            "col = 'unterminated",                # literal swallows the statement
+            "col = 'a\\'",                        # backslash escape ambiguity
+            "a UNION ALL b",
+            "a JOIN b",
+            "WITH x AS (a) a",
+        ],
+    )
+    def test_rejected_expressions(self, expr):
+        import backend.routes.dq as d
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException):
+            d._validate_expression(expr, "CUSTOM")
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "amount > 0 AND status IN ('active','pending')",  # the everyday rule
+            "x IS NOT NULL",
+            "amount BETWEEN 1 AND 10",
+            "upper(trim(name)) LIKE 'A%'",
+            "a > 1 AND (b < 2 OR c = 3)",
+            "note = 'it''s fine'",                            # escaped quote
+            "cast(x AS int) > 0",
+            "`odd column` <> 'x'",
+            "abs(delta) / 100 <= 0.5",
+        ],
+    )
+    def test_accepted_expressions(self, expr):
+        """The other direction: ordinary DQ rules must keep working."""
+        import backend.routes.dq as d
+        assert d._validate_expression(expr, "CUSTOM") == expr
+
+    def test_regex_rule_keeps_regex_syntax(self):
+        """REGEX expressions land inside a quoted literal, so real regex
+        metacharacters must survive."""
+        import backend.routes.dq as d
+        assert d._validate_expression(r"^[0-9]{3}-[0-9]{4}$", "REGEX") == r"^[0-9]{3}-[0-9]{4}$"
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "^.*/v1/.*$",            # `*/` — a block-comment token
+            "^[0-9]{4}--[0-9]{2}$",  # `--` — a line-comment token
+            "^(select|update)$",     # bare SQL words
+            r"\d{3}-\d{4}",          # backslash classes
+        ],
+    )
+    def test_regex_metacharacters_are_not_keyword_screened(self, expr):
+        """These are all legitimate patterns that the old keyword/comment screen
+        rejected. At a literal position the escaping is the control, so screening
+        keywords on top only broke real regexes — see
+        test_regex_payload_is_neutralised_by_escaping for the property that
+        actually holds."""
+        import backend.routes.dq as d
+        assert d._validate_expression(expr, "REGEX") == expr
+
+    def test_regex_payload_is_neutralised_by_escaping(self):
+        """The former keyword screen rejected this outright. It is now accepted
+        and rendered inert instead: sql_str escapes it into the RLIKE literal, so
+        no part of it can reach a code position. This is the same guarantee
+        TestBuildCheckSql.test_regex_literal_is_escaped pins for `\\'`."""
+        import backend.routes.dq as d
+        payload = "x' UNION SELECT 1 --"
+        assert d._validate_expression(payload, "REGEX") == payload
+        sql = d._build_check_sql("c.s.t", "col", "REGEX", payload, 100)
+        # the quote is doubled, so UNION SELECT stays inside the literal
+        assert "RLIKE 'x'' UNION SELECT 1 --'" in sql
+        assert "RLIKE 'x' UNION" not in sql
 
 
 class TestBuildCheckSql:
@@ -422,9 +567,78 @@ class TestBuildCheckSql:
         sql = d._build_check_sql("c.s.t", "col", "CUSTOM", "col > 0", 100)
         assert "CASE WHEN (col > 0)" in sql
 
+    def test_custom_string_literal_not_quote_doubled(self):
+        """The old `expression.replace("'", "''")` at code position corrupted every
+        legitimate literal (`status = 'active'` -> `status = ''active''`) while
+        protecting nothing — the expression is code, not a literal."""
+        import backend.routes.dq as d
+        sql = d._build_check_sql(
+            "c.s.t", "col", "CUSTOM", "status IN ('active','pending')", 100
+        )
+        assert "CASE WHEN (status IN ('active','pending'))" in sql
+        assert "''active''" not in sql
+
+    def test_regex_literal_is_escaped(self):
+        r"""REGEX *is* at literal position, so it is escaped backslash-first: a
+        `\'` prefix must not be able to close the RLIKE literal."""
+        import backend.routes.dq as d
+        sql = d._build_check_sql("c.s.t", "col", "REGEX", "\\'x", 100)
+        assert "RLIKE '\\\\''x'" in sql
+        assert "RLIKE '\\''" not in sql  # the bypassable quote-only form
+
     def test_unknown_none(self):
         import backend.routes.dq as d
         assert d._build_check_sql("c.s.t", "col", "OTHER", "", 100) is None
+
+    @pytest.mark.parametrize(
+        "col",
+        [
+            "normal_col",
+            "my-col",         # UC allows hyphens
+            "my col",         # …and spaces
+            "Order Date",     # a real-world column name
+            "col.with.dot",
+            "café_id",        # …and unicode
+        ],
+    )
+    def test_backquoted_column_accepts_every_name_uc_allows(self, col):
+        """The column reaches a code position as a BACK-QUOTED identifier, so
+        anything UC permits is inert once quoted.
+
+        Screening it with the bare-identifier regex (no hyphens, no spaces) broke
+        real tables: writes 400'd and existing rules on such columns were marked
+        permanently invalid, silently dropping the check.
+        """
+        import backend.routes.dq as d
+        sql = d._build_check_sql("c.s.t", col, "NOT_NULL", "", 100)
+        assert f"`{col}`" in sql
+
+    @pytest.mark.parametrize(
+        "col",
+        [
+            # the projection-rewrite payload: a backtick closes the identifier
+            "x`) THEN 1 ELSE 0 END) AS passing_rows, "
+            "(SELECT count(*) FROM main.hr.payroll) AS leak FROM (SELECT * FROM c.s.t LIMIT 1) -- ",
+            "a`b",            # any embedded backtick
+            "a\nb",           # control characters
+            "a" * 256,        # over length
+        ],
+    )
+    def test_backquoted_column_rejects_break_out(self, col):
+        """A backtick is the ONLY character that can end the quoting, so it is the
+        one that must be refused."""
+        import backend.routes.dq as d
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc:
+            d._build_check_sql("c.s.t", col, "NOT_NULL", "", 100)
+        assert exc.value.status_code == 400
+
+    def test_no_column_means_star_not_a_validation_error(self):
+        """A table-scoped CUSTOM rule has no column; that is not an error."""
+        import backend.routes.dq as d
+        assert d._build_check_sql("c.s.t", "", "NOT_NULL", "", 100) is None
+        sql = d._build_check_sql("c.s.t", "", "CUSTOM", "amount > 0", 100)
+        assert "SELECT * FROM c.s.t" in sql
 
 
 class TestScoreToGrade:

@@ -232,12 +232,115 @@ class TestDiff:
 
 
 class TestDelete:
-    def test_ok(self, app_client, mock_sql):
-        resp = app_client.delete("/api/snapshots/s1")
+    """DELETE is admin-gated: a hard DELETE with no per-user scoping."""
+
+    def test_ok(self, admin_client, mock_sql):
+        resp = admin_client.delete("/api/snapshots/s1")
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 
-    def test_error_500(self, app_client, mock_sql):
+    def test_error_500(self, admin_client, mock_sql):
         mock_sql.side_effect = RuntimeError("boom")
-        resp = app_client.delete("/api/snapshots/s1")
+        resp = admin_client.delete("/api/snapshots/s1")
         assert resp.status_code == 500
+        # Raw SQL error text must not reach the caller.
+        assert "boom" not in resp.text
+
+    def test_non_admin_403(self, non_admin_client, mock_sql):
+        resp = non_admin_client.delete("/api/snapshots/s1")
+        assert resp.status_code == 403
+        mock_sql.assert_not_called()
+
+    def test_anonymous_403(self, app_client, mock_sql):
+        resp = app_client.delete("/api/snapshots/s1")
+        assert resp.status_code == 403
+        mock_sql.assert_not_called()
+
+
+class TestInjection:
+    """Escaping/allow-listing of every user value that reaches SQL here."""
+
+    # The confirmed exploit: a leading backslash makes quote-doubling alone
+    # close the literal early, so the UNION runs as the app service principal.
+    _UNION = ("\\' UNION SELECT email, ssn, dob, current_timestamp(), 'x', 1, 1 "
+              "FROM main.pii.customers -- ")
+
+    def test_list_scope_union_payload_400(self, app_client, mock_sql):
+        resp = app_client.get("/api/snapshots", params={"scope": self._UNION})
+        assert resp.status_code == 400
+        mock_sql.assert_not_called()
+
+    # An empty ?scope= means "no filter" (falsy), so it is not in this list.
+    @pytest.mark.parametrize("bad", ["c'", "a.b.c", "c s", "c.", "main;drop"])
+    def test_list_scope_shape_400(self, app_client, mock_sql, bad):
+        resp = app_client.get("/api/snapshots", params={"scope": bad})
+        assert resp.status_code == 400
+        mock_sql.assert_not_called()
+
+    @pytest.mark.parametrize("good", ["main", "main.default", "my-catalog.my_schema"])
+    def test_list_scope_valid_shapes_ok(self, app_client, mock_sql, good):
+        resp = app_client.get("/api/snapshots", params={"scope": good})
+        assert resp.status_code == 200
+        assert f"scope = '{good}'" in mock_sql.call_args[0][0]
+
+    def test_capture_rejects_bad_scope(self, app_client, mock_sql):
+        resp = app_client.post("/api/snapshots/capture",
+                               json={"catalog": "c", "schema_name": "s'; DROP TABLE x; --"})
+        assert resp.status_code == 400
+
+    def test_snapshot_id_backslash_escaped(self, app_client, mock_sql):
+        """snapshot_id is free-form, so it is escaped rather than allow-listed:
+        the backslash is doubled FIRST, so the following '' cannot close the
+        literal and the payload stays inert data."""
+        mock_sql.return_value = []
+        resp = app_client.get(f"/api/snapshots/{self._UNION}")
+        assert resp.status_code == 404
+        sql = mock_sql.call_args[0][0]
+        assert self._UNION not in sql          # raw payload never emitted
+        assert "\\\\''" in sql                 # backslash doubled, then quote
+
+    def test_delete_id_backslash_escaped(self, admin_client, mock_sql):
+        resp = admin_client.delete(f"/api/snapshots/{self._UNION}")
+        assert resp.status_code == 200
+        sql = mock_sql.call_args[0][0]
+        assert self._UNION not in sql
+        assert "\\\\''" in sql
+
+    def test_diff_ids_backslash_escaped(self, mock_sql):
+        # /diff is shadowed by /{snapshot_id} over HTTP, so call the coroutine.
+        import backend.routes.graph_snapshots as g
+        mock_sql.return_value = []
+        with pytest.raises(Exception):
+            asyncio.run(g.diff_snapshots(MagicMock(), self._UNION, "b"))
+        selects = [c[0][0] for c in mock_sql.call_args_list if "snapshot_id =" in c[0][0]]
+        assert selects and self._UNION not in selects[0]
+        assert "\\\\''" in selects[0]
+
+    def test_capture_records_real_caller(self, admin_client, mock_sql):
+        """captured_by is the caller's identity, not the hardcoded 'app' —
+        capture stays open to all users, so rows must be attributable."""
+        from backend.models import LineageResponse
+        with patch("backend.routes.graph_snapshots.get_table_lineage",
+                   return_value=LineageResponse(nodes=[], edges=[])):
+            resp = admin_client.post("/api/snapshots/capture", json={"catalog": "c"})
+        assert resp.status_code == 200
+        inserts = [c[0][0] for c in mock_sql.call_args_list if "INSERT INTO" in c[0][0]]
+        assert inserts and "'admin@test.com'" in inserts[0]
+        assert "'app'" not in inserts[0]
+
+    def test_capture_label_backslash_escaped(self, app_client, mock_sql):
+        from backend.models import LineageResponse
+        with patch("backend.routes.graph_snapshots.get_table_lineage",
+                   return_value=LineageResponse(nodes=[], edges=[])):
+            resp = app_client.post("/api/snapshots/capture",
+                                   json={"catalog": "c", "label": self._UNION})
+        assert resp.status_code == 200
+        inserts = [c[0][0] for c in mock_sql.call_args_list if "INSERT INTO" in c[0][0]]
+        assert inserts and self._UNION not in inserts[0]
+        assert "\\\\''" in inserts[0]
+
+    def test_list_error_hides_sql_text(self, app_client, mock_sql):
+        mock_sql.side_effect = RuntimeError("SQL failed: table not found")
+        resp = app_client.get("/api/snapshots")
+        assert resp.status_code == 500
+        assert "SQL failed" not in resp.text

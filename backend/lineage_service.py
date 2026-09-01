@@ -15,6 +15,7 @@ system.access.column_lineage — the source of truth captured by Unity Catalog
 from actual query execution. No inference, no heuristics, no regex parsing.
 """
 
+import hashlib
 import os
 import re
 import sys
@@ -22,12 +23,15 @@ import time
 import logging
 import threading
 from collections import OrderedDict
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Callable, TypeVar
 from cachetools import TTLCache
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.core import Config as SdkConfig
 from databricks.sdk.service.sql import StatementState
 from backend.parallel import map_parallel, run_parallel
+from backend.warehouse_gate import tag_statement, warehouse_slot
 from backend.models import (
     TableNode,
     EntityNode,
@@ -51,10 +55,128 @@ _client_instance: WorkspaceClient | None = None
 
 
 def _get_client() -> WorkspaceClient:
+    """The APP's own client (service principal).
+
+    Correct for anything the APP owns: its own lineage/cache tables, feature flags,
+    build-job submission, and the diagnostics probe that reports what the SP can
+    reach. NOT the right client for reading a user's data — see get_read_client.
+    """
     global _client_instance
     if _client_instance is None:
         _client_instance = WorkspaceClient()
     return _client_instance
+
+
+# ---------------------------------------------------------------------------
+# Per-user query identity (A1)
+#
+# THE PROBLEM. Every data query in this app has historically run as the app's own
+# service principal. The caller's `x-forwarded-access-token` was used only to
+# resolve their email and admin flag, then discarded. So Unity Catalog ACLs were not
+# enforced on anything: the blast radius of the app was the UNION of every grant the
+# SP held, and "who can see this table's lineage" was answered by the Apps ACL
+# rather than by UC. The app documented this honestly (APP_SP_VISIBILITY_NOTE in
+# edge_case_guards) and the documented mitigation — scope the SP's grants tightly —
+# is in direct tension with the product, because cross-catalog tracing is the
+# feature. In practice grants widen and the perimeter disappears.
+#
+# THE SWITCH. `ENFORCE_USER_IDENTITY` routes user-data READS through a client built
+# from the caller's own forwarded token, which makes UC the perimeter again.
+#
+# IT DEFAULTS OFF, DELIBERATELY. Turning it on makes every user see LESS than they
+# do today — only what their own UC grants allow. That is the correct end state and
+# it is also a visible behaviour change that reads as "the app broke" to anyone
+# relying on SP visibility. Validate it against one catalog first, then flip it.
+#
+# IT FAILS CLOSED. When enforcement is on and no user token is present, reads RAISE
+# rather than falling back to the SP. A fallback would mean the one code path that
+# matters — an unauthenticated or misrouted request — silently got the broader
+# visibility the flag exists to remove.
+#
+# WHAT IT COVERS. The user-data read paths in this module: catalogs, schemas,
+# tables, columns, the lineage graph and trace, column lineage, and the sharing
+# overlay. It does NOT cover the app's own writes (its lineage tables, the
+# distributed cache, feature flags, DQ rules, the glossary) — the caller has no
+# grants there and must not; those keep using _get_client by design.
+# ---------------------------------------------------------------------------
+ENFORCE_USER_IDENTITY = os.environ.get("ENFORCE_USER_IDENTITY", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Token of the caller whose request is in flight. ContextVar, not thread-local, so it
+# survives asyncio.to_thread — the same reason warehouse_gate uses one.
+_user_token_ctx: ContextVar[str] = ContextVar("bt_user_token", default="")
+
+# Building a WorkspaceClient resolves auth metadata, so per-request construction
+# would add a round-trip to every query. Cache by token digest, bounded and TTL'd:
+# a token outliving its cache entry just rebuilds, and an evicted entry costs one
+# handshake rather than correctness.
+_USER_CLIENT_TTL_S = int(os.environ.get("USER_CLIENT_CACHE_TTL_SECONDS", "600"))
+_USER_CLIENT_MAX = 200
+_user_clients: "OrderedDict[str, tuple[float, WorkspaceClient]]" = OrderedDict()
+_user_client_lock = threading.Lock()
+
+
+class UserIdentityUnavailable(RuntimeError):
+    """Enforcement is on but the caller's identity could not be established.
+
+    Surfaced as 401 rather than 500: this is a missing credential, not a defect. It
+    means the request reached a data path without a forwarded token — an unauthenticated
+    call, a misconfigured proxy, or a background task that should be using the app's
+    own client instead.
+    """
+
+
+def set_user_token(token: str) -> None:
+    """Record the caller's forwarded token for the duration of this request."""
+    _user_token_ctx.set(token or "")
+
+
+def _user_client(token: str) -> WorkspaceClient:
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    now = time.time()
+    with _user_client_lock:
+        hit = _user_clients.get(digest)
+        if hit and now - hit[0] < _USER_CLIENT_TTL_S:
+            _user_clients.move_to_end(digest)
+            return hit[1]
+    # Built outside the lock: construction can do I/O, and holding the lock through
+    # it would serialize every first-time caller behind one handshake.
+    client = WorkspaceClient(config=SdkConfig(
+        host=_get_client().config.host, token=token, auth_type="pat",
+    ))
+    with _user_client_lock:
+        _user_clients[digest] = (now, client)
+        _user_clients.move_to_end(digest)
+        while len(_user_clients) > _USER_CLIENT_MAX:
+            _user_clients.popitem(last=False)
+    return client
+
+
+def get_read_client() -> WorkspaceClient:
+    """The client to use for reading a USER's data.
+
+    Returns the app SP's client unless ENFORCE_USER_IDENTITY is set, in which case it
+    returns a client built from the caller's own token so Unity Catalog enforces the
+    read. Raises UserIdentityUnavailable when enforcing without a caller identity —
+    fail closed, never fall back to the SP's wider visibility.
+    """
+    if not ENFORCE_USER_IDENTITY:
+        return _get_client()
+    token = _user_token_ctx.get()
+    if not token:
+        raise UserIdentityUnavailable(
+            "ENFORCE_USER_IDENTITY is on, but this request carried no user token, so "
+            "the query was not run as anyone. If this is a background task it should "
+            "use the app's own client instead of a user read path."
+        )
+    return _user_client(token)
+
+
+def _reset_user_clients() -> None:
+    """Clear the per-user client cache — for tests only."""
+    with _user_client_lock:
+        _user_clients.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +202,13 @@ SQL_POLL_INTERVAL_S = int(os.environ.get("SQL_POLL_INTERVAL_S", "3"))
 # When the in-scope table count exceeds this, we refuse rather than melt the
 # warehouse/browser. Schema-scoped requests are never capped.
 LINEAGE_MAX_NODES = int(os.environ.get("LINEAGE_MAX_NODES", "2500"))
+# Per-hop row cap for the BFS walk. LINEAGE_MAX_NODES bounds the walk's DEPTH but
+# not the WIDTH of any single hop: the node cap is only checked between hops, so one
+# hop through a shared conformed dimension (a table hundreds of pipelines read)
+# returns every edge it has, in one unbounded result set, into app memory. Hitting
+# this cap is reported as truncation, which the response model already expresses —
+# a partial graph labelled partial is fine, an unbounded one is not.
+LINEAGE_HOP_MAX_ROWS = int(os.environ.get("LINEAGE_HOP_MAX_ROWS", "5000"))
 # Lookback window for system.access lineage queries. This is effectively the max
 # staleness a producing pipeline can have before its lineage drops off the view:
 # a relationship is surfaced only if its producer emitted a lineage EVENT within
@@ -353,15 +482,20 @@ def _execute_sql_long(client: WorkspaceClient, sql: str, max_wait_s: int) -> lis
     warehouse_id = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
     if not warehouse_id:
         raise RuntimeError("No SQL warehouse available. Set DATABRICKS_WAREHOUSE_ID.")
-    resp = client.statement_execution.execute_statement(
-        statement=sql, warehouse_id=warehouse_id, wait_timeout="50s",
-    )
-    deadline = time.time() + max_wait_s
-    while resp.status.state in (StatementState.PENDING, StatementState.RUNNING):
-        if time.time() > deadline:
-            raise RuntimeError(f"SQL exceeded {max_wait_s}s budget: statement_id={resp.statement_id}")
-        time.sleep(5)
-        resp = client.statement_execution.get_statement(resp.statement_id)
+    # Holds a warehouse slot for the WHOLE poll loop, not just the submit: this is
+    # the most expensive query in the app (account-wide system.billing aggregation,
+    # 1-4 min) and it occupies warehouse concurrency the entire time it runs.
+    # Releasing after submit would let the gate admit work the warehouse cannot take.
+    with warehouse_slot():
+        resp = client.statement_execution.execute_statement(
+            statement=tag_statement(sql), warehouse_id=warehouse_id, wait_timeout="50s",
+        )
+        deadline = time.time() + max_wait_s
+        while resp.status.state in (StatementState.PENDING, StatementState.RUNNING):
+            if time.time() > deadline:
+                raise RuntimeError(f"SQL exceeded {max_wait_s}s budget: statement_id={resp.statement_id}")
+            time.sleep(5)
+            resp = client.statement_execution.get_statement(resp.statement_id)
     if resp.status.state != StatementState.SUCCEEDED:
         err = resp.status.error.message if resp.status.error else resp.status.state
         raise RuntimeError(f"SQL failed: {err}")
@@ -440,25 +574,30 @@ def _execute_sql(client: WorkspaceClient, sql: str, catalog: str = None) -> list
     if not warehouse_id:
         raise RuntimeError("No SQL warehouse available. Set DATABRICKS_WAREHOUSE_ID.")
 
-    resp = client.statement_execution.execute_statement(
-        statement=sql,
-        warehouse_id=warehouse_id,
-        catalog=catalog,
-        wait_timeout=SQL_WAIT_TIMEOUT,
-    )
+    # Admission control: the app can present ~84 concurrent statements (a 64-thread
+    # default executor plus three module pools) at a warehouse that runs ~10 per
+    # cluster. The slot is held for the whole poll loop below, because a statement
+    # that is still PENDING is still consuming warehouse concurrency.
+    with warehouse_slot():
+        resp = client.statement_execution.execute_statement(
+            statement=tag_statement(sql),
+            warehouse_id=warehouse_id,
+            catalog=catalog,
+            wait_timeout=SQL_WAIT_TIMEOUT,
+        )
 
-    # The API caps wait_timeout at 50s. A heavy lineage query (e.g. a schema-wide
-    # scan of system.access.column_lineage over a 365d window) can still be
-    # PENDING/RUNNING when that window expires — so poll past the cap rather than
-    # failing with "SQL did not complete: PENDING". Bounded by SQL_POLL_MAX_S.
-    deadline = time.time() + SQL_POLL_MAX_S
-    while resp.status.state in (StatementState.PENDING, StatementState.RUNNING):
-        if time.time() > deadline:
-            raise RuntimeError(
-                f"SQL exceeded {SQL_POLL_MAX_S}s budget: statement_id={resp.statement_id}"
-            )
-        time.sleep(SQL_POLL_INTERVAL_S)
-        resp = client.statement_execution.get_statement(resp.statement_id)
+        # The API caps wait_timeout at 50s. A heavy lineage query (e.g. a schema-wide
+        # scan of system.access.column_lineage over a 365d window) can still be
+        # PENDING/RUNNING when that window expires — so poll past the cap rather than
+        # failing with "SQL did not complete: PENDING". Bounded by SQL_POLL_MAX_S.
+        deadline = time.time() + SQL_POLL_MAX_S
+        while resp.status.state in (StatementState.PENDING, StatementState.RUNNING):
+            if time.time() > deadline:
+                raise RuntimeError(
+                    f"SQL exceeded {SQL_POLL_MAX_S}s budget: statement_id={resp.statement_id}"
+                )
+            time.sleep(SQL_POLL_INTERVAL_S)
+            resp = client.statement_execution.get_statement(resp.statement_id)
 
     if resp.status.state == StatementState.FAILED:
         raise RuntimeError(f"SQL failed: {resp.status.error.message if resp.status.error else 'Unknown error'}")
@@ -481,7 +620,7 @@ def list_catalogs() -> list[str]:
         return cached
 
     def _fetch() -> list[str]:
-        client = _get_client()
+        client = get_read_client()
         skip = {"system", "__databricks_internal"}
         try:
             rows = _execute_sql(client, "SHOW CATALOGS")
@@ -516,7 +655,7 @@ def list_all_tables() -> list[dict]:
         return cached
 
     def _fetch() -> list[dict]:
-        client = _get_client()
+        client = get_read_client()
         catalogs = list_catalogs()
 
         def _fetch_cat(cat: str) -> list[dict]:
@@ -568,7 +707,7 @@ def list_schemas(catalog: str) -> list[str]:
         return cached
 
     def _fetch() -> list[str]:
-        client = _get_client()
+        client = get_read_client()
         skip = {"information_schema", "default"}
         try:
             rows = _execute_sql(client, f"SHOW SCHEMAS IN `{catalog}`", catalog=catalog)
@@ -704,7 +843,7 @@ def _fetch_lineage_trace(seed_full_name: str) -> LineageResponse:
     bidirectional walk would fan out through it into every sibling consumer. By
     keeping each direction pure, the trace stays within the seed's own lineage
     cone (its true ancestors + descendants)."""
-    client = _get_client()
+    client = get_read_client()
 
     MAX_ITERS = 16
     NODE_CAP = LINEAGE_MAX_NODES
@@ -741,6 +880,7 @@ def _fetch_lineage_trace(seed_full_name: str) -> LineageResponse:
             WHERE {match_col} IN ({in_list})
               AND event_time > current_date() - INTERVAL {LINEAGE_WINDOW_DAYS} DAYS
               AND {_internal_lineage_filter()}
+            LIMIT {LINEAGE_HOP_MAX_ROWS}
             """
             try:
                 rows = _execute_sql(client, sql)
@@ -752,6 +892,15 @@ def _fetch_lineage_trace(seed_full_name: str) -> LineageResponse:
                 # surface the error and the next request retry (e.g. once the warehouse
                 # is warm). See get_lineage_trace — it only caches non-truncated results.
                 raise
+            # Hit the row cap => this hop was cut short, so edges exist that we did
+            # not see. Flag it rather than presenting the result as the whole cone.
+            if len(rows) >= LINEAGE_HOP_MAX_ROWS:
+                truncated["hit"] = True
+                logger.warning(
+                    "Lineage hop hit the %d-row cap walking %s from a %d-table frontier; "
+                    "graph is partial. Narrow the window or raise LINEAGE_HOP_MAX_ROWS.",
+                    LINEAGE_HOP_MAX_ROWS, direction, len(frontier),
+                )
             _collect(rows)
             nxt: set[str] = set()
             for r in rows:
@@ -994,7 +1143,7 @@ def _fetch_table_lineage(catalog: str, schema: str | None, cache_key: str) -> tu
     so columns and lookups are keyed by (schema, table_name), never table_name
     alone.
     """
-    client = _get_client()
+    client = get_read_client()
 
     # Schema predicate shared by the tables + columns queries. Catalog-wide
     # excludes the noise schemas; schema-scoped pins to the one schema.
@@ -1465,7 +1614,7 @@ def resolve_entity_name(entity_type: str, entity_id: str) -> dict:
         logger.warning(f"resolve_entity_name: rejecting unsafe entity_id for {entity_type}")
         return result
 
-    client = _get_client()
+    client = get_read_client()
     try:
         if entity_type == "JOB":
             rows = _execute_sql(client, f"""
@@ -1520,7 +1669,7 @@ def get_columns(catalog: str, schema: str, table: str, skip_cache: bool = False)
     cache_key = f"columns:{catalog}.{schema}.{table}"
 
     def _fetch() -> list[dict]:
-        client = _get_client()
+        client = get_read_client()
         sql = f"""
         SELECT column_name, data_type, is_nullable, ordinal_position
         FROM `{catalog}`.information_schema.columns
@@ -1543,6 +1692,11 @@ def run_diagnostics() -> dict:
     errors and return empty results, so a misconfigured deploy looks like an empty
     app with no explanation. This turns each silent failure into an actionable
     status. Read-only — every probe is a `LIMIT 1` / `SELECT 1`, no row data.
+
+    Deliberately uses the APP's client, not get_read_client: the question this answers
+    is "can the app service principal reach its prerequisites", which is what an
+    operator fixing a deploy needs. Running it as the caller would report the caller's
+    own grants and make a correctly-configured deploy look broken to a non-admin.
     """
     client = _get_client()
     warehouse_id = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
@@ -1624,7 +1778,7 @@ def get_schema_column_lineage(catalog: str, schema: str, skip_cache: bool = Fals
     cache_key = f"col_lineage:{catalog}.{schema}"
 
     def _fetch() -> ColumnLineageResponse:
-        client = _get_client()
+        client = get_read_client()
         rows: list[dict] = []
         try:
             sql = f"""
@@ -1694,7 +1848,7 @@ def get_table_edges(catalog: str, schema: str | None = None, skip_cache: bool = 
     cache_key = f"table_edges:{catalog}.{schema}" if schema else f"table_edges:{catalog}"
 
     def _fetch() -> list[dict]:
-        client = _get_client()
+        client = get_read_client()
         if schema is not None:
             scope = (
                 f"(target_table_catalog = '{catalog}' AND target_table_schema = '{schema}') "
@@ -1775,7 +1929,7 @@ def get_sharing_overlay(catalog: str, schema: str | None, audience: str = "both"
     cache_key = f"sharing_overlay:{catalog}.{schema}:{aud}"
 
     def _fetch() -> SharingOverlay:
-        client = _get_client()
+        client = get_read_client()
         want_out = aud in ("provider", "both")
         want_in = aud in ("recipient", "both")
         any_view_read = False
@@ -1861,7 +2015,7 @@ def get_sharing_overview(skip_cache: bool = False) -> dict:
     cache_key = "sharing_overview"
 
     def _fetch() -> dict:
-        client = _get_client()
+        client = get_read_client()
 
         def _rows(sql: str) -> list[dict]:
             try:

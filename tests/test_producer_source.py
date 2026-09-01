@@ -218,10 +218,18 @@ class TestCompareProducersRoute:
         assert resp.status_code == 400
 
     def test_valid_returns_matrix(self, app_client):
-        with patch("backend.routes.lineage.compare_producers", return_value={
-            "table_full_name": "c.s.t", "producers": [], "columns": [],
-            "divergent_count": 0, "column_count": 0,
-        }):
+        # A non-admin caller must clear _assert_producers_of, which asks
+        # system.access.table_lineage whether each (entity_type, entity_id) really
+        # writes the target. That check fails CLOSED (503) when it cannot run, so
+        # its SQL has to be mocked here — previously this test left it unmocked and
+        # only passed when a mock WorkspaceClient happened to have leaked in from an
+        # earlier test file; run on its own it reached the network and hung.
+        recorded = [{"et": "JOB", "eid": "a"}, {"et": "JOB", "eid": "b"}]
+        with patch("backend.routes.lineage._execute_sql", return_value=recorded), \
+             patch("backend.routes.lineage.compare_producers", return_value={
+                 "table_full_name": "c.s.t", "producers": [], "columns": [],
+                 "divergent_count": 0, "column_count": 0,
+             }):
             resp = app_client.post("/api/column-transformations/compare-producers", json={
                 "catalog": "c", "schema_name": "s", "table": "t",
                 "producers": [
@@ -231,3 +239,34 @@ class TestCompareProducersRoute:
             })
         assert resp.status_code == 200
         assert "columns" in resp.json()
+
+    def test_unrecorded_producer_is_rejected_for_non_admin(self, app_client):
+        """The batch guard must still refuse a producer UC never recorded — one
+        query now answers all N, so a partial result has to fail."""
+        only_a = [{"et": "JOB", "eid": "a"}]
+        with patch("backend.routes.lineage._execute_sql", return_value=only_a), \
+             patch("backend.routes.lineage.compare_producers") as compare:
+            resp = app_client.post("/api/column-transformations/compare-producers", json={
+                "catalog": "c", "schema_name": "s", "table": "t",
+                "producers": [
+                    {"entity_type": "JOB", "entity_id": "a"},
+                    {"entity_type": "JOB", "entity_id": "b"},
+                ],
+            })
+        assert resp.status_code == 403
+        compare.assert_not_called()
+
+    def test_producer_fan_out_is_capped(self, app_client):
+        """Each producer costs an LLM resolution, and the list was previously
+        bounded only by "at least 2"."""
+        with patch("backend.routes.lineage._execute_sql", return_value=[]), \
+             patch("backend.routes.lineage.compare_producers") as compare:
+            resp = app_client.post("/api/column-transformations/compare-producers", json={
+                "catalog": "c", "schema_name": "s", "table": "t",
+                "producers": [
+                    {"entity_type": "JOB", "entity_id": f"j{i}"} for i in range(25)
+                ],
+            })
+        assert resp.status_code == 400
+        assert "at most" in resp.json()["detail"]
+        compare.assert_not_called()

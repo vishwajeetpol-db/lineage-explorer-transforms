@@ -1,7 +1,8 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { DQMetricsPanel } from "./DQMetricsPanel";
+import { useLineageStore } from "../store/lineageStore";
 
 function mockFetch(data: any, ok = true) {
   return vi.fn().mockResolvedValue({ ok, json: async () => data, text: async () => (typeof data === "string" ? data : JSON.stringify(data)) });
@@ -21,11 +22,25 @@ const result = {
 };
 
 describe("DQMetricsPanel", () => {
-  afterEach(() => vi.restoreAllMocks());
+  // Running checks executes stored rule expressions as the app SP, so the backend
+  // admin-gates GET /api/dq-rules/metrics and the button is admin-only. Tests that
+  // drive it claim an admin identity.
+  beforeEach(() => useLineageStore.setState({ isAdmin: true }));
+  afterEach(() => {
+    vi.restoreAllMocks();
+    useLineageStore.setState({ isAdmin: false });
+  });
 
   it("renders header", () => {
     render(<DQMetricsPanel />);
     expect(screen.getByText("Data Quality Metrics")).toBeInTheDocument();
+  });
+
+  it("disables Run Checks for non-admins and explains why", () => {
+    useLineageStore.setState({ isAdmin: false });
+    render(<DQMetricsPanel tableFqn="main.s.t" />);
+    expect(screen.getByRole("button", { name: /Run Checks/i })).toBeDisabled();
+    expect(screen.getByText(/restricted to admins/i)).toBeInTheDocument();
   });
 
   it("runs checks and renders quality score + metrics", async () => {

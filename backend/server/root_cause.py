@@ -30,13 +30,16 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from databricks.sdk.service.sql import StatementState
-from backend.lineage_service import _get_client
+from backend.lineage_service import _get_client, LINEAGE_WINDOW_DAYS
 
 logger = logging.getLogger(__name__)
 
 WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 SQL_WAIT_TIMEOUT = os.environ.get("SQL_WAIT_TIMEOUT", "50s")
-LINEAGE_LOOKBACK_DAYS = int(os.environ.get("LINEAGE_WINDOW_DAYS", "90"))
+# Single source of truth: lineage_service owns this window (default 365).
+# Re-reading LINEAGE_WINDOW_DAYS with a local default of 90 made root-cause tracing
+# disagree with the graph whenever the env var was unset.
+LINEAGE_LOOKBACK_DAYS = LINEAGE_WINDOW_DAYS
 LINEAGE_CATALOG = os.environ.get("LINEAGE_CATALOG", "lattice_lineage")
 LINEAGE_SCHEMA = os.environ.get("LINEAGE_SCHEMA", "lineage")
 DQ_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.dq_rules"
@@ -143,16 +146,34 @@ def _get_dq_violations(
     Returns evidence entries of type "dq_violation" for any rule with a
     pass rate below 1.0.
     """
+    # A stored `expression` lands at SQL *code* position below, exactly as it does
+    # in routes/dq.py. That module gates GET /api/dq-rules/metrics behind
+    # require_admin BECAUSE it executes these expressions as the app service
+    # principal — but this helper is reached from POST /api/root-cause/analyze and
+    # POST /api/diagnostics/root-cause, neither of which is admin-gated, and it
+    # used to interpolate `expr` with no validation whatsoever. The gate was
+    # therefore decorative: the same execution was one ungated route away.
+    #
+    # Validate with the SAME grammar rather than adding a second one, so the two
+    # execution sites cannot drift apart again. A rule that fails validation is
+    # skipped, never executed — this module is non-fatal throughout.
+    from backend.routes.dq import _validate_expression
+    from backend.validators import sql_str
+
     evidence: list[dict] = []
     try:
-        # Fetch rules for this table (optionally column-specific)
+        # Fetch rules for this table (optionally column-specific). Both values
+        # reach a literal position and were previously interpolated raw.
         col_filter = ""
         if column_name:
-            col_filter = f"AND (column_name = '{column_name}' OR column_name IS NULL)"
+            col_filter = (
+                f"AND (column_name = '{sql_str(column_name, limit=255)}' "
+                f"OR column_name IS NULL)"
+            )
         rules = _execute_sql(
             f"SELECT rule_id, column_name, rule_type, expression, severity "
             f"FROM {DQ_TABLE} "
-            f"WHERE table_fqn = '{table_fqn}' {col_filter} "
+            f"WHERE table_fqn = '{sql_str(table_fqn, limit=255)}' {col_filter} "
             f"LIMIT 20"
         )
         if not rules:
@@ -162,6 +183,21 @@ def _get_dq_violations(
         for rule in rules:
             expr = rule.get("expression", "")
             if not expr:
+                continue
+            # "CUSTOM" is passed deliberately, NOT the rule's own type. dq.py
+            # exempts REGEX/RANGE from the code-position grammar because there it
+            # escapes them into an RLIKE literal or parses them into floats — but
+            # `NOT ({expr})` below is a code position for every rule type, so the
+            # exemption must not carry over. A REGEX pattern is not a predicate
+            # and is correctly skipped here.
+            try:
+                _validate_expression(expr, "CUSTOM")
+            except Exception as bad_expr:
+                logger.warning(
+                    "root_cause: skipping DQ rule %s — expression is not a valid "
+                    "predicate at code position: %s",
+                    rule.get("rule_id"), bad_expr,
+                )
                 continue
             try:
                 # Count violations in a sample

@@ -15,6 +15,7 @@ Design:
 import os
 import logging
 import threading
+import time
 from datetime import datetime
 
 import requests as http_client
@@ -168,6 +169,114 @@ def _reset_pipeline_notebook_path_cache() -> None:
         _pipeline_notebook_path_cache = None
 
 
+# ---------------------------------------------------------------------------
+# Build source reachability
+#
+# `bundle deploy` uploads the app source into the DEPLOYING identity's home
+# (/Workspace/Users/<deployer>/.bundle/<bundle>/<target>/files) — a folder only
+# that identity and workspace admins can touch. The build job runs
+# <source>/notebooks/run_pipeline as the APP's service principal, so unless that
+# SP was granted CAN_RUN on the folder the run dies on its first task with
+# "Unable to access the notebook ... lacks the required permissions" — about a
+# minute of serverless compute spent to learn a permission is missing.
+#
+# Preflighting turns that into an instant, actionable error. Note the limit of
+# what the probe can prove: get_status succeeds with CAN_READ, while executing a
+# notebook_task needs CAN_RUN, and the app SP cannot read its own ACL. So the
+# probe catches the common "no access at all" case, and _is_source_access_failure
+# below covers the residual CAN_READ-only case from the job's own message.
+# ---------------------------------------------------------------------------
+_SOURCE_ACCESS_HINT = (
+    "The app's service principal cannot reach the deployed build notebook, so no build job "
+    "was submitted. `bundle deploy` uploads the source into the deploying identity's home "
+    "folder, which the app's service principal has no permission on. Fix it from the deploy "
+    "machine: ./grant_build_source_access.sh --profile <cli-profile> --app <app-name>"
+)
+
+_JOB_SOURCE_ACCESS_HINT = (
+    " — this means the app's service principal lacks CAN_RUN on the deployed source folder. "
+    "Run ./grant_build_source_access.sh from the deploy machine, then Regenerate."
+)
+
+# The path last proven reachable, and how long that proof is trusted.
+#
+# Latched on SUCCESS ONLY, so a transient API failure can never permanently disable
+# builds and a grant applied while the app is running takes effect without a
+# restart. The latch also EXPIRES, which is the other half of the same argument: a
+# grant REVOKED under a long-lived app (a security sweep, a re-grant to the wrong
+# SP, or a `bundle destroy`/redeploy that re-creates the folder with a fresh ACL at
+# the same path) would otherwise be undetectable for the process lifetime, and
+# every build would go back to dying a minute in on serverless compute — the exact
+# cost this preflight exists to avoid.
+#
+# One path per process (get_pipeline_notebook_path resolves and caches a single
+# value), so this is a scalar, not a collection. Guarded by an explicit lock to
+# match _pipeline_notebook_path_cache and _build_locks rather than relying on the
+# GIL, so all three caches in this module read the same way.
+_SOURCE_ACCESS_TTL_SECONDS = 300.0
+_source_access_ok_path: str | None = None
+_source_access_ok_until: float = 0.0
+_source_access_lock = threading.Lock()
+
+
+class BuildSourceAccessError(RuntimeError):
+    """The app SP cannot reach the build notebook — no job was submitted.
+
+    Distinct from a generic RuntimeError so the API layer can return the curated
+    remediation text instead of a truncated, sanitized error string.
+    """
+
+
+def _assert_source_readable(client, notebook_path: str) -> None:
+    """Raise BuildSourceAccessError if the app SP cannot see the build notebook.
+
+    A proven path is not re-probed until the latch expires
+    (_SOURCE_ACCESS_TTL_SECONDS), so the common case costs nothing; a revoked grant
+    is picked up on the next probe after that.
+    """
+    global _source_access_ok_path, _source_access_ok_until
+
+    with _source_access_lock:
+        if notebook_path == _source_access_ok_path and time.monotonic() < _source_access_ok_until:
+            return
+    try:
+        client.workspace.get_status(notebook_path)
+    except Exception as e:
+        logger.error(
+            f"Build source preflight failed for {notebook_path}: {e}. The app service "
+            "principal needs CAN_RUN on the deployed source folder — run "
+            "grant_build_source_access.sh."
+        )
+        raise BuildSourceAccessError(_SOURCE_ACCESS_HINT) from e
+    with _source_access_lock:
+        _source_access_ok_path = notebook_path
+        _source_access_ok_until = time.monotonic() + _SOURCE_ACCESS_TTL_SECONDS
+
+
+def _reset_source_access_cache() -> None:
+    """Reset the reachability latch — for tests only."""
+    global _source_access_ok_path, _source_access_ok_until
+    with _source_access_lock:
+        _source_access_ok_path = None
+        _source_access_ok_until = 0.0
+
+
+def _is_source_access_failure(message: str) -> bool:
+    """True if a job's failure message is the source-permission failure.
+
+    Deliberately narrow. The remediation this gates (_JOB_SOURCE_ACCESS_HINT) names
+    one specific cause and one specific fix, with no hedging, so a false positive
+    sends the operator to a script that cannot help. The second branch therefore
+    keys on the platform's own identity clause ("the identity used to run this job,
+    <sp>, lacks the required permissions") rather than a bare "notebook" mention,
+    which matched any notebook-permission failure anywhere in the run.
+    """
+    m = (message or "").lower()
+    if "unable to access the notebook" in m:
+        return True
+    return "lacks the required permissions" in m and "identity used to run this job" in m
+
+
 WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 
 # Build pipeline step names (for progress UI)
@@ -183,9 +292,113 @@ BUILD_STEPS = [
 ]
 
 # A12 FIX: Per-table build lock prevents concurrent duplicate Jobs for same FQN.
-# Maps table_fqn → run_id of the currently in-progress build.
+# Maps table_fqn → run_id of the currently in-progress build, or _BUILD_RESERVED
+# while a submit is in flight and its run_id is not known yet. Not a valid run_id,
+# so get_build_status's "release the lock whose value matches this run" never
+# matches it — the submit path is responsible for clearing its own reservation.
+_BUILD_RESERVED = "\x00reserved"
 _build_locks: dict[str, str] = {}
 _build_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Build budget
+#
+# The admin gate on POST /api/transform/build stops non-admins spending money; it
+# does nothing about an admin spending it. Every submission launches a serverless
+# job, the per-table lock only stops DUPLICATE builds of the SAME table, and an
+# admin working down a 200-table schema submits 200 legitimately-distinct runs as
+# fast as the UI allows. "Admin" in an enterprise is a group, not one careful
+# person, and the bill arrives with no owner attached.
+#
+# Two ceilings, both per process (see the C4 caveat in the enterprise review — with
+# multiple replicas these multiply, and the fix is the same shared store the cache
+# needs):
+#   * MAX_BUILDS_IN_FLIGHT — concurrency, so a burst cannot fan out
+#   * MAX_BUILDS_PER_DAY   — total spend, so a slow leak cannot run all week
+#
+# Both are deliberately generous: this is a guard rail against a runaway loop, not
+# a workflow restriction. Exceeding one is a 429, not a 403 — it is capacity, not
+# permission.
+# ---------------------------------------------------------------------------
+MAX_BUILDS_IN_FLIGHT = int(os.environ.get("MAX_BUILDS_IN_FLIGHT", "5"))
+MAX_BUILDS_PER_DAY = int(os.environ.get("MAX_BUILDS_PER_DAY", "200"))
+
+_budget_lock = threading.Lock()
+_builds_today = 0
+_budget_day: str = ""
+# Who submitted what, so serverless spend has a name. Bounded ring, newest last.
+_build_submitters: list[tuple[str, str, str]] = []   # (iso_ts, actor, table_fqn)
+_BUILD_LOG_MAX = 500
+
+
+class BuildBudgetError(RuntimeError):
+    """A build budget ceiling was hit — the caller should back off, not retry now.
+
+    Distinct from BuildSourceAccessError (a broken deploy) and from a bare
+    RuntimeError (a defect) so the API layer can answer 429 rather than 500.
+    """
+
+
+def _today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _reserve_budget(actor: str, table_fqn: str) -> None:
+    """Charge one build against the budgets, or raise BuildBudgetError."""
+    global _builds_today, _budget_day
+    with _budget_lock:
+        today = _today()
+        if _budget_day != today:
+            _budget_day = today
+            _builds_today = 0
+        if _builds_today >= MAX_BUILDS_PER_DAY:
+            raise BuildBudgetError(
+                f"The daily build budget of {MAX_BUILDS_PER_DAY} serverless builds is "
+                f"spent. It resets at midnight. Raise MAX_BUILDS_PER_DAY if this "
+                f"workspace genuinely needs more."
+            )
+        _builds_today += 1
+        _build_submitters.append((datetime.now().isoformat(timespec="seconds"), actor or "unknown", table_fqn))
+        del _build_submitters[:-_BUILD_LOG_MAX]
+
+
+def _refund_budget() -> None:
+    """Give back a charge whose build never launched."""
+    global _builds_today
+    with _budget_lock:
+        if _builds_today > 0:
+            _builds_today -= 1
+        if _build_submitters:
+            _build_submitters.pop()
+
+
+def get_build_budget() -> dict:
+    """Budget state, for /api/diagnostics and the admin dashboard."""
+    with _budget_lock:
+        used, day = _builds_today, _budget_day or _today()
+        recent = list(_build_submitters[-20:])
+    with _build_lock:
+        in_flight = len(_build_locks)
+    return {
+        "day": day,
+        "builds_today": used,
+        "max_per_day": MAX_BUILDS_PER_DAY,
+        "remaining_today": max(0, MAX_BUILDS_PER_DAY - used),
+        "in_flight": in_flight,
+        "max_in_flight": MAX_BUILDS_IN_FLIGHT,
+        "recent_submissions": [
+            {"at": t, "actor": a, "table_fqn": f} for t, a, f in reversed(recent)
+        ],
+    }
+
+
+def _reset_build_budget() -> None:
+    """Zero the budget — for tests only."""
+    global _builds_today, _budget_day
+    with _budget_lock:
+        _builds_today = 0
+        _budget_day = ""
+        _build_submitters.clear()
 
 
 def _estimate_step_from_progress(pct: int) -> int:
@@ -216,11 +429,19 @@ def submit_build_job(
     target_catalog: str | None = None,
     target_schema: str | None = None,
     force_reparse: bool = False,
+    actor: str = "",
 ) -> str:
     """Submit a serverless one-time job to build transformation lineage.
 
     Returns the run_id as a string.
-    Raises RuntimeError if PIPELINE_NOTEBOOK_PATH is not configured.
+
+    `actor` is the submitting admin's email, recorded against the run so serverless
+    spend has a name. Optional so existing callers keep working; the API layer
+    passes it.
+
+    Raises RuntimeError if PIPELINE_NOTEBOOK_PATH is not configured,
+    BuildSourceAccessError if the app SP cannot reach the notebook, and
+    BuildBudgetError if a build ceiling is hit.
     """
     notebook_path = get_pipeline_notebook_path()
     if not notebook_path:
@@ -229,17 +450,74 @@ def submit_build_job(
             "(env section) to the workspace path of the run_all notebook."
         )
 
-    # A12 FIX: Prevent concurrent builds for the same table
+    # A12 FIX: Prevent concurrent builds for the same table.
+    #
+    # RESERVE the slot inside the same critical section that checks it. Checking
+    # here but only writing the run_id after the submit returned left a window
+    # spanning a workspace round-trip (the preflight) plus the runs/submit POST —
+    # wide enough for two requests for the same table to both find no lock, both
+    # submit, and both bill a serverless run, with only the second run_id surviving
+    # in _build_locks.
     with _build_lock:
         existing_run = _build_locks.get(target_table_fqn)
+        if not existing_run and len(_build_locks) >= MAX_BUILDS_IN_FLIGHT:
+            raise BuildBudgetError(
+                f"{len(_build_locks)} builds are already running (limit "
+                f"{MAX_BUILDS_IN_FLIGHT}). Each one is a serverless job — wait for "
+                f"some to finish, or raise MAX_BUILDS_IN_FLIGHT."
+            )
         if existing_run:
             logger.info(f"Build already in progress for {target_table_fqn}: run_id={existing_run}")
+            in_flight = (
+                "is being submitted right now"
+                if existing_run == _BUILD_RESERVED
+                else f"is already in progress (run_id={existing_run})"
+            )
             raise RuntimeError(
-                f"A build is already in progress for {target_table_fqn} (run_id={existing_run}). "
+                f"A build for {target_table_fqn} {in_flight}. "
                 "Wait for it to complete or check /api/transform/status/{run_id}."
             )
+        _build_locks[target_table_fqn] = _BUILD_RESERVED
 
+    # Charged AFTER the reservation succeeds, so a duplicate request rejected above
+    # never consumes budget, and refunded below if the submit itself fails.
+    try:
+        _reserve_budget(actor, target_table_fqn)
+    except BuildBudgetError:
+        with _build_lock:
+            if _build_locks.get(target_table_fqn) == _BUILD_RESERVED:
+                del _build_locks[target_table_fqn]
+        raise
+
+    try:
+        return _submit_reserved_build_job(target_table_fqn, notebook_path, force_reparse)
+    except BaseException:
+        _refund_budget()
+        # Nothing is running under this reservation — drop it, or the table stays
+        # locked out until the process restarts. Only ever clears OUR placeholder:
+        # once the real run_id is in place, releasing it is get_build_status's job.
+        with _build_lock:
+            if _build_locks.get(target_table_fqn) == _BUILD_RESERVED:
+                del _build_locks[target_table_fqn]
+        raise
+
+
+def _submit_reserved_build_job(
+    target_table_fqn: str,
+    notebook_path: str,
+    force_reparse: bool,
+) -> str:
+    """Preflight + submit, with this table's build slot already reserved.
+
+    Split out so the reservation has exactly one release path (the caller's
+    except); every failure below reaches it.
+    """
     client = _get_client()
+
+    # Fail fast and for free when the app SP cannot reach the notebook, instead
+    # of paying for a serverless run that dies on its first task.
+    _assert_source_readable(client, notebook_path)
+
     host = client.config.host.rstrip('/')
     headers = client.config.authenticate()
 
@@ -300,7 +578,8 @@ def submit_build_job(
     resp.raise_for_status()
     run_id = str(resp.json()["run_id"])
 
-    # A12 FIX: Register this build in the per-table lock
+    # A12 FIX: swap the reservation for the real run_id, which get_build_status
+    # matches on to release the lock when the run completes.
     with _build_lock:
         _build_locks[target_table_fqn] = run_id
 
@@ -340,6 +619,7 @@ def get_build_status(run_id: str) -> BuildJobStatus:
 
         lc = state.life_cycle_state if state else None
         result = state.result_state if state else None
+        message = (state.state_message if state else "") or ""
 
         progress = _PROGRESS_MAP.get(lc, 0)
         is_complete = lc in _TERMINAL_STATES
@@ -353,13 +633,19 @@ def get_build_status(run_id: str) -> BuildJobStatus:
                 for k in to_remove:
                     del _build_locks[k]
 
+        # A build that failed because the app SP cannot run the deployed notebook
+        # says so in platform terms only ("Unable to access the notebook ...").
+        # Append what to actually do about it — this is the message the panel shows.
+        if is_complete and not is_success and _is_source_access_failure(message):
+            message = f"{message}{_JOB_SOURCE_ACCESS_HINT}"
+
         current_step = _estimate_step_from_progress(progress)
 
         return BuildJobStatus(
             run_id=run_id,
             state=lc.value if lc else "UNKNOWN",
             result_state=result.value if result else None,
-            state_message=(state.state_message if state else "") or "",
+            state_message=message,
             progress_pct=progress,
             is_complete=is_complete,
             is_success=is_success,

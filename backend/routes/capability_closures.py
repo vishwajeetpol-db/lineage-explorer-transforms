@@ -19,16 +19,18 @@ from __future__ import annotations
 import os
 import uuid
 import json
+import math
 import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from databricks.sdk.service.sql import StatementState
 from backend.lineage_service import _get_client
-from backend.validators import _IDENTIFIER_RE, _FULL_NAME_RE, _validate
+from backend.validators import _IDENTIFIER_RE, _FULL_NAME_RE, _validate, redact_url, require_admin, sql_str
 from backend.circuit_breaker import sql_circuit_breaker
 
 logger = logging.getLogger(__name__)
@@ -164,8 +166,9 @@ async def streaming_topology(request: Request, catalog: Optional[str] = Query(No
         if edge_errors:
             result["edge_errors"] = edge_errors
         return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("capability_closures: streaming_topology failed")
+        raise HTTPException(status_code=500, detail="Failed to streaming topology.")
 
 
 # ===========================================================================
@@ -196,6 +199,16 @@ async def auto_capture_all_scopes(request: Request):
             cat = row.get("catalog", "")
             if not cat:
                 continue
+            # `cat` comes from a system-table read, but it is still interpolated
+            # into the INSERT's `scope` literal below and was the one value in this
+            # hunk left raw while everything around it was escaped. Validating it
+            # also keeps the written scope readable by the snapshot endpoints,
+            # whose _validate_scope would otherwise reject what this wrote.
+            try:
+                cat = _validate(cat, "catalog")
+            except HTTPException:
+                logger.warning("auto-capture: skipping unusable catalog name")
+                continue
             try:
                 lineage = get_table_lineage(cat, None, False)
                 nodes = [{"id": n.id, "type": getattr(n, "node_type", "unknown")} for n in lineage.nodes]
@@ -208,15 +221,16 @@ async def auto_capture_all_scopes(request: Request):
                 _execute_sql(f"""
                     INSERT INTO {SNAPSHOTS_TABLE}
                     (snapshot_id, scope, label, captured_at, captured_by, node_count, edge_count, graph_json, metadata)
-                    VALUES ('{sid}', '{cat}', 'Auto {now[:10]}', TIMESTAMP '{now}', 'scheduler',
-                            {len(nodes)}, {len(edges_list)}, '{graph_json.replace(chr(39), chr(39)*2)}', '{{"auto":true}}')
+                    VALUES ('{sid}', '{sql_str(cat)}', 'Auto {now[:10]}', TIMESTAMP '{now}', 'scheduler',
+                            {len(nodes)}, {len(edges_list)}, '{sql_str(graph_json)}', '{{"auto":true}}')
                 """)
                 captured.append({"catalog": cat, "snapshot_id": sid, "nodes": len(nodes), "edges": len(edges_list)})
             except Exception as e:
                 logger.debug(f"Auto-capture failed for {cat}: {e}")
         return {"status": "ok", "captured": captured}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("capability_closures: auto_capture_all_scopes failed")
+        raise HTTPException(status_code=500, detail="Failed to auto capture all scopes.")
 
 
 @router.get("/api/snapshots/timeline")
@@ -238,8 +252,9 @@ async def snapshot_timeline(request: Request, scope: str = Query(...), days: int
             ORDER BY captured_at ASC LIMIT 100
         """)
         return {"scope": safe_scope, "timeline": rows}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("capability_closures: snapshot_timeline failed")
+        raise HTTPException(status_code=500, detail="Failed to snapshot timeline.")
 
 
 # ===========================================================================
@@ -271,20 +286,41 @@ async def record_dq_metrics(request: Request, body: dict):
     _ensure_dq_history()
     run_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    fqn = (body.get("table_fqn", "") or "").replace("'", "''")
-    # A1 FIX: Validate table_fqn format
-    if fqn and not _FULL_NAME_RE.match(fqn.replace("''", "'")):
+    raw_fqn = (body.get("table_fqn", "") or "").strip()
+    # A1 FIX: Validate table_fqn format (before escaping, so the regex sees the
+    # value the caller actually sent)
+    if raw_fqn and not _FULL_NAME_RE.match(raw_fqn):
         raise HTTPException(status_code=400, detail="Invalid table_fqn format")
+    fqn = sql_str(raw_fqn)
+    # A1 FIX: coerce the four numeric columns. They are interpolated at UNQUOTED
+    # positions, so without coercion any string in the body — from an admin, but
+    # still — is written straight into the statement as SQL.
+    try:
+        quality_score = float(body.get("quality_score", 0) or 0)
+        rules_evaluated = int(body.get("rules_evaluated", 0) or 0)
+        rules_passed = int(body.get("rules_passed", 0) or 0)
+        rules_failed = int(body.get("rules_failed", 0) or 0)
+        if not math.isfinite(quality_score):
+            raise ValueError("quality_score must be finite")
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError matters: `int(float('inf'))` raises it, not ValueError, and
+        # Infinity reaches here intact because json.loads accepts `1e999`. Without
+        # it, an infinite rules_evaluated escaped this 400 and surfaced as a 500.
+        raise HTTPException(
+            status_code=400,
+            detail="quality_score must be a number and rules_evaluated/passed/failed integers",
+        )
     try:
         await asyncio.to_thread(_execute_sql, f"""
             INSERT INTO {DQ_HISTORY_TABLE} VALUES (
-                '{run_id}', '{fqn}', {body.get('quality_score', 0)},
-                {body.get('rules_evaluated', 0)}, {body.get('rules_passed', 0)}, {body.get('rules_failed', 0)},
-                TIMESTAMP '{now}', '{json.dumps(body.get("details", {})).replace(chr(39), chr(39)*2)[:4000]}')
+                '{run_id}', '{fqn}', {quality_score},
+                {rules_evaluated}, {rules_passed}, {rules_failed},
+                TIMESTAMP '{now}', '{sql_str(json.dumps(body.get("details", {})), limit=4000)}')
         """)
         return {"status": "ok", "run_id": run_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("capability_closures: record_dq_metrics failed")
+        raise HTTPException(status_code=500, detail="Failed to record dq metrics.")
 
 
 @router.get("/api/dq-rules/trends")
@@ -297,7 +333,7 @@ async def dq_trends(request: Request, table_fqn: str = Query(...), days: int = Q
     if not _FULL_NAME_RE.match(table_fqn):
         raise HTTPException(status_code=400, detail="Invalid table_fqn format")
     _ensure_dq_history()
-    safe_fqn = table_fqn.replace(chr(39), chr(39)*2)
+    safe_fqn = sql_str(table_fqn)
     try:
         rows = await asyncio.to_thread(_execute_sql, f"""
             SELECT run_id, quality_score, rules_evaluated, rules_passed, rules_failed, evaluated_at
@@ -312,8 +348,9 @@ async def dq_trends(request: Request, table_fqn: str = Query(...), days: int = Q
             last = float(rows[-1].get("quality_score") or 0)
             trend = "degrading" if last < first - 0.05 else "improving" if last > first + 0.05 else "stable"
         return {"table_fqn": table_fqn, "trend": trend, "data_points": rows}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("capability_closures: dq_trends failed")
+        raise HTTPException(status_code=500, detail="Failed to dq trends.")
 
 
 @router.get("/api/dq-rules/pipeline-expectations")
@@ -345,8 +382,9 @@ async def pipeline_expectations(request: Request, catalog: Optional[str] = Query
             except Exception:
                 pass
         return {"pipeline_tables": len(rows), "tables_with_expectations": expectations}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("capability_closures: pipeline_expectations failed")
+        raise HTTPException(status_code=500, detail="Failed to pipeline expectations.")
 
 
 # ===========================================================================
@@ -374,16 +412,33 @@ class WebhookIn(BaseModel):
     secret: Optional[str] = ""
 
 
+# Canonical implementation now lives in backend/validators.py, so this router and
+# openlineage's producer-config read cannot disagree on what "redacted" means.
+# Kept as a module-level alias because it is referenced below as _redact_url.
+_redact_url = redact_url
+
+
 @router.get("/api/notifications/webhooks")
 async def list_webhooks(request: Request):
-    """List registered webhook endpoints."""
+    """List registered webhook endpoints. Admin-gated.
+
+    A2 FIX: the create/delete peers below both require admin and CHANGELOG.md
+    documents all three as admin-gated, but this read was open — and it returned
+    the raw `url`, i.e. any user could read every webhook's delivery token. The
+    gate is now enforced and `url` is redacted to scheme+host on the way out, so
+    a path-embedded secret never leaves the server at all.
+    """
+    require_admin(request)
     _ensure_webhook_tables()
     try:
         rows = await asyncio.to_thread(_execute_sql,
             f"SELECT webhook_id, name, url, event_types, enabled, created_at FROM {WEBHOOKS_TABLE}")
+        for row in rows:
+            row["url"] = _redact_url(row.get("url"))
         return {"webhooks": rows}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("capability_closures: list_webhooks failed")
+        raise HTTPException(status_code=500, detail="Failed to list webhooks.")
 
 
 @router.post("/api/notifications/webhooks")
@@ -393,19 +448,36 @@ async def register_webhook(request: Request, body: WebhookIn):
     email, is_admin = _get_user_info(request)
     if not is_admin:
         raise HTTPException(status_code=403, detail="Admin required")
+    # Require https:// with a real host. This handler did NO scheme validation at
+    # all — urlparse appeared in this module only inside _redact_url — so an
+    # `http://` or `file://` URL was accepted and enqueue_delivery copied it into
+    # the queue for the external delivery job to POST notification content to.
+    # Notifications carry table names and DQ findings, and the row's `secret` is
+    # sent alongside, so plaintext delivery leaks both. Mirrors the check
+    # configure_producer already applies to its own outbound endpoint.
+    url = (body.url or "").strip()
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise HTTPException(
+            status_code=400,
+            detail="Webhook url must be an https:// URL with a host",
+        )
     _ensure_webhook_tables()
     wid = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    safe = lambda s: (s or "").replace("'", "''")[:500]
+    safe = lambda s: sql_str(s, limit=500)
     try:
         await asyncio.to_thread(_execute_sql, f"""
             INSERT INTO {WEBHOOKS_TABLE} VALUES (
-                '{wid}', '{safe(body.name)}', '{safe(body.url)}', '{safe(body.event_types)}',
+                '{wid}', '{safe(body.name)}', '{safe(url)}', '{safe(body.event_types)}',
                 true, '{safe(body.secret)}', '{safe(email)}', TIMESTAMP '{now}')
         """)
         return {"status": "ok", "webhook_id": wid}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("capability_closures: register_webhook failed")
+        raise HTTPException(status_code=500, detail="Failed to register webhook")
 
 
 @router.delete("/api/notifications/webhooks/{webhook_id}")
@@ -417,20 +489,27 @@ async def delete_webhook(request: Request, webhook_id: str):
         raise HTTPException(status_code=403, detail="Admin required")
     try:
         await asyncio.to_thread(_execute_sql,
-            f"DELETE FROM {WEBHOOKS_TABLE} WHERE webhook_id = '{webhook_id.replace(chr(39), chr(39)*2)[:100]}'")
+            f"DELETE FROM {WEBHOOKS_TABLE} WHERE webhook_id = '{sql_str(webhook_id, limit=100)}'")
         return {"status": "ok"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("capability_closures: delete_webhook failed")
+        raise HTTPException(status_code=500, detail="Failed to delete webhook.")
 
 
 @router.post("/api/notifications/enqueue-delivery")
 async def enqueue_delivery(request: Request):
-    """Queue unread notifications for webhook delivery.
+    """Queue unread notifications for webhook delivery. Admin-gated.
 
     Matches notifications against registered webhooks by event_type,
     creates delivery queue entries. A separate Databricks job polls the
     queue and performs the actual HTTP POST delivery (decoupled for security).
+
+    A2 FIX: this is a write that causes outbound HTTP from the delivery job, and
+    it was the only ungated mutation among the webhook endpoints (register and
+    delete both require admin) — an anonymous caller could flood every registered
+    endpoint with notification traffic.
     """
+    require_admin(request)
     _ensure_webhook_tables()
     NOTIF_TABLE = f"{LINEAGE_CATALOG}.{LINEAGE_SCHEMA}.notifications"
     try:
@@ -450,22 +529,23 @@ async def enqueue_delivery(request: Request):
             for n in notifications:
                 if "*" not in types and n.get("notif_type", "") not in types:
                     continue
-                payload = json.dumps({
+                payload = sql_str(json.dumps({
                     "type": n.get("notif_type"), "severity": n.get("severity"),
                     "title": n.get("title"), "detail": n.get("detail"),
                     "table_fqn": n.get("table_fqn"), "detected_at": str(n.get("detected_at", "")),
-                }).replace("'", "''")[:4000]
+                }), limit=4000)
                 did = str(uuid.uuid4())
                 _execute_sql(f"""
                     INSERT INTO {DELIVERY_QUEUE_TABLE} VALUES (
-                        '{did}', '{wh_id}', '{url.replace(chr(39), chr(39)*2)}',
+                        '{did}', '{sql_str(wh_id)}', '{sql_str(url)}',
                         '{payload}', 'pending', TIMESTAMP '{now}', NULL)
                 """)
                 queued += 1
 
         return {"status": "ok", "queued": queued}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("capability_closures: enqueue_delivery failed")
+        raise HTTPException(status_code=500, detail="Failed to enqueue delivery.")
 
 
 @router.get("/api/notifications/delivery-status")
@@ -480,5 +560,6 @@ async def delivery_status(request: Request, limit: int = Query(20)):
         """)
         pending = sum(1 for r in rows if r.get("status") == "pending")
         return {"deliveries": rows, "pending": pending, "total": len(rows)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("capability_closures: delivery_status failed")
+        raise HTTPException(status_code=500, detail="Failed to delivery status.")

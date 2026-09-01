@@ -184,6 +184,75 @@ class TestQueryConfigTable:
         assert out["matched"] is False
         assert len(out["rows"]) == 10  # sample cap
 
+    def test_detected_key_column_is_honoured(self):
+        # A framework keying its config by a NON-standard column (`tgt_tbl`) must
+        # still match — the detected target_key_columns are what make this work.
+        # Without them the row set falls back to a blind sample (matched=False) and
+        # derivation reports "no columns" for config that was right there.
+        rows = [{"mappings": [
+            {"tgt_tbl": "orders", "expr": "a+b"},
+            {"tgt_tbl": "customers", "expr": "c"},
+        ]}]
+        with patch("backend.lineage_service._get_client", return_value=MagicMock()), \
+             patch("backend.lineage_service._execute_sql", return_value=rows):
+            out = fa._query_config_table("c.s.cfg", "c.s.orders", ["tgt_tbl"])
+        assert out["matched"] is True
+        assert out["rows"] == [{"mappings": [{"tgt_tbl": "orders", "expr": "a+b"}]}]
+
+    def test_nonstandard_key_without_detection_does_not_match(self):
+        # Same data, but the detection didn't report the key → no match (documents
+        # exactly what the key_columns wiring buys).
+        rows = [{"mappings": [{"tgt_tbl": "orders", "expr": "a+b"}]}]
+        with patch("backend.lineage_service._get_client", return_value=MagicMock()), \
+             patch("backend.lineage_service._execute_sql", return_value=rows):
+            out = fa._query_config_table("c.s.cfg", "c.s.orders", [])
+        assert out["matched"] is False
+
+
+# ---------------------------------------------------------------------------
+# _target_keys / _entity_label / _blockers_note
+# ---------------------------------------------------------------------------
+
+class TestTargetKeys:
+    def test_detected_keys_come_first_then_defaults(self):
+        keys = fa._target_keys(["tgt_tbl"])
+        assert keys[0] == "tgt_tbl"
+        assert set(fa._TARGET_KEYS).issubset(set(keys))
+
+    def test_dedupes_and_drops_blanks_and_non_strings(self):
+        keys = fa._target_keys(["target", " tgt ", "", None, 7, "tgt"])
+        assert keys.count("target") == 1
+        assert keys.count("tgt") == 1      # " tgt " stripped, then deduped
+        assert None not in keys and 7 not in keys
+
+    def test_none_yields_defaults(self):
+        assert fa._target_keys(None) == fa._TARGET_KEYS
+
+
+class TestEntityLabel:
+    def test_known_types_get_friendly_nouns(self):
+        assert fa._entity_label("MATERIALIZED_VIEW") == "materialized view"
+        assert fa._entity_label("PIPELINE") == "pipeline"
+        assert fa._entity_label("SQL_TASK") == "SQL task"
+
+    def test_unknown_type_is_humanized_not_raw(self):
+        assert fa._entity_label("SOME_NEW_KIND") == "some new kind"
+
+    def test_missing_type_degrades_to_producer(self):
+        assert fa._entity_label("") == "producer"
+        assert fa._entity_label(None) == "producer"
+
+
+class TestBlockersNote:
+    def test_empty_when_nothing_blocked(self):
+        assert fa._blockers_note([], [], []) == ""
+
+    def test_names_each_cause_distinctly(self):
+        note = fa._blockers_note(["c.s.e"], ["c.s.u"], ["c.s.g"])
+        assert "SELECT" in note and "c.s.u" in note      # grant problem
+        assert "empty" in note and "c.s.e" in note       # re-run problem
+        assert "inferred" in note and "c.s.g" in note    # guessed name
+
 
 # ---------------------------------------------------------------------------
 # deep_analyze_stream
@@ -228,6 +297,7 @@ class TestDeepAnalyzeStream:
              patch.object(fa.llm_client, "detect_framework_config", return_value=cfg), \
              patch.object(fa, "_fetch_entity_parameters", return_value={}), \
              patch.object(fa, "_query_config_table", return_value=empty_res), \
+             patch.object(fa, "_fetch_target_columns", return_value=["x"]), \
              patch.object(fa.llm_client, "derive_columns_from_config") as mock_derive:
             events = _events(fa.deep_analyze_stream("PIPELINE", "p1", "c.s.t"))
         # the empty table is reported as a warn, not an "ok"
@@ -237,8 +307,133 @@ class TestDeepAnalyzeStream:
         assert r["derived"] is False
         assert r["reason_code"] == "config_empty"
         assert r["config_tables"] == ["c.s.cfg"]
+        assert r["empty_config_tables"] == ["c.s.cfg"]
         assert "empty" in r["detail"]
+        assert "pipeline" in r["detail"]  # friendly noun, not "PIPELINE"/"pipeline_"
         mock_derive.assert_not_called()  # short-circuited before the derive LLM call
+
+    def test_empty_config_table_reported_once_not_thrice(self):
+        # The same "empty" fact used to be emitted as a query_config warn, a derive
+        # error AND the result detail. Only the per-table warn + the result remain.
+        cfg = {"config_tables": [{"name": "c.s.cfg", "certain": True}],
+               "parameters": [], "target_key_columns": [], "notes": ""}
+        empty_res = {"table": "c.s.cfg", "columns": [], "rows": [], "total_rows": 0, "matched": False}
+        with patch.object(fa, "_fetch_source", return_value="code"), \
+             patch.object(fa.llm_client, "detect_framework_config", return_value=cfg), \
+             patch.object(fa, "_fetch_entity_parameters", return_value={}), \
+             patch.object(fa, "_query_config_table", return_value=empty_res), \
+             patch.object(fa, "_fetch_target_columns", return_value=["x"]), \
+             patch.object(fa.llm_client, "derive_columns_from_config"):
+            events = _events(fa.deep_analyze_stream("PIPELINE", "p1", "c.s.t"))
+        assert _steps(events, "derive") == []            # no redundant derive event
+        assert len([e for e in events if e.get("type") == "step"
+                    and "empty" in e.get("message", "")]) == 1
+
+    def test_uncertain_empty_table_falls_through_to_derive(self):
+        # `certain: false` means the table NAME was only guessed from a variable, so
+        # its emptiness proves nothing — derivation must still be attempted.
+        cfg = {"config_tables": [{"name": "c.s.guess", "certain": False}],
+               "parameters": [], "target_key_columns": [], "notes": ""}
+        empty_res = {"table": "c.s.guess", "columns": [], "rows": [], "total_rows": 0, "matched": False}
+        good_cols = [{"target_column": "x", "source_columns": ["a"],
+                      "expression": "a", "category": "PASS_THROUGH"}]
+        with patch.object(fa, "_fetch_source", return_value="code"), \
+             patch.object(fa.llm_client, "detect_framework_config", return_value=cfg), \
+             patch.object(fa, "_fetch_entity_parameters", return_value={}), \
+             patch.object(fa, "_query_config_table", return_value=empty_res), \
+             patch.object(fa, "_fetch_target_columns", return_value=["x"]), \
+             patch.object(fa.llm_client, "derive_columns_from_config", return_value=good_cols) as mock_derive, \
+             patch.object(fa.analysis_store, "save_analysis", return_value=3):
+            events = _events(fa.deep_analyze_stream("JOB", "1", "c.s.t"))
+        mock_derive.assert_called_once()                 # NOT short-circuited
+        r = _result(events)
+        assert r["derived"] is True and r.get("reason_code") is None
+
+    def test_empty_table_with_parameters_still_derives(self):
+        # The framework passes its column map as a pipeline parameter; the config
+        # table is a per-run audit table that happens to be empty. Deriving from
+        # source + parameters must still run (this path regressed once).
+        cfg = {"config_tables": [{"name": "c.s.audit", "certain": True}],
+               "parameters": ["column_config"], "target_key_columns": [], "notes": ""}
+        empty_res = {"table": "c.s.audit", "columns": [], "rows": [], "total_rows": 0, "matched": False}
+        good_cols = [{"target_column": "y", "source_columns": ["b"],
+                      "expression": "b*2", "category": "ARITHMETIC"}]
+        with patch.object(fa, "_fetch_source", return_value="code"), \
+             patch.object(fa.llm_client, "detect_framework_config", return_value=cfg), \
+             patch.object(fa, "_fetch_entity_parameters", return_value={"column_config": '{"y": "b*2"}'}), \
+             patch.object(fa, "_query_config_table", return_value=empty_res), \
+             patch.object(fa, "_fetch_target_columns", return_value=["y"]), \
+             patch.object(fa.llm_client, "derive_columns_from_config", return_value=good_cols) as mock_derive, \
+             patch.object(fa.analysis_store, "save_analysis", return_value=4):
+            events = _events(fa.deep_analyze_stream("PIPELINE", "p1", "c.s.t"))
+        mock_derive.assert_called_once()
+        assert mock_derive.call_args.kwargs["parameters"] == {"column_config": '{"y": "b*2"}'}
+        assert _result(events)["derived"] is True
+
+    def test_unreadable_plus_empty_reports_grant_not_rerun(self):
+        # One table can't be SELECTed, another is empty. Claiming "the tables are
+        # empty, re-run the pipeline" would send the user after the wrong fix, so
+        # the permission blocker must appear in the final detail.
+        cfg = {"config_tables": [{"name": "c.s.denied", "certain": True},
+                                 {"name": "c.s.empty", "certain": True}],
+               "parameters": [], "target_key_columns": [], "notes": ""}
+        empty_res = {"table": "c.s.empty", "columns": [], "rows": [], "total_rows": 0, "matched": False}
+
+        def _q(name, *_a, **_k):
+            if name == "c.s.denied":
+                raise RuntimeError("PERMISSION_DENIED")
+            return empty_res
+
+        with patch.object(fa, "_fetch_source", return_value="code"), \
+             patch.object(fa.llm_client, "detect_framework_config", return_value=cfg), \
+             patch.object(fa, "_fetch_entity_parameters", return_value={}), \
+             patch.object(fa, "_query_config_table", side_effect=_q), \
+             patch.object(fa, "_fetch_target_columns", return_value=["x"]), \
+             patch.object(fa.llm_client, "derive_columns_from_config", return_value=[]):
+            events = _events(fa.deep_analyze_stream("JOB", "1", "c.s.t"))
+        r = _result(events)
+        assert r["derived"] is False
+        assert r["reason_code"] == "no_columns"          # not the misleading config_empty
+        assert "c.s.denied" in r["detail"] and "SELECT" in r["detail"]
+        assert r["unreadable_config_tables"] == ["c.s.denied"]
+        assert r["empty_config_tables"] == ["c.s.empty"]
+
+    def test_duplicate_config_table_names_are_deduped(self):
+        # Free-form LLM JSON can repeat a table; it must be queried and named once.
+        cfg = {"config_tables": [{"name": "c.s.cfg"}, {"name": "c.s.cfg", "certain": False}],
+               "parameters": [], "target_key_columns": [], "notes": ""}
+        empty_res = {"table": "c.s.cfg", "columns": [], "rows": [], "total_rows": 0, "matched": False}
+        with patch.object(fa, "_fetch_source", return_value="code"), \
+             patch.object(fa.llm_client, "detect_framework_config", return_value=cfg), \
+             patch.object(fa, "_fetch_entity_parameters", return_value={}), \
+             patch.object(fa, "_query_config_table", return_value=empty_res) as mock_q, \
+             patch.object(fa, "_fetch_target_columns", return_value=["x"]), \
+             patch.object(fa.llm_client, "derive_columns_from_config", return_value=[]):
+            events = _events(fa.deep_analyze_stream("JOB", "1", "c.s.t"))
+        assert mock_q.call_count == 1
+        assert _result(events)["empty_config_tables"] == ["c.s.cfg"]
+
+    def test_result_missing_total_rows_is_treated_as_empty(self):
+        # A partial dict from _query_config_table must not raise KeyError mid-stream.
+        cfg = {"config_tables": [{"name": "c.s.cfg", "certain": True}],
+               "parameters": [], "target_key_columns": [], "notes": ""}
+        with patch.object(fa, "_fetch_source", return_value="code"), \
+             patch.object(fa.llm_client, "detect_framework_config", return_value=cfg), \
+             patch.object(fa, "_fetch_entity_parameters", return_value={}), \
+             patch.object(fa, "_query_config_table", return_value={"table": "c.s.cfg"}), \
+             patch.object(fa, "_fetch_target_columns", return_value=["x"]), \
+             patch.object(fa.llm_client, "derive_columns_from_config"):
+            events = _events(fa.deep_analyze_stream("PIPELINE", "p1", "c.s.t"))
+        assert _result(events)["reason_code"] == "config_empty"
+
+    def test_reason_codes_on_early_failures(self):
+        with patch.object(fa, "_fetch_source", return_value=" "):
+            r = _result(_events(fa.deep_analyze_stream("JOB", "1", "c.s.t")))
+        assert r["reason_code"] == "no_source"
+        with patch.object(fa, "_fetch_source", return_value="code"), \
+             patch.object(fa.llm_client, "detect_framework_config", return_value={"error": "boom"}):
+            r = _result(_events(fa.deep_analyze_stream("JOB", "1", "c.s.t")))
+        assert r["reason_code"] == "detect_failed"
 
     def test_happy_path_with_config_table_and_save(self):
         cfg = {"config_tables": [{"name": "c.s.cfg", "certain": True}],
