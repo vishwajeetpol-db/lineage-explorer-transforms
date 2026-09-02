@@ -150,6 +150,26 @@ class TestGetTableGovernance:
         assert out["columns"][0]["sensitivity"] == "TAGGED"
         assert out["columns"][0]["sensitivity_source"] == "tag_rule"
 
+    def test_column_tags_query_uses_schema_name(self):
+        """Regression: information_schema.column_tags is keyed by `schema_name`, not
+        `table_schema`. The old filter raised UNRESOLVED_COLUMN and was swallowed, so
+        tags were silently always empty and the tag-based classification path was dead."""
+        seen = {}
+
+        def router(sql):
+            if "column_tags" in sql:
+                seen["sql"] = sql
+                return [{"tag_name": "pii", "tag_value": "address"}]
+            if "information_schema.columns" in sql:
+                return [{"column_name": "name_norm", "data_type": "string",
+                         "is_nullable": "YES", "comment": None}]
+            return []
+
+        with patch.object(governance, "_execute_sql", side_effect=router):
+            out = governance.get_table_governance("c", "s", "t")
+        assert "schema_name" in seen["sql"] and "table_schema" not in seen["sql"]
+        assert out["tags"] == [{"name": "pii", "value": "address"}]
+
     def test_metadata_and_tags_exceptions_are_soft(self):
         cols = [{"column_name": "id", "data_type": "bigint", "is_nullable": "NO", "comment": None}]
         with patch.object(governance, "_execute_sql",

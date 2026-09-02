@@ -134,12 +134,16 @@ def get_table_governance(catalog: str, schema: str, table: str) -> dict:
     except Exception as e:
         logger.info(f"governance: could not fetch table metadata for {full_name}: {e}")
 
-    # 2. UC tags via information_schema.column_tags (DBR 14.1+)
+    # 2. UC tags via information_schema.column_tags (DBR 14.1+).
+    # NOTE: column_tags uses `schema_name` (not `table_schema` like .tables/.columns).
+    # The old `table_schema` filter raised UNRESOLVED_COLUMN on every call and was
+    # swallowed by the except below, so this ALWAYS returned zero tags — the entire
+    # tag-based classification path was dead. Verified live: schema_name/table_name.
     try:
         tag_rows = _execute_sql(
             f"SELECT tag_name, tag_value "
             f"FROM {catalog}.information_schema.column_tags "
-            f"WHERE table_schema = '{schema}' AND table_name = '{table}'"
+            f"WHERE schema_name = '{schema}' AND table_name = '{table}'"
         )
         result["tags"] = [{"name": r["tag_name"], "value": r.get("tag_value")} for r in tag_rows]
     except Exception as e:
