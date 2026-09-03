@@ -114,10 +114,17 @@ describe("transformStore", () => {
       expect(get().freshness?.exists).toBe(false);
     });
 
-    it("goes to needs_build when stale", async () => {
+    it("loads the existing trace when stale (does not block on rebuild)", async () => {
+      // Stale-but-existing lineage must still render the already-built graph;
+      // rebuilding is a non-blocking, opt-in "Regenerate" affordance. Only a
+      // genuine absence (exists=false) blocks with needs_build.
       mocked.getTransformFreshness.mockResolvedValue(fresh({ is_stale: true }));
+      mocked.getTransformTrace.mockResolvedValue(trace());
       await get().openPanel("c.s.t", "col");
-      expect(get().panelState).toBe("needs_build");
+      expect(get().panelState).toBe("ready");
+      expect(get().traceResult).not.toBeNull();
+      // freshness still reports stale so the panel can offer "Regenerate"
+      expect(get().freshness?.is_stale).toBe(true);
     });
 
     it("loads trace when fresh and existing", async () => {
