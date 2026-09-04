@@ -151,6 +151,7 @@ Switch to **Pipelines** view to see job-to-job dependencies derived from shared 
 ## What It Does
 
 - **Visualizes** table-to-table and column-to-column lineage as an interactive DAG with upstream/downstream path highlighting
+- **Explains** the same lineage in plain language for non-engineers — a one-click **Business view** relabels and simplifies the graph, and an **AI lightbulb** narrates the whole flow in prose
 - **Discovers** all tables, views, jobs, notebooks, and DLT pipelines from Unity Catalog system tables — including cross-schema and cross-catalog references
 - **Connects** them with lineage edges (`feedsInto`, `writesTo`) and entity nodes showing which pipeline moves the data
 - **Integrates** with external dashboards via deep links — one URL parameter, any platform
@@ -172,6 +173,15 @@ Switch to **Pipelines** view to see job-to-job dependencies derived from shared 
 - **Interactive:** Drag nodes, zoom/pan, hover tooltips, orphan detection (amber border)
 - **Large graph optimization:** 50+ node graphs render instantly (no staggered animation). fitView retries at 100/500/1000/2000ms
 - **Cross-schema nodes:** Tables from other schemas/catalogs render with cyan dashed border and `CROSS-SCHEMA` badge. Full column metadata fetched from their `information_schema` via batch queries — expandable and clickable for column lineage tracing
+
+### Business View & AI Explanation
+
+- **Technical ⇄ Business toggle:** A control on the top-left of the lineage canvas flips the detailed engineering graph into a plain-language view aimed at non-engineers. Instant and client-side (no backend call); the preference persists across sessions.
+- **Plain-language relabeling:** Technical types become business terms — JOB→"Process", PIPELINE→"Data pipeline", NOTEBOOK→"Code step", VIEW→"View", MATERIALIZED_VIEW/MANAGED/EXTERNAL→"Dataset", STREAMING_TABLE→"Live dataset", VOLUME/PATH→"File". Names are humanized (`orders_curated` → "Orders Curated").
+- **Dataset descriptions:** Each dataset shows a one-line plain-English description — its Unity Catalog comment when present, otherwise a derived summary like "A dataset built from 3 sources, feeding 2 downstream consumers."
+- **Less clutter:** The business view hides engineering detail — fully-qualified names, column-level edges, job/pipeline IDs, per-run cost badges, and health popovers.
+- **Data only vs Data + processing:** A sub-toggle chooses whether to show just the datasets and how they connect, or the datasets plus the processing steps (jobs/pipelines) that move data between them. "Data only" uses the **precise** table→table dependencies recorded in system tables, so a heavily-connected table shows only its real dependencies rather than appearing falsely connected to everything.
+- **AI "Explain this lineage" (lightbulb):** A bulb button opens a modal with an AI-generated, plain-English explanation of the **current** on-screen graph — an overall summary plus an ordered "source → process → output" walkthrough. It respects the current view (data-only vs data+processing) and can be regenerated. Backed by `POST /api/lineage/explain`; requires a reachable Foundation Model serving endpoint, and shows a clear message if one isn't configured.
 
 ### Landing Page
 
@@ -224,6 +234,15 @@ Switch to **Pipelines** view to see job-to-job dependencies derived from shared 
 | **Pipelines** | Entity nodes only, connected by pipeline dependencies | Disabled | See which jobs depend on which |
 | **Tables** | Table nodes only, direct table-to-table edges | Enabled | Classic lineage view |
 | **Full** | Both tables and entity nodes with routed edges | Enabled | Complete picture: data flow + which pipeline moves it |
+
+**Business view** is a separate lens layered on top of the above (toggled Technical ⇄ Business on the canvas), with its own content sub-modes:
+
+| Business sub-mode | What Renders | Use Case |
+|---|---|---|
+| **Data only** | Datasets only, connected by their **precise** table→table dependencies (from system tables) | Give a business audience the cleanest "where does this data come from / go to" picture |
+| **Data + processing** | Datasets plus the processing steps (jobs/pipelines) that move data between them | Show non-engineers both the data and the steps that transform it |
+
+Because "Data only" uses the precise recorded pairs, a heavily-connected hub table shows only its real dependencies — it no longer appears falsely connected to everything.
 
 ### Depth Control
 
@@ -475,6 +494,7 @@ Before deploying, review the permissions the app needs. The app uses a **bare mi
 | `SELECT` on `system.access.audit` | For transformation-lineage notebook-path resolution | No | Account admin |
 | `SELECT` on `system.query.history` | For the transformation-lineage query-history fallback (entity-less producers). Identity-scoped — needs broad query-history visibility to resolve other users' ad-hoc tables | No | Account admin |
 | `ALL PRIVILEGES` on `LINEAGE_CATALOG.LINEAGE_SCHEMA` (dedicated store) | For writing transformation-lineage tables. **Option A:** this one schema is the *only* place the app writes — **no write on any data catalog** (node ids embed the real catalog) | No | Owner of the dedicated catalog/schema |
+| `CAN_RUN` on the deployed bundle source folder (`${workspace.file_path}`) | For transformation-lineage **builds** — the build job runs `notebooks/run_pipeline` from there as the app SPN, and `bundle deploy` leaves that folder readable only by the deployer + workspace admins | Grants it (it owns the folder) | The deploying identity, via `./grant_build_source_access.sh` |
 | `CAN_USE` on SQL Warehouse | Yes | No | Warehouse owner / admin |
 | `CAN_MANAGE` on SQL Warehouse | No | Yes (if SPN) | Warehouse owner / admin |
 | Workspace membership | Auto (app SPN added) | Must exist in workspace | Workspace admin |
@@ -513,10 +533,10 @@ databricks bundle deploy -t dev \
   --var warehouse_id=<your-warehouse-id>
 
 # 4. Start
-databricks bundle run lineage-explorer -t dev --profile <your-profile>
+databricks bundle run bricktrace -t dev --profile <your-profile>
 
 # 5. Get URL
-databricks apps get lineage-explorer-dev --profile <your-profile> -o json \
+databricks apps get bricktrace-dev --profile <your-profile> -o json \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['url'])"
 ```
 
@@ -543,10 +563,29 @@ Then deploy with `--profile my-spn-profile`. See [OAuth M2M authentication](http
 1. **Settings > Workspace > Previews** → Enable "Databricks Apps - On-Behalf-Of User Authorization"
 2. **Compute > Apps > lineage-explorer-dev** → Edit → User Authorization → Add scopes: `iam.current-user:read`, `iam.access-control:read`
 
+**Let the app read its own deployed source** (required for transformation-lineage builds):
+
+```bash
+./grant_build_source_access.sh --profile <your-profile> --app bricktrace-dev
+```
+
+`bundle deploy` uploads the source to `/Workspace/Users/<deployer>/.bundle/<bundle>/<target>/files`,
+which only the deployer and workspace admins can touch. Clicking **Generate transformation lineage**
+submits a serverless job that runs `<source>/notebooks/run_pipeline` and imports
+`<source>/transformation_lineage` **as the app's service principal** — so without a grant on that
+folder every build fails with `Unable to access the notebook … lacks the required permissions`.
+
+The script resolves the app's SPN + source path from `apps get` and grants that SPN `CAN_RUN` on the
+folder (children inherit). `CAN_READ` is *not* enough — a `notebook_task` must execute the notebook.
+Run it as the identity that deployed the bundle: it already has `CAN_MANAGE` there, so no metastore
+admin, warehouse, or account admin is involved. It is idempotent (PATCH — existing ACL entries are
+untouched) and `make deploy` runs it for you. Re-run it whenever the bundle root is re-created: a
+first deploy, a deploy from a different identity, a renamed bundle/target, or after `bundle destroy`.
+
 **Grant permissions to the app SPN:**
 
 ```bash
-APP_SPN=$(databricks apps get lineage-explorer-dev --profile <your-profile> -o json \
+APP_SPN=$(databricks apps get bricktrace-dev --profile <your-profile> -o json \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['service_principal_client_id'])")
 ```
 
@@ -903,6 +942,10 @@ Single-process is the right default — it keeps the cache, coalescing, and rate
 | `TRANSFORM_CACHE_TTL_SECONDS` | `3600` (1h) | Transformation-lineage cache TTL |
 | `TRANSFORM_MAX_DEPTH` | `8` | Max BFS depth for the transformation backtrack |
 | `BUILD_CACHE_TTL_HOURS` | `24` | Hours before a built table's transformation lineage is considered stale |
+| `CAPABILITY_CACHE_TTL_SECONDS` | `86400` (24h) | Age before a cached Impact/Root Cause/Governance/Access panel is flagged stale (v2.6.0). Payload is still served past this — only the badge changes. |
+| `OBSERVABILITY_LOOKBACK_DAYS` | `90` | Lookback window for run-health aggregates and the last-N-runs health check (v2.6.0; was 30) |
+| `CAPTURED_PLANS_TABLE` | `<cat>.<schema>.captured_plans` | Delta table the offline `lineage_capture` wheel writes analyzed plans to (bundle var `captured_plans_table`) |
+| `CAPTURED_CDC_TABLE` | `<cat>.<schema>.captured_cdc_specs` | Delta table for captured apply_changes/AUTO-CDC specs (bundle var `captured_cdc_table`) |
 
 Override via DABs:
 
@@ -945,6 +988,20 @@ env:
 | `GET` | `/api/transform/categories` | Transform category → color map |
 | `GET` | `/api/transform/build-configured` | Whether the build pipeline path is configured |
 | `POST` | `/api/transform/invalidate?scope=cache\|table\|all[&table_fqn=]` | Flush transform cache / wipe stored lineage (**admin-only**) |
+| **Column transformations** | | |
+| `POST` | `/api/column-transformations` | Unified per-column derivation, best-source-first (captured plan → CDC → stored LLM → fresh LLM). Body `{catalog, schema_name, table, entity_type?, entity_id?, force_rerun?, model?}` |
+| `POST` | `/api/column-transformations/versions` | Merged version list across sources (each with a `ref`) |
+| `POST` | `/api/column-transformations/compare` | Diff any two version refs (incl. cross-source captured-plan vs LLM) |
+| `POST` | `/api/column-transformations/compare-producers` | **Multi-producer comparison (v2.6.0)** — per-column matrix across 2+ producers of the same table, flagging divergent logic. Body `{catalog, schema_name, table, producers:[{entity_type, entity_id}], force_rerun?}` |
+| **Observability / run health** | | |
+| `GET` | `/api/observability?entity_type=&entity_id=` | Aggregate run/update health for a job or pipeline |
+| `GET` | `/api/observability/runs?entity_type=&entity_id=&limit=5&refresh=false` | **Last-N runs health check (v2.6.0)** — per-run status, duration, **per-run cost**, deep links, plus verdict / success rate / duration trend / cost total + spike. Cached per entity |
+| `GET` | `/api/observability/producers?catalog=&schema=&table=` | Health of every producer of a table |
+| **Per-table capability cache (admin)** | | |
+| `GET` | `/api/admin/capability-cache` | Inventory of cached `(table, tab)` entries (admin-only) |
+| `POST` | `/api/admin/capability-cache/evict?scope=entry\|table\|all[&table_fqn=&tab=]` | Evict capability-cache entries (admin-only) |
+
+> **Cached capability panels (v2.6.0).** `GET /api/impact`, `/api/root-cause/trace`, `/api/governance`, and `/api/access` accept `&refresh=true` to bypass the per-table cache and recompute live; otherwise they serve the cached payload with a `_cache` meta block (`from_cache`, `cached_at`, `stale`).
 
 All identifier parameters are validated: alphanumeric + underscores, max 255 chars.
 
@@ -1024,6 +1081,8 @@ lineage-explorer/
 | Catalog not visible | App SPN lacks `USE CATALOG` | Grant `USE CATALOG` + `BROWSE` |
 | `bundle deploy` host mismatch | Wrong profile | Use `--profile <name>` matching your `~/.databrickscfg` |
 | `bundle deploy` missing variable | No `--var warehouse_id` | Add `--var warehouse_id=<id>` to the deploy command |
+| Build fails: "Unable to access the notebook ... lacks the required permissions" | The app SPN has no `CAN_RUN` on the bundle source folder `bundle deploy` uploaded into the deployer's home | Run `./grant_build_source_access.sh --profile <profile> --app <app>` as the deploying identity, then Regenerate |
+| "The app's service principal cannot reach the deployed build notebook" (503 on Generate) | Same cause, caught by the pre-submit check before any serverless compute is spent | Same fix — the message names the script |
 | 429 Too Many Requests | Rate limit exceeded | Increase `RATE_LIMIT_MAX_REQUESTS` env var. Admin dashboard auto-refreshes every 10s -- set to `200` for dev environments. |
 | 400 "Invalid catalog" | Special chars in identifier | Use only alphanumeric + underscores |
 | Live toggle disabled for all | Workspace preview not enabled | Enable "Databricks Apps - On-Behalf-Of User Authorization Public Preview" in Settings > Workspace > Previews |

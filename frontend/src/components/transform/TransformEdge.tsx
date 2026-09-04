@@ -112,9 +112,11 @@ export default function TransformEdgeComponent({
                 </span>
                 <div className="mt-1">
                   <p className="text-[9px] text-slate-500 font-semibold uppercase tracking-wider mb-1">
-                    Expression
+                    {/^Step 1:/m.test(data.expression) ? 'Transformation steps' : 'Expression'}
                   </p>
-                  <code className="text-[11px] text-amber-300 font-mono break-all leading-relaxed block">
+                  {/* Preserve newlines so each `Step N: …` stays on its own line;
+                      wrap long lines without breaking mid-token. */}
+                  <code className="text-[11px] text-amber-300 font-mono whitespace-pre-wrap break-words leading-relaxed block">
                     {data.expression}
                   </code>
                 </div>
@@ -143,7 +145,15 @@ export default function TransformEdgeComponent({
                     className="text-[10px] text-amber-300/90 font-mono truncate"
                     title={data.expression}
                   >
-                    {truncate(data.expression, MAX_INLINE_EXPR)}
+                    {/* Inline label shows the PRIMARY op: for a step-wise expr
+                        that's the last (final) step; the numbered steps appear
+                        in the expanded hover card. */}
+                    {(() => {
+                      const lines = data.expression.split('\n').filter((l) => l.trim());
+                      const primary = lines.length ? lines[lines.length - 1] : data.expression;
+                      const cleaned = primary.replace(/^\s*Step\s+\d+:\s*/, '');
+                      return truncate(cleaned, MAX_INLINE_EXPR);
+                    })()}
                   </code>
                 )}
               </div>

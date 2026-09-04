@@ -34,6 +34,33 @@ from cachetools import TTLCache
 from databricks.sdk.service.sql import StatementState
 
 from backend.lineage_service import _get_client
+
+# Cap 30: captured-plan BFS override — imported lazily to avoid circular imports
+# at module load time, only resolved when the feature flag is on.
+_plan_capture_svc = None
+
+def _get_captured_expression_for_node(
+    table_fqn: str, column: str
+):
+    """Return a captured plan override dict for (table_fqn, column), or None.
+
+    Lazily imports plan_capture_service the first time the flag is on so the
+    import never blocks startup when the flag is off. Non-fatal: returns None
+    on any error.
+    """
+    try:
+        from backend.feature_flags import get_flag_state
+        if not (get_flag_state("lineage_tracking.plan_capture") and
+                get_flag_state("column_transformation.captured_plan_precedence")):
+            return None
+        from backend import plan_capture_service as _pcs
+        parts = table_fqn.split(".")
+        if len(parts) != 3:
+            return None
+        return _pcs.get_captured_expression(parts[0], parts[1], parts[2], column)
+    except Exception:
+        return None
+
 from backend.models import (
     TransformNode,
     TransformEdge,
@@ -572,7 +599,16 @@ def load_edges(
             return []
 
         where_parts = [f"pipeline_run_id = '{run_id}'"]
-        where_parts.append("src_fqn IS NOT NULL AND dst_fqn IS NOT NULL")
+        # The DESTINATION must be a fully-resolved column (that's the node the
+        # trace backtracks from). The SOURCE table (src_fqn) may legitimately be
+        # NULL: when a chain reads MULTIPLE tables (a join), the parser cannot
+        # safely attribute a bare column like `total_amount` to one side, so it
+        # leaves src_fqn NULL by design — but the derive edge still carries the
+        # real expression and source COLUMN. Requiring src_fqn NOT NULL here hid
+        # all join-derived column lineage ("No transformation logic found" on a
+        # table that genuinely has it). Keep such edges as long as the source
+        # column is known; the source node just renders without a table label.
+        where_parts.append("dst_fqn IS NOT NULL")
         where_parts.append("src_col IS NOT NULL AND dst_col IS NOT NULL")
         # Drop self-loops (src column node == dst column node). These come from
         # stale/mis-resolved parses attributing a source ref to the output table
@@ -661,6 +697,8 @@ def backtrack_transform_lineage(
 
         # BFS backtracking — optimized with pre-allocated structures
         levels: list[TransformLevel] = []
+        # A3 FIX: Check captured plan for target column too
+        target_captured = _get_captured_expression_for_node(fqn, column)
         levels.append(TransformLevel(
             depth=0,
             label="Target Column",
@@ -669,6 +707,7 @@ def backtrack_transform_lineage(
                 node_id=target_node_id,
                 table_fqn=fqn,
                 column=column,
+                captured_expression=target_captured.get("expression") if target_captured else None,
             )],
             transforms=[],
         ))
@@ -720,10 +759,15 @@ def backtrack_transform_lineage(
 
                         src_tbl = edge.get("src_fqn") or "?"
                         src_col = edge.get("src_col") or "?"
+                        # A3 FIX: Check for captured-plan override expression
+                        # If Runtime Plan Capture has a more accurate expression for
+                        # this column, attach it to the node for the UI to prefer.
+                        captured_expr = _get_captured_expression_for_node(src_tbl, src_col)
                         level_nodes.append(TransformNode(
                             node_id=src_id,
                             table_fqn=src_tbl,
                             column=src_col,
+                            captured_expression=captured_expr.get("expression") if captured_expr else None,
                         ))
 
             if level_nodes or level_transforms:

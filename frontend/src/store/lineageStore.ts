@@ -3,6 +3,42 @@ import type { GraphNode, LineageEdge, ColumnLineageEdge, TableSearchItem, Sharin
 
 export type LineageScope = "table" | "schema" | "catalog";
 
+const BUSINESS_VIEW_KEY = "bricktrace-business-view";
+const BUSINESS_DETAIL_KEY = "bricktrace-business-detail";
+
+// Read the persisted business-view preference (guarded for jsdom / no-storage).
+function readBusinessView(): boolean {
+  try {
+    return localStorage.getItem(BUSINESS_VIEW_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function persistBusinessView(enabled: boolean): void {
+  try {
+    localStorage.setItem(BUSINESS_VIEW_KEY, enabled ? "1" : "0");
+  } catch {
+    /* storage unavailable — in-memory only */
+  }
+}
+
+function readBusinessDetail(): "data" | "data_and_processing" {
+  try {
+    return localStorage.getItem(BUSINESS_DETAIL_KEY) === "data" ? "data" : "data_and_processing";
+  } catch {
+    return "data_and_processing";
+  }
+}
+
+function persistBusinessDetail(detail: "data" | "data_and_processing"): void {
+  try {
+    localStorage.setItem(BUSINESS_DETAIL_KEY, detail);
+  } catch {
+    /* storage unavailable — in-memory only */
+  }
+}
+
 interface LineageState {
   // Table-focused landing
   focusTable: string | null; // FQDN of selected table
@@ -18,6 +54,12 @@ interface LineageState {
   lineageView: "pipeline" | "table" | "full";
   lineageDepth: number; // 0 = full lineage, >0 = N hops upstream + N hops downstream
   columnLineageEnabled: boolean;
+  // Business view: a plain-language lens over the technical graph (relabel +
+  // hide detail + simplify) for non-engineers. Off by default; persisted.
+  businessView: boolean;
+  // Within business view: show only datasets, or datasets + the processing steps
+  // (jobs/pipelines/code) that move data between them.
+  businessDetail: "data" | "data_and_processing";
   liveMode: boolean;
   isAdmin: boolean;
   discountPercent: number;
@@ -32,6 +74,9 @@ interface LineageState {
   schemas: string[];
   nodes: GraphNode[];
   edges: LineageEdge[];
+  // Precise table→table pairs from the backend (see LineageResponse.table_edges).
+  // Used by the "datasets only" business view instead of collapsing entities.
+  tableEdges: LineageEdge[];
   columnEdges: ColumnLineageEdge[];
 
   // Cache metadata
@@ -41,6 +86,8 @@ interface LineageState {
   fetchDurationMs: number | null;
   lineageWindowDays: number;
   truncated: boolean;
+  graphWarnings: Record<string, unknown> | null; // C2–C5 diagnostics from backend
+  healthWarning: string | null; // C1: system-table / SP-grant failures
 
   // UI state
   loading: boolean;
@@ -66,6 +113,9 @@ interface LineageState {
   setLineageView: (view: "pipeline" | "table" | "full") => void;
   setLineageDepth: (depth: number) => void;
   setColumnLineageEnabled: (enabled: boolean) => void;
+  setBusinessView: (enabled: boolean) => void;
+  toggleBusinessView: () => void;
+  setBusinessDetail: (detail: "data" | "data_and_processing") => void;
   setLiveMode: (live: boolean) => void;
   setIsAdmin: (isAdmin: boolean) => void;
   setDiscountPercent: (percent: number) => void;
@@ -74,15 +124,19 @@ interface LineageState {
   setSharingOverlay: (overlay: SharingOverlay | null) => void;
   setCatalogs: (catalogs: string[]) => void;
   setSchemas: (schemas: string[]) => void;
+  setGraphWarnings: (warnings: Record<string, unknown> | null) => void;
+  setHealthWarning: (warning: string | null) => void;
   setLineageData: (data: {
     nodes: GraphNode[];
     edges: LineageEdge[];
+    tableEdges?: LineageEdge[];
     cached?: boolean;
     cachedAt?: string | null;
     cacheExpiresAt?: string | null;
     fetchDurationMs?: number | null;
     lineageWindowDays?: number | null;
     truncated?: boolean;
+    graphWarnings?: Record<string, unknown> | null;
   }) => void;
   setColumnEdges: (edges: ColumnLineageEdge[]) => void;
   setLoading: (loading: boolean) => void;
@@ -108,6 +162,8 @@ export const useLineageStore = create<LineageState>((set) => ({
   lineageView: "full",
   lineageDepth: 0,
   columnLineageEnabled: false,
+  businessView: readBusinessView(),
+  businessDetail: readBusinessDetail(),
   liveMode: false,
   isAdmin: false,
   discountPercent: 0,
@@ -121,6 +177,7 @@ export const useLineageStore = create<LineageState>((set) => ({
   schemas: [],
   nodes: [],
   edges: [],
+  tableEdges: [],
   columnEdges: [],
   cached: false,
   cachedAt: null,
@@ -128,6 +185,8 @@ export const useLineageStore = create<LineageState>((set) => ({
   fetchDurationMs: null,
   lineageWindowDays: 90,
   truncated: false,
+  graphWarnings: null,
+  healthWarning: null,
   loading: false,
   error: null,
   expandedNodes: new Set(),
@@ -171,6 +230,26 @@ export const useLineageStore = create<LineageState>((set) => ({
   setLineageView: (view) => set({ lineageView: view, columnEdges: [], selectedColumn: null, expandedNodes: new Set() }),
   setLineageDepth: (depth) => set({ lineageDepth: depth }),
   setColumnLineageEnabled: (enabled) => set({ columnLineageEnabled: enabled, columnEdges: [], selectedColumn: null, expandedNodes: new Set() }),
+  // Business view hides column-level detail, so entering it also collapses any
+  // expanded columns and clears column selection (technical-only state).
+  setBusinessView: (enabled) => {
+    persistBusinessView(enabled);
+    set(enabled
+      ? { businessView: true, columnEdges: [], selectedColumn: null, expandedNodes: new Set() }
+      : { businessView: false });
+  },
+  toggleBusinessView: () =>
+    set((state) => {
+      const next = !state.businessView;
+      persistBusinessView(next);
+      return next
+        ? { businessView: true, columnEdges: [], selectedColumn: null, expandedNodes: new Set() }
+        : { businessView: false };
+    }),
+  setBusinessDetail: (detail) => {
+    persistBusinessDetail(detail);
+    set({ businessDetail: detail });
+  },
   setLiveMode: (live) => set({ liveMode: live }),
   setIsAdmin: (isAdmin) => set({ isAdmin }),
   setDiscountPercent: (percent) => set({ discountPercent: Math.max(0, Math.min(99, percent)) }),
@@ -180,10 +259,13 @@ export const useLineageStore = create<LineageState>((set) => ({
   setSharingOverlay: (sharingOverlay) => set({ sharingOverlay }),
   setCatalogs: (catalogs) => set({ catalogs }),
   setSchemas: (schemas) => set({ schemas }),
-  setLineageData: ({ nodes, edges, cached, cachedAt, cacheExpiresAt, fetchDurationMs, lineageWindowDays, truncated }) =>
+  setGraphWarnings: (graphWarnings) => set({ graphWarnings }),
+  setHealthWarning: (healthWarning) => set({ healthWarning }),
+  setLineageData: ({ nodes, edges, tableEdges, cached, cachedAt, cacheExpiresAt, fetchDurationMs, lineageWindowDays, truncated, graphWarnings }) =>
     set({
       nodes,
       edges,
+      tableEdges: tableEdges ?? [],
       loading: false,
       error: null,
       cached: cached ?? false,
@@ -192,6 +274,7 @@ export const useLineageStore = create<LineageState>((set) => ({
       fetchDurationMs: fetchDurationMs ?? null,
       lineageWindowDays: lineageWindowDays ?? 90,
       truncated: truncated ?? false,
+      graphWarnings: graphWarnings ?? null,
     }),
   setColumnEdges: (columnEdges) => set({ columnEdges }),
   setLoading: (loading) => set({ loading }),
@@ -221,6 +304,7 @@ export const useLineageStore = create<LineageState>((set) => ({
     set({
       nodes: [],
       edges: [],
+      tableEdges: [],
       columnEdges: [],
       expandedNodes: new Set(),
       selectedNode: null,

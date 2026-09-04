@@ -44,12 +44,19 @@ class ColumnLineageEdge(BaseModel):
 class LineageResponse(BaseModel):
     nodes: list[Union[TableNode, EntityNode]]
     edges: list[LineageEdge]
+    # PRECISE table→table dependencies (one per real source→target pair from
+    # system.access.table_lineage), independent of the entity-routed `edges`.
+    # The UI uses these for a "datasets only" view so collapsing entity nodes
+    # doesn't have to cross-product an entity's inputs × outputs (which fabricates
+    # edges and produces a dense mesh for hub tables).
+    table_edges: list[LineageEdge] = []
     cached: bool = False
     cached_at: Optional[str] = None
     cache_expires_at: Optional[str] = None
     fetch_duration_ms: Optional[int] = None
     lineage_window_days: Optional[int] = None  # lookback window used for this graph
     truncated: bool = False  # True when a trace hit the node cap — graph is incomplete
+    graph_warnings: Optional[dict] = None  # C2/C3/C4/C5 edge-case diagnostics for FE banners
 
 
 class ColumnLineageResponse(BaseModel):
@@ -97,6 +104,38 @@ class SharingOverlay(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Federated Source overlay — Lakehouse Federation foreign table enrichment.
+#
+# Mirrors the Delta Sharing overlay pattern: a lens layered on the existing
+# table DAG that enriches FOREIGN table nodes with connection metadata.
+# The frontend matches full_name values against graph nodes and renders
+# connection-type badges, dashed borders, and external-source annotations.
+# See FEDERATED_LINEAGE_DESIGN.docx Tier 1.
+# ---------------------------------------------------------------------------
+
+
+class FederatedTableEntry(BaseModel):
+    """A Unity Catalog FOREIGN table backed by a Lakehouse Federation connection."""
+    full_name: str                       # catalog.schema.table in Databricks UC
+    connection_name: str                  # e.g. 'oracle_prod_connection'
+    connection_type: str                  # ORACLE | SQLSERVER | POSTGRESQL | MYSQL |
+                                         # SNOWFLAKE | REDSHIFT | BIGQUERY | DATABRICKS
+    remote_catalog: Optional[str] = None  # database/instance name in source
+    remote_schema: Optional[str] = None   # schema/owner in source system
+    remote_object: Optional[str] = None   # table or view name in source
+    object_type: Optional[str] = None     # TABLE | VIEW | SYNONYM | unknown
+    is_view: bool = False
+    column_count: int = 0
+
+
+class FederatedSourceOverlay(BaseModel):
+    """Overlay for Lakehouse Federation foreign tables in the lineage graph."""
+    federated_tables: list[FederatedTableEntry] = []
+    connections: list[dict] = []          # name, type, owner, created_at
+    available: bool = True                # False when foreign catalogs aren't accessible
+
+
+# ---------------------------------------------------------------------------
 # Transformation Lineage Models — column-level expression-aware lineage
 # from the LATTICE pipeline (transformation_lineage library).
 #
@@ -111,6 +150,8 @@ class TransformNode(BaseModel):
     node_id: str                          # e.g. "col:catalog.schema.table::column_name"
     table_fqn: str                        # fully qualified table name
     column: str                           # column name
+    # A3 FIX: Runtime Plan Capture expression override (if available)
+    captured_expression: str | None = None  # from plan_capture when flag is on
 
 
 class TransformEdge(BaseModel):
@@ -154,10 +195,27 @@ class FreshnessInfo(BaseModel):
     is_stale: bool = True
 
 
+# Canonical vocabulary for "why is there no (or only partial) transformation
+# lineage". ONE list shared by every producer of a reason_code — producer_source
+# (source/LLM failures), framework_analysis (deep-analysis failures) and
+# TransformDiagnosis (build-time diagnosis) — so the UI's reason → label mapping
+# stays exhaustive instead of silently falling through for a newly added code.
+# Mirrored by `TransformReasonCode` in frontend/src/api/client.ts; keep in sync.
+TransformReasonCode = Literal[
+    # producer source / LLM analysis
+    "access_denied", "entity_missing", "no_source", "no_columns",
+    "llm_error", "llm_not_configured",
+    # deep metadata-driven-framework analysis
+    "config_empty", "detect_failed",
+    # build-time diagnosis
+    "no_producer", "producer_outside_window", "producer_unresolved", "unknown",
+]
+
+
 class TransformDiagnosis(BaseModel):
     """Why a table has no transformation lineage — shown instead of a generic
     "not generated yet" so a no-op build is self-explanatory."""
-    reason_code: str = "unknown"          # no_producer | producer_outside_window | producer_unresolved | unknown
+    reason_code: TransformReasonCode = "unknown"
     title: str = ""
     detail: str = ""
     last_produced_at: Optional[str] = None
@@ -186,3 +244,63 @@ class BuildJobStatus(BaseModel):
     total_steps: int = 8
     steps: list[str] = []                 # ordered step names for progress bar
     run_page_url: str = ""                # link to the job run in Databricks UI
+
+
+# ---------------------------------------------------------------------------
+# Control Panel Models — feature-flag registry, workspace impact/access
+# metadata, and status cards for the Runtime Plan Capture and Federated Sync
+# modules. See backend/feature_flags.py, backend/plan_capture_service.py,
+# backend/federated_sync.py.
+# ---------------------------------------------------------------------------
+
+
+class AccessRequirement(BaseModel):
+    privilege: str
+    scope: str
+    reason: str
+    satisfied: Optional[bool] = None      # None = could not be verified automatically
+    detail: Optional[str] = None
+
+
+class FeatureFlagCard(BaseModel):
+    id: str
+    module: str
+    module_label: str
+    accent: str = "indigo"
+    name: str
+    description: str
+    cost: str = "low"                     # low | medium | high
+    risk: str = "low"                     # low | medium | high
+    side_effects: list[str] = []
+    access_requirements: list[dict] = []
+    depends_on: list[str] = []
+    enabled: bool = False
+    kill_switched: bool = False           # True when an ops env-var forces this off regardless of the DB flag
+
+
+class FeatureFlagsResponse(BaseModel):
+    flags: list[FeatureFlagCard] = []
+
+
+class PlanCaptureStatus(BaseModel):
+    enabled: bool = False
+    table_reachable: bool = False
+    captured_plan_count: int = 0
+    captured_cdc_spec_count: int = 0
+    distinct_targets: int = 0
+
+
+class FederatedPeer(BaseModel):
+    peer_alias: str
+    share_name: str
+    direction: str = "both"               # inbound | outbound | both
+    registered_by: Optional[str] = None
+    registered_at: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class FederatedSyncStatus(BaseModel):
+    enabled: bool = False
+    registered_peers: int = 0
+    known_shares: int = 0
+    reachable_overlap: int = 0

@@ -1,8 +1,8 @@
 import { memo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Menu, Activity, FolderOpen, Home } from "lucide-react";
+import { Menu, Activity, FolderOpen, Home, SlidersHorizontal, BarChart3, BookOpen, Bell, Download, Search, Monitor, Radio } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
-import { goLanding, goCatalogs } from "../../hooks/useRouter";
+import { goLanding, goCatalogs, goControlPanel, goDQ, goGlossary, goNotifications, goExport, goRootCause, goBiConsumers, goStreaming } from "../../hooks/useRouter";
 
 interface Props {
   variant?: "default" | "floating";
@@ -42,27 +42,47 @@ function HeaderMenu({ variant = "default" }: Props) {
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: -4, scale: 0.96 }}
               transition={{ duration: 0.15 }}
-              className="absolute right-0 top-full mt-2 z-[100] w-56 rounded-xl bg-[#161625]/95 backdrop-blur-xl border border-white/[0.08] shadow-[0_12px_40px_rgba(0,0,0,0.5)] overflow-hidden"
+              className="absolute right-0 top-full mt-2 z-[100] w-56 rounded-xl bg-[#161625]/95 backdrop-blur-xl border border-white/[0.08] shadow-[0_12px_40px_rgba(0,0,0,0.5)] overflow-hidden max-h-[80vh] overflow-y-auto"
             >
-              <button
-                onClick={() => {
-                  setOpen(false);
-                  goLanding();
-                }}
-                className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.04] text-left"
-              >
+              <button onClick={() => { setOpen(false); goLanding(); }} className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.04] text-left">
                 <Home size={14} className="text-accent-light" />
                 <span className="text-[12px] text-slate-300 font-medium">Home</span>
               </button>
-              <button
-                onClick={() => {
-                  setOpen(false);
-                  goCatalogs();
-                }}
-                className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.04] text-left"
-              >
+              <button onClick={() => { setOpen(false); goCatalogs(); }} className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.04] text-left">
                 <FolderOpen size={14} className="text-indigo-400" />
                 <span className="text-[12px] text-slate-300 font-medium">Browse catalogs</span>
+              </button>
+              <button onClick={() => { setOpen(false); goControlPanel(); }} className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.04] text-left">
+                <SlidersHorizontal size={14} className="text-violet-400" />
+                <span className="text-[12px] text-slate-300 font-medium">Control Panel</span>
+              </button>
+              <button onClick={() => { setOpen(false); goDQ(); }} className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.04] text-left">
+                <BarChart3 size={14} className="text-cyan-400" />
+                <span className="text-[12px] text-slate-300 font-medium">Data Quality</span>
+              </button>
+              <button onClick={() => { setOpen(false); goGlossary(); }} className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.04] text-left">
+                <BookOpen size={14} className="text-amber-400" />
+                <span className="text-[12px] text-slate-300 font-medium">Business Glossary</span>
+              </button>
+              <button onClick={() => { setOpen(false); goNotifications(); }} className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.04] text-left">
+                <Bell size={14} className="text-rose-400" />
+                <span className="text-[12px] text-slate-300 font-medium">Notifications</span>
+              </button>
+              <button onClick={() => { setOpen(false); goExport(); }} className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.04] text-left">
+                <Download size={14} className="text-teal-400" />
+                <span className="text-[12px] text-slate-300 font-medium">OpenLineage Export</span>
+              </button>
+              <button onClick={() => { setOpen(false); goRootCause(); }} className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.04] text-left">
+                <Search size={14} className="text-orange-400" />
+                <span className="text-[12px] text-slate-300 font-medium">Root Cause Analysis</span>
+              </button>
+              <button onClick={() => { setOpen(false); goBiConsumers(); }} className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.04] text-left">
+                <Monitor size={14} className="text-blue-400" />
+                <span className="text-[12px] text-slate-300 font-medium">BI Consumers</span>
+              </button>
+              <button onClick={() => { setOpen(false); goStreaming(); }} className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-white/[0.04] transition-colors border-b border-white/[0.04] text-left">
+                <Radio size={14} className="text-emerald-400" />
+                <span className="text-[12px] text-slate-300 font-medium">Streaming Topology</span>
               </button>
               {isAdmin && (
                 <a

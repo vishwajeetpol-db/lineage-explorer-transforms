@@ -1,0 +1,264 @@
+"""Shared pytest fixtures for BrickTrace backend tests.
+
+Covers:
+- A9:  Correct API contract testing (wrapped responses, proper params)
+- A14: LOCAL_DEV_ADMIN_EMAIL privilege escalation testing
+- A2:  Admin-gated vs ungated route testing
+- A1:  SQL injection vector testing via crafted inputs
+- C9:  Multi-user App SP visibility testing
+"""
+import os
+import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+# Ensure backend package is importable
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+# Set default test env vars before any backend imports
+os.environ.setdefault("DATABRICKS_WAREHOUSE_ID", "test-warehouse-id")
+os.environ.setdefault("LINEAGE_CATALOG", "test_catalog")
+os.environ.setdefault("LINEAGE_SCHEMA", "test_schema")
+os.environ.setdefault("ADMIN_GROUP_NAME", "admins")
+# Ensure LOCAL_DEV_ADMIN_EMAIL is NOT set by default (A14 security)
+os.environ.pop("LOCAL_DEV_ADMIN_EMAIL", None)
+
+# Point the Databricks SDK at a dead loopback address, and away from any real
+# ~/.databrickscfg, so an UNMOCKED warehouse call fails fast instead of reaching a
+# live workspace.
+#
+# DATABRICKS_WAREHOUSE_ID above is fake but TRUTHY, so every `if not WAREHOUSE_ID:`
+# guard passes and execution continues to `_get_client()`. With no host in the env
+# the SDK fell back to the developer's ~/.databrickscfg — so any code path whose SQL
+# helper wasn't patched issued a real API call against the developer's own
+# workspace. On a machine with credentials that call blocks on connect/retry, which
+# is why several test files hung indefinitely mid-suite (test_routes_impact,
+# test_routes_scalability, test_coverage_topups): each mocks the SQL helper its
+# route calls directly, but the capability-cache layer added later has its own
+# helper that stayed unmocked. On a credential-less CI box the same tests "passed"
+# only because the call failed immediately.
+#
+# setdefault, so an integration run that exports real credentials is unaffected.
+os.environ.setdefault("DATABRICKS_HOST", "http://127.0.0.1:1")
+os.environ.setdefault("DATABRICKS_TOKEN", "not-a-real-token")
+os.environ.setdefault("DATABRICKS_AUTH_TYPE", "pat")
+os.environ.setdefault("DATABRICKS_CONFIG_FILE", "/dev/null")
+
+
+@pytest.fixture(autouse=True)
+def _reset_global_state():
+    """Reset module-level singletons/caches between tests.
+
+    The FastAPI `app` and several module globals are process-wide singletons
+    shared by every TestClient. Without a reset, state leaks across test files:
+      * the RateLimitMiddleware's per-user request buckets accumulate — after
+        RATE_LIMIT_MAX_REQUESTS (60) anonymous requests every later test gets a
+        spurious 429 (this was the main cause of order-dependent failures);
+      * a stale `_user_info_cache` entry can make requests resolve to the wrong
+        identity.
+    Clearing these keeps each test hermetic regardless of file order.
+    Best-effort: any missing attribute is ignored.
+    """
+    def _reset():
+        # Rate-limiter request buckets on the (lazily built) middleware stack.
+        try:
+            import backend.main as _m
+            node = getattr(_m.app, "middleware_stack", None)
+            while node is not None:
+                reqs = getattr(node, "requests", None)
+                if isinstance(reqs, dict):
+                    reqs.clear()
+                node = getattr(node, "app", None)
+        except Exception:
+            pass
+        # User-info auth cache.
+        try:
+            import backend.main as _m
+            if hasattr(_m, "_user_info_cache"):
+                _m._user_info_cache.clear()
+        except Exception:
+            pass
+        # Lineage LRU + cost globals — leaking these makes later tests' fetch
+        # paths serve from cache (not execute), deflating that module's coverage.
+        try:
+            import backend.lineage_service as _ls
+            _ls.invalidate_cache()
+            for attr in ("_cost_by_job_id", "_cost_by_pipeline_id"):
+                d = getattr(_ls, attr, None)
+                if isinstance(d, dict):
+                    d.clear()
+            if hasattr(_ls, "_cost_cache_fetched_at"):
+                _ls._cost_cache_fetched_at = 0.0
+        except Exception:
+            pass
+        # Build-service globals: the per-table build lock and the source-access
+        # latch. Both are process-wide. test_cache_service calls the REAL
+        # submit_build_job with a MagicMock client, whose workspace.get_status
+        # auto-succeeds — latching whatever path it resolved, so a later test
+        # asserting the preflight actually probes would pass vacuously depending on
+        # file order. A leaked _build_locks entry likewise makes a later build for
+        # the same FQN raise "already in progress".
+        try:
+            import backend.build_service as _bs
+            _bs._reset_source_access_cache()
+            _bs._build_locks.clear()
+            _bs._reset_build_budget()
+        except Exception:
+            pass
+        # Admission-control counters, the cache hit buffer, and the LLM call budget.
+        # All module-global and all cheap to reset; leaking any of them makes a later
+        # test's assertion depend on how many tests ran before it.
+        try:
+            import backend.warehouse_gate as _wg
+            _wg.reset_stats()
+            _wg.clear_request_context()
+        except Exception:
+            pass
+        try:
+            import backend.cache_service as _cs
+            _cs._reset_hit_buffer()
+        except Exception:
+            pass
+        try:
+            import backend.server.llm as _llm
+            _llm._reset_llm_budget()
+        except Exception:
+            pass
+
+    _reset()   # before the test
+    yield
+    _reset()   # and after
+
+
+@pytest.fixture(autouse=True)
+def _never_build_a_real_workspace_client():
+    """Safety net: no unit test may construct a real WorkspaceClient.
+
+    The client fixtures below patch `backend.lineage_service._get_client`, but
+    several modules bind that function BY VALUE at import time —
+    `from backend.lineage_service import _get_client`, e.g.
+    backend/server/capability_cache.py:35 — so the patched attribute on the
+    lineage_service module is never consulted by them. Those callers built a REAL
+    client, which resolves OAuth host metadata over the network and retries with
+    backoff (`databricks/sdk/clock.py: sleep`).
+
+    That is what hung the suite mid-run: `GET /api/impact` and friends go through
+    capability_cache.serve_or_compute, whose `_sql` helper is not the one the test
+    mocked, so the request left the process. On a developer machine with a
+    ~/.databrickscfg it blocked indefinitely against the real workspace; on a
+    credential-less box the same tests "passed" only because the call failed fast.
+
+    Patching the CLASS that _get_client instantiates covers every caller whatever
+    its import style, and clearing the module singleton keeps a real client from an
+    earlier test out of later ones. Tests that want to assert on the client keep
+    using mock_workspace_client / the *_client fixtures; this only removes the
+    ability to reach the network.
+    """
+    import backend.lineage_service as ls
+    ls._client_instance = None
+    # SdkConfig too, not just WorkspaceClient. `Config.__init__` resolves auth/OIDC
+    # metadata against the host over the NETWORK, so constructing one with a fake host
+    # blocks until it gives up — the same hang this fixture exists to prevent, one
+    # layer down. It went unnoticed because the only pre-existing SdkConfig call site
+    # (main._get_user_info) is patched wholesale by the client fixtures.
+    #
+    # A namespace, not a MagicMock: tests assert on what was passed (cfg.token,
+    # cfg.host), and a MagicMock would make every such assertion silently pass.
+    def _fake_config(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    with patch.object(ls, "WorkspaceClient", MagicMock()), \
+         patch.object(ls, "SdkConfig", _fake_config):
+        yield
+    ls._client_instance = None
+    ls._reset_user_clients()
+
+
+@pytest.fixture
+def mock_workspace_client():
+    """Mock WorkspaceClient for all tests that need SDK access."""
+    with patch("backend.lineage_service._get_client") as mock_fn:
+        client = MagicMock()
+        mock_fn.return_value = client
+        yield client
+
+
+@pytest.fixture
+def mock_execute_sql():
+    """Patch _execute_sql at module level for routes that define it locally."""
+    with patch("backend.routes.impact._execute_sql") as mock_fn:
+        mock_fn.return_value = []
+        yield mock_fn
+
+
+@pytest.fixture
+def mock_feature_flags_sql():
+    """Patch SQL execution for feature flags module."""
+    with patch("backend.feature_flags._execute_sql") as mock_fn:
+        mock_fn.return_value = []
+        yield mock_fn
+
+
+@pytest.fixture
+def app_client():
+    """FastAPI TestClient for integration-style route tests (unauthenticated).
+
+    No x-forwarded-access-token header — simulates anonymous App access.
+    Without LOCAL_DEV_ADMIN_EMAIL, user is (None, False) = non-admin.
+    """
+    from fastapi.testclient import TestClient
+    with patch("backend.lineage_service._get_client") as mock_fn:
+        mock_fn.return_value = MagicMock()
+        from backend.main import app
+        with TestClient(app) as client:
+            yield client
+
+
+@pytest.fixture
+def admin_client():
+    """FastAPI TestClient with admin identity (A2: admin-gate tests).
+
+    Mocks _get_user_info to return an admin user so admin-gated routes
+    can be tested for correct behavior when authorized.
+    """
+    from fastapi.testclient import TestClient
+    with patch("backend.lineage_service._get_client") as mock_fn:
+        mock_fn.return_value = MagicMock()
+        with patch("backend.main._get_user_info", return_value=("admin@test.com", True)):
+            from backend.main import app
+            with TestClient(app) as client:
+                yield client
+
+
+@pytest.fixture
+def non_admin_client():
+    """FastAPI TestClient with non-admin identity (A2: admin-gate tests).
+
+    Mocks _get_user_info to return a regular user so admin-gated routes
+    can be tested to confirm they reject non-admins with 403.
+    """
+    from fastapi.testclient import TestClient
+    with patch("backend.lineage_service._get_client") as mock_fn:
+        mock_fn.return_value = MagicMock()
+        with patch("backend.main._get_user_info", return_value=("user@test.com", False)):
+            from backend.main import app
+            with TestClient(app) as client:
+                yield client
+
+
+@pytest.fixture
+def local_dev_admin_client():
+    """FastAPI TestClient with LOCAL_DEV_ADMIN_EMAIL set (A14 vuln test).
+
+    Simulates the dangerous condition where LOCAL_DEV_ADMIN_EMAIL is
+    accidentally set on a deployed App, granting admin to everyone.
+    """
+    from fastapi.testclient import TestClient
+    with patch.dict(os.environ, {"LOCAL_DEV_ADMIN_EMAIL": "dev@test.com"}):
+        with patch("backend.lineage_service._get_client") as mock_fn:
+            mock_fn.return_value = MagicMock()
+            from backend.main import app
+            with TestClient(app) as client:
+                yield client

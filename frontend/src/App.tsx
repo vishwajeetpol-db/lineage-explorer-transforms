@@ -3,16 +3,25 @@ import { ReactFlowProvider } from "reactflow";
 import Toolbar from "./components/layout/Toolbar";
 import LineageCanvas from "./components/graph/LineageCanvas";
 import AdminDashboard from "./components/AdminDashboard";
+import ControlPanel from "./components/control-panel/ControlPanel";
 import Landing from "./components/landing/Landing";
 import GlobalSearch from "./components/landing/GlobalSearch";
 import LineagePreview from "./components/lineage/LineagePreview";
 import TransformPanel from "./components/transform/TransformPanel";
+import { DQMetricsPanel } from "./components/DQMetricsPanel";
+import { GlossaryPanel } from "./components/GlossaryPanel";
+import { NotificationsPanel } from "./components/NotificationsPanel";
+import { ExportPanel } from "./components/ExportPanel";
+import { RootCauseWizard } from "./components/RootCauseWizard";
+import TableLineageWorkspace from "./components/table-lineage/TableLineageWorkspace";
+import { BiConsumersPanel } from "./components/BiConsumersPanel";
+import { StreamingTopologyPanel } from "./components/StreamingTopologyPanel";
 import CatalogListView from "./components/browse/CatalogListView";
 import SchemaListView from "./components/browse/SchemaListView";
 import TableListView from "./components/browse/TableListView";
 import { useLineageStore } from "./store/lineageStore";
 import { api, setLiveMode } from "./api/client";
-import { useRouter, goLineage } from "./hooks/useRouter";
+import { useRouter, goLineage, goLanding } from "./hooks/useRouter";
 import { useRecents } from "./hooks/useRecents";
 
 const TABLE_LOAD_MAX_RETRIES = 3;
@@ -35,6 +44,28 @@ export default function App() {
     api.getUserInfo()
       .then((info) => useLineageStore.getState().setIsAdmin(info.isAdmin))
       .catch(() => useLineageStore.getState().setIsAdmin(false));
+  }, []);
+
+  // R5: Check system-table / SP-grant health on mount and surface as a banner
+  useEffect(() => {
+    api.getHealth()
+      .then((h) => {
+        const sh = h.system_health;
+        if (!sh.system_tables_available) {
+          useLineageStore.getState().setHealthWarning(
+            "System tables unavailable — lineage data cannot be fetched. " +
+            "Ensure the service principal has SELECT on system.access.table_lineage."
+          );
+        } else if (!sh.sp_grants_valid) {
+          const missing = sh.missing_grants.join(", ");
+          useLineageStore.getState().setHealthWarning(
+            `Service-principal grants incomplete. Missing: ${missing}`
+          );
+        } else {
+          useLineageStore.getState().setHealthWarning(null);
+        }
+      })
+      .catch(() => { /* health check failure is non-blocking */ });
   }, []);
 
   // Load all tables on mount with retry (transient failures only — 4xx aren't retried)
@@ -91,6 +122,7 @@ export default function App() {
         fetchDurationMs: data.fetch_duration_ms,
         lineageWindowDays: data.lineage_window_days,
         truncated: data.truncated,
+        graphWarnings: data.graph_warnings ?? null,
       });
     } catch (err: any) {
       if (err?.name === "AbortError") return;
@@ -113,12 +145,17 @@ export default function App() {
       useLineageStore.getState().setLineageData({
         nodes: data.nodes,
         edges: data.edges,
+        // Precise (source_table → target_table) pairs. Without forwarding these the
+        // store resets tableEdges to [], and business "Data only" falls back to
+        // cross-producting each entity's inputs × outputs — the dense mesh.
+        tableEdges: data.table_edges ?? [],
         cached: data.cached,
         cachedAt: data.cached_at,
         cacheExpiresAt: data.cache_expires_at,
         fetchDurationMs: data.fetch_duration_ms,
         lineageWindowDays: data.lineage_window_days,
         truncated: data.truncated,
+        graphWarnings: data.graph_warnings ?? null,
       });
     } catch (err: any) {
       if (err?.name === "AbortError") return;
@@ -150,6 +187,9 @@ export default function App() {
         store.enterScopeLineage("catalog", route.catalog, "");
         fetchLineage(route.catalog, "");
       }
+    } else if (route.view === "tableLineage") {
+      // The Table Lineage workspace owns its own graph loading (via the tree
+      // selection); don't let the route-sync effect clear focusTable here.
     } else if (store.focusTable) {
       store.setFocusTable(null);
     }
@@ -189,6 +229,75 @@ export default function App() {
       );
     }
     return <AdminDashboard open={true} onClose={() => window.close()} />;
+  }
+
+  if (route.view === "controlPanel") {
+    // Readable by any authenticated user — toggles are admin-gated inside the
+    // panel itself (see FeatureToggleCard), so a non-admin can still see what
+    // capabilities exist and their access requirements.
+    return <ControlPanel open={true} onClose={goLanding} />;
+  }
+
+  if (route.view === "dq") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        <DQMetricsPanel tableFqn={route.table} />
+      </div>
+    );
+  }
+
+  if (route.view === "glossary") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        <GlossaryPanel />
+      </div>
+    );
+  }
+
+  if (route.view === "notifications") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        <NotificationsPanel />
+      </div>
+    );
+  }
+
+  if (route.view === "export") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        {/* catalog/schema are required — the capture endpoint rejects an empty
+            scope, so mounting without them made "Capture Now" always 400. */}
+        <ExportPanel catalog={catalog} schema={schema} />
+      </div>
+    );
+  }
+
+  if (route.view === "rootCause") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        <RootCauseWizard />
+      </div>
+    );
+  }
+
+  if (route.view === "biConsumers") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        <BiConsumersPanel />
+      </div>
+    );
+  }
+
+  if (route.view === "streaming") {
+    return (
+      <div className="h-screen w-screen bg-surface overflow-auto">
+        <StreamingTopologyPanel />
+      </div>
+    );
+  }
+
+  if (route.view === "tableLineage") {
+    return <TableLineageWorkspace initialTable={route.table} />;
   }
 
   if (route.view === "lineage" || route.view === "schemaLineage" || route.view === "catalogLineage") {

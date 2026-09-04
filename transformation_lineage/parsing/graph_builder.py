@@ -62,17 +62,34 @@ _CATEGORY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 
 
 def _classify_transform(expr: str) -> str:
-    """Return a short category tag for a transformation expression."""
+    """Return a short category tag for a transformation expression.
+
+    Classify by the PRIMARY (final) operation only. A step-wise expression
+    (see `_build_step_expr`) is a numbered list ending with the output column's
+    own expression — e.g.
+
+        Step 1: completed_revenue = sum(when(...))
+        Step 2: refunded_amount = sum(when(...))
+        Step 3: net_revenue = completed_revenue - refunded_amount
+
+    The category should reflect the FINAL step (`net_revenue = … - …` →
+    arithmetic), not the intermediate `sum(...)` steps. For a single-line expr
+    the whole thing is the primary op.
+    """
     if not expr:
         return "unknown"
-    stripped = expr.strip()
+    lines = [ln for ln in expr.split("\n") if ln.strip()]
+    primary = lines[-1] if lines else expr
+    # Drop a leading `Step N: <name> = ` label so patterns match the expression.
+    primary = re.sub(r"^\s*Step\s+\d+:\s*[\w.]+\s*=\s*", "", primary)
+    stripped = primary.strip()
     # Pure column reference (e.g. `o.amount`, `col("amount")`, `amount`)
     if re.fullmatch(r"[\w.\"'` ]+", stripped) or re.fullmatch(
         r"(?:col|F\.col)\(\s*[\"'][\w]+[\"']\s*\)", stripped, re.IGNORECASE
     ):
         return "projection"
     for pat, cat in _CATEGORY_PATTERNS:
-        if pat.search(expr):
+        if pat.search(primary):
             return cat
     return "other"
 

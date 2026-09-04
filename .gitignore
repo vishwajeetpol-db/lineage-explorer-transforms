@@ -1,10 +1,21 @@
 frontend/node_modules/
 .venv/
+.venv*/
+venv/
+venv*/
 __pycache__/
 *.pyc
 *.png
 ss_*
 screenshot_*
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
 
 # Sensitive / local files
 worspace_details_access_tokens
@@ -33,3 +44,5 @@ generate_stress_test.py
 # Databricks local state
 .databricks/
 .claude/
+.isaac/
+frontend/coverage/

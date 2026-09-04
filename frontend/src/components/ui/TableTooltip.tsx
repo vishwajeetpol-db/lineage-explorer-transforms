@@ -37,7 +37,7 @@ function TableTooltip({ node, position, onMouseEnter, onMouseLeave }: Props) {
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
     >
-      <div className="rounded-xl overflow-hidden border border-white/[0.08] shadow-[0_16px_48px_rgba(0,0,0,0.6),0_0_0_1px_rgba(255,255,255,0.04)] backdrop-blur-2xl bg-[#13131F]/90 min-w-[270px]">
+      <div className="rounded-xl overflow-hidden border border-white/[0.08] shadow-[0_16px_48px_rgba(0,0,0,0.35),0_0_0_1px_rgba(255,255,255,0.04)] backdrop-blur-2xl bg-surface-50/90 min-w-[270px]">
         {/* Header — full name is selectable so it can be copied */}
         <div className="px-4 pt-3.5 pb-2">
           <div className="font-mono font-semibold text-[14px] text-white tracking-tight select-text">

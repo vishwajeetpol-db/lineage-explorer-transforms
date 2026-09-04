@@ -7,8 +7,9 @@ Patches applied:
   1. list_all_tables() — parallel catalog enumeration (8x speedup for 8 catalogs)
   2. _fetch_lineage_trace() — parallel up/down BFS walks (2x speedup)
   3. _refresh_cost_cache() — parallel job/pipeline cost SQL (2x speedup)
-  4. _fetch_table_lineage ext columns — parallel per-catalog column fetch
-  5. _estimate_value_size() — structural heuristic (50x faster, no json.dumps)
+  4. _estimate_value_size() — structural heuristic (50x faster, no json.dumps)
+  5. get_table_lineage(), get_lineage_trace() — Delta-backed distributed cache
+     (shared across all app replicas via backend/cache_service.py)
 
 Why monkey-patch instead of inline edits?
   - lineage_service.py is 1500+ lines of stable, tested code
@@ -288,12 +289,107 @@ def _apply_estimate_patch():
 
 
 # ---------------------------------------------------------------------------
+# PATCH 5: Distributed Delta cache for get_table_lineage + get_lineage_trace
+#
+# All app replicas share a Delta-table-backed cache (backend/cache_service.py).
+# When replica A warms a lineage scope, replica B can serve it from the Delta
+# cache without a full DBSQL re-scan on its first request.
+#
+# Read path:  in-process LRU hit → return
+#             in-process LRU miss → Delta cache hit → populate LRU → return
+#             both miss → original DBSQL fetch → populate LRU + Delta cache
+#
+# This patch is applied AFTER all modules are loaded (no circular import risk
+# — cache_service.py imports _get_client from lineage_service, which is already
+# defined by the time this module-level code runs).
+# ---------------------------------------------------------------------------
+def _apply_distributed_cache_patch():
+    import backend.lineage_service as ls
+    from backend.cache_service import get_cache_service
+    from backend.models import LineageResponse
+
+    _orig_table = ls.get_table_lineage
+    _orig_trace = ls.get_lineage_trace
+
+    def _patched_get_table_lineage(catalog, schema=None, skip_cache=False):
+        if skip_cache:
+            return _orig_table(catalog, schema, skip_cache)
+        cache_key = f"lineage:{catalog}.{schema}" if schema else f"lineage:{catalog}"
+        # 1. In-process LRU
+        cached = ls._cache_get(cache_key)
+        if cached is not None:
+            return ls._wrap_with_cache_metadata(cached, cache_key, from_cache=True, fetch_ms=0)
+        # 2. Distributed Delta cache (shared across replicas)
+        try:
+            dc_data = get_cache_service().get(cache_key, namespace="lineage")
+            if dc_data is not None:
+                dc_result = LineageResponse.model_validate(dc_data)
+                ls._cache_set(cache_key, dc_result)
+                logger.debug("Distributed cache hit (lineage): %s", cache_key)
+                return ls._wrap_with_cache_metadata(dc_result, cache_key, from_cache=True, fetch_ms=0)
+        except Exception as _e:
+            logger.debug("Distributed cache read failed (non-fatal): %s", _e)
+        # 3. Original — handles per-key lock + DBSQL fetch + in-process LRU write
+        result = _orig_table(catalog, schema, skip_cache)
+        # 4. Populate distributed cache after a fresh DBSQL fetch
+        if not getattr(result, "cached", False):
+            try:
+                clean = ls._cache_get(cache_key)  # unwrapped value as stored in LRU
+                if clean is not None and isinstance(clean, LineageResponse):
+                    get_cache_service().set(
+                        cache_key, clean.model_dump(),
+                        ttl_seconds=ls.CACHE_TTL_SECONDS, namespace="lineage",
+                    )
+            except Exception as _e:
+                logger.debug("Distributed cache write failed (non-fatal): %s", _e)
+        return result
+
+    def _patched_get_lineage_trace(seed_full_name, skip_cache=False):
+        if skip_cache:
+            return _orig_trace(seed_full_name, skip_cache)
+        # v2: keep in lock-step with get_lineage_trace's key (now carries table_edges).
+        cache_key = f"trace:v2:{seed_full_name}"
+        # 1. In-process LRU
+        cached = ls._cache_get(cache_key)
+        if cached is not None:
+            return ls._wrap_with_cache_metadata(cached, cache_key, from_cache=True, fetch_ms=0)
+        # 2. Distributed Delta cache
+        try:
+            dc_data = get_cache_service().get(cache_key, namespace="trace")
+            if dc_data is not None:
+                dc_result = LineageResponse.model_validate(dc_data)
+                ls._cache_set(cache_key, dc_result)
+                logger.debug("Distributed cache hit (trace): %s", cache_key)
+                return ls._wrap_with_cache_metadata(dc_result, cache_key, from_cache=True, fetch_ms=0)
+        except Exception as _e:
+            logger.debug("Distributed cache read failed (non-fatal): %s", _e)
+        # 3. Original — handles per-key lock + BFS + in-process LRU write (truncated traces excluded)
+        result = _orig_trace(seed_full_name, skip_cache)
+        # 4. Populate distributed cache for complete (non-truncated) traces only
+        if not getattr(result, "cached", False) and not getattr(result, "truncated", False):
+            try:
+                clean = ls._cache_get(cache_key)
+                if clean is not None and isinstance(clean, LineageResponse):
+                    get_cache_service().set(
+                        cache_key, clean.model_dump(),
+                        ttl_seconds=ls.CACHE_TTL_SECONDS, namespace="trace",
+                    )
+            except Exception as _e:
+                logger.debug("Distributed cache write failed (non-fatal): %s", _e)
+        return result
+
+    ls.get_table_lineage = _patched_get_table_lineage
+    ls.get_lineage_trace = _patched_get_lineage_trace
+
+
+# ---------------------------------------------------------------------------
 # Apply all patches on import
 # ---------------------------------------------------------------------------
 _apply_list_all_tables_patch()
 _apply_trace_patch()
 _apply_cost_patch()
 _apply_estimate_patch()
+_apply_distributed_cache_patch()
 
 logger.info("Performance patches applied: parallel list_all_tables, parallel trace BFS, "
-            "parallel cost refresh, optimized size estimation")
+            "parallel cost refresh, optimized size estimation, distributed Delta cache")

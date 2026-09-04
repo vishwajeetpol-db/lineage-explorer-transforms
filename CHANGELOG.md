@@ -1,203 +1,456 @@
 # Changelog
 
-All notable changes to NEXUS Lineage are documented in this file.
+All notable changes to BrickTrace are documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [2.3.0] - 2026-07-14
+## [Unreleased]
 
-> Adds **transformation lineage diagnostics** — when a build materialises nothing the app now explains *why* (no producer found, producer outside the discovery window, producer source unreadable) instead of a generic "not generated yet". Also aligns the producer-discovery window to 1 year across all entry points and adds TTL caching to the new diagnostic path.
-
-### Added
-
-- **`GET /api/transform/diagnose`** — new endpoint that explains why a table has no transformation lineage after a build. Inspects `system.access.column_lineage` for the table's producer history relative to the discovery window, plus the most recent extraction report, and returns one of four actionable reason codes: `no_producer` (source/base table with no tracked writer), `producer_outside_window` (writer existed but last ran before the lookback cutoff), `producer_unresolved` (recent writer found but parsing failed), `unknown` (system.access unreadable).
-- **`TransformDiagnosis` Pydantic model** (`backend/models.py`) — structured response carrying `reason_code`, `title`, `detail`, `last_produced_at`, `days_ago`, `in_window`, and `skip_reasons`; consumed by the diagnose endpoint and the frontend empty-state panel.
-- **`diagnose_missing_lineage()`** (`backend/transform_service.py`) — service function backing the endpoint. Results are cached via the shared `_transform_cached_fetch` TTL cache so repeated UI polls don't re-hit `system.access.column_lineage`.
-- **`_latest_extraction_skip_reasons()`** (`backend/transform_service.py`) — best-effort helper that reads the most recent `lineage_extraction_reports` row and surfaces skip-reason keys (e.g. `no_resolvable_tasks`) to refine the diagnostic message.
-- **`DISCOVERY_LOOKBACK_HOURS` module constant** (`backend/transform_service.py`, `backend/build_service.py`) — mirrors the build's discovery window (default `8760` h = 1 year, overridable via env var) so the diagnose endpoint and build always share the same window definition.
-
-### Changed
-
-- **Discovery lookback window aligned to 1 year across all entry points** — `notebooks/run_pipeline` notebook default raised from `1080` h (45 d) to `8760` h; `transformation_lineage/config.py` `discovery_lookback_hours` raised from `24` h to `8760` h. Previously a direct/manual pipeline run without a widget override would silently find no producers for tables written on a quarterly or monthly schedule.
-- **`DISCOVERY_LOOKBACK_HOURS` forwarded to the build job** — `build_service.py` now passes the env-var value as a `base_parameters` entry so app-triggered builds respect the same window as the diagnose endpoint.
-
-### Fixed
-
-- **Tautological diagnostic title when date parsing fails** — if `system.access.column_lineage` returns a `last_produced` timestamp that `fromisoformat` cannot parse, `days_ago` stays `None` and the previous title read "Producer last ran outside the window — outside the X-day window". Title is now built conditionally: known age → "Producer last ran N days ago — outside the X-day window"; unknown age → "Producer last ran outside the X-day discovery window".
-
----
-
-## [2.2.0] - 2026-06-29
-
-> Matures the **expression-level transformation lineage** engine — the app's defining capability: reconstruct the actual SQL/PySpark expression behind every column (not just UC's dependency edges), across every producer type. Adds multi-entity-type coverage, the dedicated app-owned store, opt-in builds, admin invalidate controls, and a battery of correctness fixes verified against UC `column_lineage`. Docs (README, ARCHITECTURE, DESIGN, REFERENCE) brought current with the code.
+> **Branch scope.** This work now lives on `feature/anomaly-detection`, which merged all of
+> `feature/table-lineage-workspace` (branched from `main` at `df858f9` on **2026-06-18**) and
+> continues on top of it. It covers the combined BrickTrace application, the Table Lineage
+> workspace, on-demand transformation lineage, the backend/frontend test suites and their
+> coverage gates, the security hardening below, the enterprise-readiness pass, and the
+> notification auto-scan + deep-analysis fixes recorded below.
 
 ### Added
 
-- **On-demand, opt-in transformation lineage** — clicking a column no longer auto-builds. UC column lineage is the free default; the transformation popup offers an explicit **Generate** action with a compute-cost warning. Adds `needs_build` + empty-state panel states.
-- **Multi-entity-type column transformation lineage** — beyond notebook/python-file jobs: **SQL-file tasks** (resolver `sql_task` branch); **materialized views, views, streaming tables, and SQL-defined DLT** via new **definition-based resolution** (parse the object's own `SHOW CREATE TABLE` — no discovery, no system-table lineage lag); **Lakeflow/DLT pipelines** via `PIPELINE` discovery + `pipelines.get` library resolver.
-- **Dedicated app-owned lineage store (Option A)** — all transformation edges materialize into one fixed `LINEAGE_CATALOG.LINEAGE_SCHEMA` store owned by the app service principal; node-ids carry the real data catalog, so the app SP needs **zero write** on any data catalog.
-- **Empty-state** for columns with no transformation lineage (external/shared source, unsupported producer, or not yet generated) — replaces the misleading blank-but-green popup.
-- **Admin "Invalidate transformation lineage" controls** — the admin dashboard now has *Flush cache* (clear in-memory freshness/edges/trace caches, no data loss) and *Wipe lineage* (delete all stored transformation-lineage tables so everything shows "not built" and rebuilds fully re-parse; the expensive audit-path and LLM-expression caches are retained). New admin-gated `POST /api/transform/invalidate?scope=cache|table|all` endpoint + `clear_transform_lineage()`.
-- **`FORCE_REPARSE` build flag** — a forced "Regenerate" / clear-and-rebuild now bypasses the content-version early-termination so the parser actually re-runs on byte-identical sources (previously a regenerate of unchanged content silently no-op'd). Threaded config → run_pipeline → build_service (`force_rebuild ⇒ force_reparse`).
-- **Query-history fallback resolver** — tables with no tracked producing entity (`entity_type = NULL`: ad-hoc SQL, SQL editor, scripts) are now recovered from `system.query.history` by matching the most recent FINISHED write statement whose parsed output is the target table. Degrades gracefully (`no_producing_query` skip) when the service principal can't see the producing query (query history is identity-scoped — needs broad query-history visibility to cover other users' ad-hoc tables).
-- **Persistent build control in the transformation panel header** — the "Generate / Regenerate" button is now always visible: enabled when lineage is missing or stale, and **grayed when already built** (so it's clear it exists) while still allowing a force-rebuild. Previously the button only appeared in the not-built state, so an already-built table showed no build affordance at all.
+- **Notification auto-scan (background scheduler).** Notifications were only ever created by a manual admin scan, so on a fresh deploy the table stayed empty and the home screen hid Recent Activity. A periodic detection scan now runs on a timer from the app lifespan (an `asyncio` task, like the cost prefetch): an initial delay, then a scan every interval, cancelled cleanly on shutdown. It runs entirely off the request path via `asyncio.to_thread`, so the UI only ever *reads* notifications — screen render is never blocked by or waiting on a scan. Env-tunable: `NOTIFICATION_AUTOSCAN_ENABLED` (default on), `NOTIFICATION_SCAN_INTERVAL_SECONDS` (default 6h), `NOTIFICATION_SCAN_INITIAL_DELAY_SECONDS` (default 90s). (`_autoscan_loop` in `backend/routes/notifications.py`, started from `backend/main.py`'s lifespan.)
+- **Notification retention cap.** After each scan that inserts, the table is pruned to the most recent `NOTIFICATION_RETENTION_MAX` notifications (default 200; `0` = off). The detectors use `LIMIT` without a stable ordering, so successive scans surface different slices of the same underlying data; dedup alone can't hold the count flat, and the cap keeps the table (and Recent Activity) bounded and meaningful. Best-effort/fail-open. (`_prune_notifications`.)
+
+- **Business view for Table Lineage** — a canvas toggle (**Technical ⇄ Business**, top-left of the graph) that flips the detailed engineering lineage into a plain-language lens for non-engineers, instantly and with no backend call. It relabels technical types into business terms (JOB → "Process", PIPELINE → "Data pipeline", NOTEBOOK → "Code step", VIEW → "View", MATERIALIZED_VIEW/MANAGED/EXTERNAL → "Dataset", STREAMING_TABLE → "Live dataset", VOLUME/PATH → "File"), humanizes `snake_case` names (`orders_curated` → "Orders Curated"), shows a one-line plain-English description per dataset (its curator comment, or a "built from N sources, feeding M consumers" summary), and hides engineering detail (fully-qualified names, column-level edges, job/pipeline IDs, per-run cost, health popovers). The preference persists across sessions. (`frontend/src/lib/businessView.ts`, `businessView` in `lineageStore`.)
+  - **Data-only vs Data + processing** — a sub-toggle in business view chooses whether to show just the datasets and how they connect, or the datasets plus the processing steps (jobs/pipelines) that move data between them. "Data only" hides all processing nodes and bridges the flow so the picture stays connected; either way the noisiest ad-hoc query nodes are dropped.
+  - **AI "Explain this lineage" lightbulb** — a bulb button (business view) opens a modal with an AI-generated, plain-English explanation of the *current* on-screen graph: an overall summary plus an ordered "source → process → output" walkthrough. Stateless — the frontend posts the visible (business-view) nodes/edges so the narrative matches exactly what's shown. New `POST /api/lineage/explain` (`explain_lineage_graph()` in `llm.py`); results are cached per view for the session and can be regenerated.
+
+- **Column Transformation panel restructured into tabs** — one long scroll became a compact source header (label · version · column count, with an ⓘ precedence-legend toggle) plus **Columns / Analyze / History / Producers** tabs. Columns holds the transformation cards + a filter box (shown when >6 columns), CDC detail, and the access-denied notice; Analyze holds the producer picker + model + (Re-)analyze; History holds the version list, view-a-version, and cross-source diff; Producers holds the multi-producer divergence matrix (auto-runs when 2+ producers write the table). The panel opens wider (460px).
+- **AI overview of column transformations** — a new portaled master–detail modal (`ColumnOverviewModal`) gives a plain-English LLM summary of what the table's transformations do plus a per-column explanation, alongside a lineage-graph-style source→transform→target graphic. Backed by `POST /api/column-transformations/overview` (`explain_transformations()` in `llm.py`, cached per table via the shared capability cache).
+- **Deep framework analysis for metadata-driven pipelines** — when normal analysis finds no column logic (a generic, config-driven ETL engine), an agentic streaming (NDJSON) second pass detects the config mechanism from the source, reads the producer's parameters, queries the identified config table(s), and derives per-column transformations from that config — narrating each step. New `backend/server/framework_analysis.py` + `POST /api/column-transformations/deep-analyze`.
+- **Existing lineage surfaced on open** — when the Column Transformation panel opens without a producer picked, `analysis_store.get_latest_for_table()` finds the newest stored analysis across ANY producer and surfaces it (labelled with its producer), instead of showing a contradictory "No lineage yet".
+- **Maroon collapsible rails + colour-coded panels** — the catalog tree and home sidebar are now a deep-maroon collapsible rail (collapses to a slim icon rail); each capability panel gets its own accent identity (coloured top edge + tinted header + icon chip), home tiles match, and panels can be minimized to a dock of chips pinned to the screen bottom. Light-mode legibility tightened (darkened slate ramp + scoped accent-text remaps).
+
+- **Architecture reference (`docs/bricktrace_architecture.html`).** A standalone diagrammed
+  walkthrough of the app: the request path from the React SPA through FastAPI to Unity Catalog
+  system tables, where the distributed cache and circuit breaker sit, and how on-demand
+  transformation lineage is built and stored. The product-overview PDF
+  (`docs/BrickTrace_Product_Overview.pdf`) and `docs/bricktrace_capabilities.html` were
+  refreshed alongside it.
 
 ### Changed
 
-- **Transformation popup UX** — target column rendered on top with upstream cascading down; `fitView` zoom capped (small graphs no longer magnified ~3×); persistent zoom-stable edge labels (category + expression, no hover required); responsive canvas height. **Removed the depth slider** — the popup always shows the selected column's full end-to-end transformation lineage (depth is not a meaningful knob for a single column).
-- **`LINEAGE_WINDOW_DAYS` reconciled to 365** across code + docs, with the producer-staleness semantics documented (the window is max producer staleness before lineage drops off; pair with `event_date` partition pruning to keep a wide window cheap).
-- **Versions reconciled to 2.2.0** — `APP_VERSION`, `frontend/package.json`, and the docs were drifting (1.3.0 / 1.0.0 / 2.1.0); now aligned.
+- **Detection scan now deduplicates.** Detection + insert was refactored into a single shared `run_scan()` used by both the manual `POST /api/notifications/scan` endpoint and the background scheduler. It inserts only notifications not already stored, keyed on their natural identity `(type, table_fqn, column, title)`; the dedup read fails open (an unreadable existing-set never blocks a real alert). Without this, a timer-driven scan would re-insert the same rows every run.
+- **Sensitive-flow detection cross-checks classification.** `_detect_sensitive_flows` flagged *any* PII-named column (`%ssn%`/`%email%`/`%phone%`/`%credit_card%`/`%password%`) flowing downstream, regardless of governance — contradicting its own "without classification" name. It now skips a flow whose **target column already carries a Unity Catalog tag** (`<catalog>.information_schema.column_tags`, checked per target catalog, fail-open), so it surfaces only sensitive data landing somewhere governance hasn't labelled.
+- **Schema-change detection excludes platform + app-owned schemas.** `_detect_schema_changes` flagged `system`, `information_schema`, and the app's own `LINEAGE_CATALOG.LINEAGE_SCHEMA` bookkeeping tables (altered on every deploy), flooding Recent Activity with noise about internal tables. It now restricts to real user data.
+- **`redact_url` moved to `backend/validators.py`.** Two routers return stored URLs — openlineage's producer config and capability_closures' webhook list — and they must not drift apart on what "redacted" means. `capability_closures._redact_url` remains as an alias.
 
-### Fixed
+### Tests & tooling
 
-- **CTE (`WITH ... AS`) resolution in the SQL parser** — outer-query references to a CTE alias (`SELECT cust.total_revenue FROM cust ...`) now resolve *through* the CTE to its base source column (`customer_lifetime_value.lifetime_revenue`), and bare columns inside a CTE attribute to that CTE's own FROM table (not the statement's pooled tables). Previously CTE-based tables (e.g. `gold.executive_summary`) produced only phantom unresolved-external edges. Surfaced by a full scan-and-verify of every built table against UC `column_lineage`; all 15 buildable producers now verify clean.
-- **Cross-column-name edge contamination (edge-endpoints join)** — the serve-table builder matched a derived column's source by **column name** against the artifact's read set. Since a whole notebook shares one transformation node, an output column cross-joined to *every* source table exposing a same-named column (e.g. `gold.customer_orders.customer_id` gained spurious edges from `raw_customers`, `raw_orders`, `fct_orders`). Each derive edge now records its exact resolved source node id and the join pins the source by id — eliminating the cross-join. `order_count` went 7→1 edges, `customer_id` 6→1, etc.
-- **Self-loop edges** — a mis-resolved alias could attribute a column to its own output table (`x.col ← x.col`), rendering as a target with no upstream. Guarded at parse time (graph builder) and filtered at read time.
-- **Duplicate parallel edges** — the BFS now dedups by (source, target) column pair, so a column referenced both bare and alias-qualified renders as one edge, not two.
-- **`sqlparse` pinned to `0.4.4`** in the build job (newer 0.5.x tokenizes multi-statement SQL differently).
-- **Per-table read scoping (regression)** — transformation reads served edges from the single global-latest `pipeline_run_id`. Because each build is scoped to one table, building table B made table A's column lineage vanish (e.g. building the MV blanked `dim_customers.full_name`). Reads now resolve the latest run that actually built the requested table (`dst_fqn`), so every built table stays viewable simultaneously.
-- **Change detection ignored the parser version** — early termination keyed only on source-content SHA, so a deployed parser fix silently no-op'd on byte-identical objects (the streaming-table fixes never re-ran). Added `PARSER_VERSION` folded into the version-check token; bumping it forces a one-time re-parse of all artifacts.
-- **Streaming tables now emit transformation edges** — with the change-detection fix above re-parsing the definition, `STREAM(...)` / single-source streaming tables produce correct column edges (`cast`, `upper`, `concat`, …). Verified end-to-end on `st_orders_norm`.
-- **Python-defined DLT (`@dlt.table` / `@dlt.view`)** — the AST parser now walks decorated dataset functions' return chains and emits column mappings (previously only `saveAsTable` sinks were handled). Also resolves `spark.readStream.table` / `dlt.read` / `dlt.readStream` sources. Verified end-to-end on `dlt_order_enriched`.
-- **SQL parser** — detect `MATERIALIZED VIEW` / `STREAMING [LIVE] TABLE` / `LIVE TABLE` / `VIEW` / `OR REFRESH` output targets; unwrap `STREAM(...)` source reads; resolve unqualified columns against a single known source table.
-- **`run_pipeline`** — `sys.dont_write_bytecode = True` to avoid WSFS `__pycache__` `AsyncFlushFailedException` when importing the package from a Workspace path.
-- **Transform read/build paths** resolve the dedicated lineage store consistently (was deriving the store from the selected table's own schema).
+- **A test bed for every producer type and capability panel (`testbed/`).** The workspace could only exercise part of the app: it had notebook-job producers (the medallion), a materialized view, a streaming table and one Python DLT pipeline — but **no plain VIEW anywhere**, no `sql_task`, no `spark_python_task`, no SQL-defined DLT, no `apply_changes`/SCD2 spec, no table written by two producers with divergent logic, no config-table-driven ETL, no cross-catalog producer, and nothing deliberately failing or slow. `testbed/build_testbed.sh` builds one droppable schema plus 9 jobs and 2 DLT pipelines covering all of it, grants the app SP on the new schema, and triggers the runs (lineage only exists once a producer has actually run). Idempotent, tiered (`--tier 1|2`), with `--dry-run`, `--skip-runs` and `--cleanup`. `testbed/README.md` is the test plan: each fixture, the capability it exercises, and the result to expect. Verified end-to-end against a live workspace — the SCD2 fixture produces 2000 customers × 2 versions with exactly 2000 rows closed out, and the config-driven build renders all 7 column rules.
+  - Three defects in the fixtures were found only by **executing** them, which is the same lesson as the mocked-SQL tests above: `''` is not a quote escape in Databricks (it parses as adjacent string literals and silently drops the quotes, so the `INSERT` succeeds and the stored expression is corrupt — it surfaced later as `UNRESOLVED_COLUMN \`yyyy\``); a column named `` `Order Date` `` needs `delta.columnMapping.mode`; and `DROP COLUMN` needs it too. All three are documented in `testbed/README.md` next to the fixtures they bit.
 
-### Known limitations
+- **The backend suite could not complete, and three broken tests were hiding behind that.** `pytest tests/` hung indefinitely part-way through; the run now finishes in **~5s with 1,728 passing** and coverage at **90.8%**. Two independent causes, both pre-existing:
+  - **Unit tests were reaching the live workspace.** `conftest.py` sets a fake-but-**truthy** `DATABRICKS_WAREHOUSE_ID`, so every `if not WAREHOUSE_ID:` guard passes and execution continues into `_get_client()`. With no host in the environment the SDK fell back to the developer's `~/.databrickscfg` and issued real API calls — resolving OAuth host metadata and retrying with backoff (`databricks/sdk/clock.py: sleep`), which is what blocked. The client fixtures *do* patch `backend.lineage_service._get_client`, but several modules bind that function **by value** at import time (`from backend.lineage_service import _get_client` — e.g. `backend/server/capability_cache.py:35`), so the patch never reached them: `GET /api/impact` and friends route through `capability_cache.serve_or_compute`, whose `_sql` helper was not the one the test mocked. Fixed with an autouse fixture that patches the `WorkspaceClient` **class** `_get_client` instantiates (covering every caller regardless of import style) and clears the module singleton between tests, plus dead-loopback SDK env defaults. A unit test can no longer touch a real workspace at all. Affected `test_routes_impact`, `test_routes_scalability`, `test_coverage_topups` and others; each now runs in under a second.
+  - **A test reloaded a module out from under its own mock.** `test_flag_enabled_when_db_says_true` called `importlib.reload(backend.feature_flags)`, which re-executes the module body and rebinds its `_execute_sql`, discarding the fixture's patch — so `get_flag_state` issued a real `execute_statement`. Its assertion (`result is True or result is False`) also accepted any bool, so it verified nothing even when it completed. Both reload tests in the file now re-patch the reloaded module, and the assertion is exact.
+- **Three tests were failing or non-deterministic before this work, masked by the hang.** `test_platform_filter_allow_listed` genuinely failed in a fresh process (fixed by the validate-before-DDL change above). `test_stored_expression_executes_on_metrics` had been stale since the admin gate landed — it asserted the endpoint *executes* a stored payload; it is now split into a gate test plus one asserting the payload is marked `invalid` and never reaches the warehouse. `test_valid_returns_matrix` left the producer guard's SQL unmocked and passed only when a mock client leaked in from an earlier file; it now mocks the guard, with new siblings covering guard rejection and the fan-out cap.
+- **Tests updated where they pinned the behaviour being fixed, not the intent behind it.** Each of these asserted something the fixes above deliberately change, so the assertion was rewritten rather than the fix weakened — and in every case the replacement pins a stronger property: DQ delete now expects 400 for an injection payload (rejected rather than escaped) and 404 for a missing rule; REGEX keyword-screening is replaced by a test that the payload is *neutralised by escaping*; `upsert_domain`'s owner test now asserts a blank owner does **not** become the caller and adds a seizure test; the producer-config tests split into "omission preserves" and "explicit rotation works", plus gate and redaction tests; and `test_diff_requires_params` no longer accepts any `>= 400`. New regression tests cover the route-order shadow, over-length rule ids, and the non-admin scan reporting a failure instead of an all-clear.
 
-- **Delta Sharing / Lakehouse Federation tables** — transformation lineage is not derivable (the producing code runs in another account); detected and surfaced as an external source. A local notebook that **reads** a shared table into a local table **is** captured (the shared table appears as an upstream source).
+- **The no-real-client safety net had a hole one layer down, and it hung the suite again.** `conftest._never_build_a_real_workspace_client` patches the `WorkspaceClient` class so no unit test can reach the network — but not `SdkConfig`, and `databricks.sdk.core.Config.__init__` resolves auth/OIDC metadata against the host *over the network*, so constructing one with a fake host blocks until it gives up. It went unnoticed because the only pre-existing `SdkConfig` call site (`main._get_user_info`) is patched wholesale by the client fixtures; the first test to build a per-user client for `ENFORCE_USER_IDENTITY` hit it and hung with zero output. The fixture now patches both. It substitutes a `SimpleNamespace` factory rather than a `MagicMock`, because tests assert on what was passed (`cfg.token`, `cfg.host`) and a `MagicMock` would make every such assertion silently pass — the failure mode this file already warns about elsewhere.
+- **Hermeticity reset extended to every new module global.** `_reset_global_state` now also clears the build-source-access latch and build locks, the build budget, the admission-control counters and attribution context, the cache hit buffer, and the LLM per-user call budget. Each is process-wide, and leaking any of them makes a later test's assertion depend on how many tests ran before it — the class of order-dependent failure this fixture exists to prevent.
+- **Backend test coverage raised to a 90%+ gate.** Coverage went from ~38% (with 210 failing tests) to **90.5%** across `backend/` with **0 failing** (1,423 tests). Added `.coveragerc` (`fail_under = 90`, branch mode, scoped to `backend/`, omitting the standalone offline pipeline `transformation_lineage/` + `backend/plan_capture/` capture-cell wheel + `startup.py`/`perf_patches.py` bootstrap). Run: `pytest tests/ -m "not integration" --cov=backend --cov-fail-under=90`.
+- **New unit tests** for every previously-thin module: all `server/*` engines (access, governance, discovery, entities, scd_lineage, column_profiling, schema_change, root_cause, ml, analysis_store, llm) at 97–100%; `lineage_service` (92% isolated), `producer_source` (97%), `transform_service` (92%), `capability_cache`, `observability`, `edge_case_guards`, `cache_service`, `feature_flags`, `federated_sync`, `circuit_breaker`, `validators`, `parallel`; and deep route tests for impact, glossary, dq, ml, diagnostics, snapshots, openlineage, external_sources, pipeline_installer, notifications, scalability, root_cause, plus main.py routes/internals.
+- **Fixed 42 pre-existing broken tests** (stale `_execute_sql`/`_sql` mock targets, out-of-date response-shape and endpoint-param assertions, admin-gate expectations) and a **suite-isolation defect**: the process-wide FastAPI app's rate-limiter buckets + auth cache + lineage LRU/cost globals leaked across tests, causing order-dependent 429s (the main cause of the original mass failure). A `conftest.py` autouse fixture now resets them before/after each test.
+- **Frontend test suite to a 90%+ gate** (Vitest + React Testing Library + jsdom + v8 coverage): **96% lines / 95% statements / 94% functions / 85% branches**, 572 tests. Covers the api client (100%), stores/hooks/lib (100%), and every panel/component (browse, control-panel, landing, layout, transform-non-canvas, ui, table-lineage — including the new `ColumnOverviewModal`). `frontend/vitest.config.ts` sets the thresholds and excludes the graph/canvas rendering layer (React Flow + ELK), the `App.tsx` shell, and dead code; `src/test/setup.ts` shims jsdom gaps (localStorage/matchMedia/ResizeObserver/pointer-capture). Run `cd frontend && npm run coverage`.
+- **Restored the backend gate after the tab/overview/deep-analysis work.** Those features shipped `framework_analysis.py`, new `llm.py` paths, and new lineage routes without tests, which dropped backend coverage to 87.3% and broke 5 tests whose assertions predated the new behaviour. Added `tests/test_server_framework_analysis.py` (framework_analysis 0→100%), extended the `llm.py` tests (`explain_transformations`/`detect_framework_config`/`derive_columns_from_config`/temperature-retry/content-block flattening → 57→97%) and the column-transformation route tests (new `/overview` + `/deep-analyze` → 67→79%), and updated the 5 stale tests. Backend back to **90.5%, 1471 passing / 0 failing**.
 
----
+- **The production build broke the first time it ran after the Vitest suite landed.**
+  `npm run build` is `tsc && vite build`, and `tsconfig.json`'s `include: ["src"]` swept in the
+  `*.test.tsx` files, which fail on `global` with no `@types/node` — so `make build` failed on
+  code that was never shipped. Tests are excluded from the production typecheck; Vitest
+  transpiles them through its own pipeline, so they are still type-checked where it matters.
 
-## [2.1.0] - 2026-06-22
+### Enterprise readiness (load, cost, and the data boundary)
 
-### Fixed
+> An enterprise-architecture review — the customer-side "would I sign off on a
+> company-wide URL" pass rather than a code review — produced 15 findings. Eleven are
+> fixed here; the four deliberately left are listed at the end with the reason. The
+> app was appropriately built for one team on a warm warehouse; each of these is a
+> failure mode that only appears with a few hundred people behind it.
 
-- **CRITICAL: Orphaned polling race** — `closePanel()` could not cancel scheduled `setTimeout`, causing stale poll to re-open panel. Added triple guard in `transformStore.ts`.
-- **CRITICAL: Double-open race** — rapid column clicks caused parallel `openPanel` chains to overwrite each other. Added staleness guard after each await.
-- **BuildSubmitResponse type** — added `'fresh'` status and `message` field to match backend.
-- **F401 lint errors** (10+ files) — removed all unused imports across the codebase.
+- **The distributed cache wrote to Delta on every cache HIT, so it degraded as load rose.** `get()` issued a `SELECT` and then an `UPDATE … SET hit_count = hit_count + 1` against the same table. Delta takes table-level optimistic concurrency, so concurrent readers serialized on commit or retried a concurrent-modification conflict — the hot path of the cache was a write hotspot, which is the opposite of what a cache is for. `hit_count` is now buffered in memory and flushed periodically in ONE batched statement (`CACHE_HIT_FLUSH_INTERVAL_SECONDS`, default 300s), so a hit is exactly one `SELECT`. A failed flush drops counters and never touches the value.
+- **The most expensive graphs were the only ones that never cached.** `MAX_VALUE_BYTES` is 256 KB and `LINEAGE_MAX_NODES` is 2500; a graph near the cap exceeded it, so `set()` returned `False` at debug level and the catalog-wide graph that took 32 statements to build was recomputed on every request by every user, forever — invisible, because the operator saw a healthy hit rate on the small keys that did fit. Payloads are now gzipped before the size check (repetitive graph JSON compresses 5–10×), rows written before compression are still readable via a marker sniff, small payloads stay uncompressed because gzip+base64 grows them, and a value that *still* will not fit logs at **warning**.
+- **Nothing limited concurrent statements between the app's threads and the warehouse.** There was no semaphore, queue or admission gate anywhere on the SQL path, while the app can present ~84 concurrent statements (a 64-thread default executor plus three module pools of 8/8/4, fed from ~145 `asyncio.to_thread` sites) at a warehouse that admits roughly ten per cluster. Worse, a *queued* statement still held the submitting app thread for up to 170s (`SQL_WAIT_TIMEOUT` + `SQL_POLL_MAX_S`), so the app converted warehouse queuing into thread exhaustion and cheap queries timed out behind expensive ones — with no single request looking abusive. New `backend/warehouse_gate.py` is one chokepoint doing three things that all want the same location: a bounded semaphore (`WAREHOUSE_MAX_CONCURRENT_STATEMENTS`, default 8) that sheds with **429 + Retry-After** rather than queuing invisibly; the circuit breaker, which previously existed but was wired into `dq` and `capability_closures` and *not* the lineage path where every heavy query lives; and attribution. Our own shedding is explicitly not counted as a breaker failure, so backpressure cannot escalate into an outage. The known limit — it bounds total concurrency, not per-user fairness — is documented in the module with the counters needed to decide whether it matters.
+- **Warehouse load could not be attributed to a user or an endpoint.** `server/observability.py` is *data* observability (job health), not app observability, and there was no way to answer "which user, which endpoint" when the platform team saw a spike — so the investigation ended at "the lineage app" and the remedy at "turn it off". Every statement is now prefixed with `/* app=bricktrace endpoint=… actor=… */`. Databricks retains statement text in `system.query.history`, so the platform's own audit trail is self-attributing with no exporter. The actor is a truncated hash, never the email, and a `*/` in the tag is stripped rather than escaped (SQL block comments have no escape, so it would otherwise close the comment and splice the remainder into executable position).
+- **The lineage walk was bounded in depth but not in width.** 16 hops per direction, each an unbounded query with the frontier inlined as an `IN (…)` list of up to 2500 names — so one hop through a shared conformed dimension returned every edge it had, in one result set, into app memory. The node cap was only checked *between* hops. Added `LINEAGE_HOP_MAX_ROWS` (default 5000) per hop, reported as truncation through the flag the response model already carries.
+- **Serverless builds were gated but unbudgeted.** The admin gate stops non-admins spending money and does nothing about an admin spending it; the per-table lock only stops duplicates of the *same* table, so an admin working down a 200-table schema submits 200 legitimately-distinct runs as fast as the UI allows. In an enterprise "admin" is a group, not one careful person. Added `MAX_BUILDS_IN_FLIGHT` (5) and `MAX_BUILDS_PER_DAY` (200), both **429 not 403** — the caller is permitted, there is just no budget, and a 403 would send an admin hunting through ACLs for a spend ceiling. A rejected duplicate costs no budget and a failed submit is refunded. Each submission records the submitting admin, so serverless spend has a name.
+- **A misconfigured env var could ship producer source code off-workspace.** `server/llm.py` posts notebook and query text plus table and column names to a serving endpoint, and `LLM_ENDPOINT_URL` was honoured verbatim while the SDK attaches the workspace credential to whatever it is given. The override now has to resolve to this workspace — a serving-endpoint path, or an absolute URL on the workspace's own host — and anything else is refused with an error log while the in-workspace default is used. A config mistake must not become an egress. Added `LLM_MAX_CALLS_PER_USER_PER_DAY` (500) because the deep-analysis path is agentic and one user action can be many model calls.
+- **The app handed its own credential to a URL from metastore metadata.** `federated_sync.probe_peer` read `sharing_server_url` from the Unity Catalog sharing overview and called it with `Authorization: Bearer {client.config.token}` — the app service principal's token, which is the key to everything the app can read, since every data query runs as that SP. Anyone able to register a sharing provider (a delegated privilege in most large metastores) chose that URL. The same unvalidated URL also reached the app's network position, including cloud instance-metadata endpoints. **Two fixes, and the first is the rule:** the probe carries no credential at all (an unauthenticated 401 still proves the endpoint is up, which is all it reports), and new `validators.assert_safe_outbound_url` requires https, rejects embedded credentials, and rejects hosts resolving to private, loopback, link-local, reserved or multicast addresses.
+- **Workspace audit history was readable by every app user.** `/api/access` and `/api/access/schema` are built on `system.access.audit` keyed by `user_identity.email` — they answer "which named person read this table, how often". Every other panel describes DATA; this one describes PEOPLE, and combined with the single-service-principal read model any user could enumerate colleagues' access patterns workspace-wide. Both are now admin-gated, ahead of parameter validation so an unauthorized caller learns nothing about the payload. Gating rather than redacting is deliberate: declared-grants-versus-empirical-use *is* a governance question whose answer is the identity, so a de-identified version would be a different and largely useless panel. Job run health (`/api/observability`) stays open — that is operational, not personal.
+- **Unity Catalog can now be the read perimeter instead of the Apps ACL.** Every data query ran as the app service principal; the caller's token was used only to resolve their email and admin flag, then discarded. So UC ACLs were not enforced on reads and the app's blast radius was the union of every grant the SP held. New `ENFORCE_USER_IDENTITY` routes user-data reads through a client built from the caller's own forwarded token. **It defaults OFF**, because switching it on makes every user see *less* than they do today — the correct end state, and also a visible change that reads as "the app broke" to anyone relying on SP visibility; validate it against one catalog first. **It fails closed:** enforcing with no caller token raises (surfaced as 401) rather than falling back to the SP, because a fallback would mean the one case that matters silently got the wider access the flag exists to remove. Per-user clients are cached by token digest, bounded and TTL'd, since building one resolves auth metadata. App-owned paths — the lineage tables, the cache, feature flags, build submission, and the diagnostics probe that reports what the *SP* can reach — deliberately keep using the app's client.
+- **`LOCAL_DEV_ADMIN_EMAIL` no longer sits one per-request condition from workspace admin.** The existing guard was correct but was evaluated in a hot path. The app now refuses to **boot** when that variable is set alongside `DATABRICKS_APP_NAME`, which is a much louder signal than a log line nobody reads and takes the variable out of the request path entirely on a real deploy.
 
-### Changed
+- **Deliberately not done, and why.** *Per-227-site SQL builder* (routing every interpolated statement through one typed chokepoint) — the right fix, and too large to bundle safely with the above; it needs its own pass with the coverage gate as the safety net. *Folding `perf_patches.py` into `lineage_service`* — removes a real support hazard (reading the source does not tell you what runs) but touches the hot path for no behavioural gain. *Distributed rate limiting and build locks* — these need a shared store, and putting them in Delta would recreate the contention just removed from the cache; until they exist, **single-replica is a correctness constraint, not a capacity choice**. *`uvicorn --workers`* — blocked on that same work by definition.
 
-- ARCHITECTURE.md updated to v2.1.0 with race condition documentation.
-
----
-
-## [2.0.0] - 2025-06-22
-
-### Summary
-
-Unified release consolidating the standalone Streamlit-based transformation lineage app (`transformation-lineage_maincode`) into the combined FastAPI+React architecture. **All functionality is now self-contained** with zero external code references.
-
-### Added
-
-- **Transformation Lineage Panel** — ReactFlow-based interactive DAG for column-level transformation drill-down (replaces D3.js/Streamlit iframe approach)
-- **Lineage Builder** (`build_service.py`) — serverless job submission and real-time progress polling with 8-step pipeline visualization
-- **Transform Service** (`transform_service.py`) — BFS backtracking engine with single-flight coalescing, parallel SQL, and memory-bounded caching
-- **Frontend Transform Components** — TransformPanel, TransformCanvas, TransformNode, TransformEdge, BuildProgress, FreshnessBadge, PruningControls
-- **Pipeline Library** (`transformation_lineage/`) — full 8-phase orchestrator embedded in the app with ThreadPoolExecutor parallelism
-- **Run Pipeline Notebook** (`notebooks/run_pipeline`) — self-contained notebook executed by build jobs
-- **Expression Enrichment** — LLM-powered PySpark→SQL translation via `ai_query` (best-effort, non-blocking)
-- **Freshness-aware caching** — separate 1h TTL transform cache (vs 8h main lineage cache)
-- **Admin Transform Cache** endpoint in `/api/admin/status`
-- **ARCHITECTURE.md** — comprehensive technical documentation
-- **CHANGELOG.md** — this file
-
-### Changed
-
-- **Tech stack migration**: Streamlit + D3.js → FastAPI + React + ReactFlow + ELK.js
-- **LineageBuilder class** refactored into `build_service.py` (pure functions, no Streamlit state)
-- **Graph renderer** replaced: D3 force-directed iframe → ReactFlow with ELK hierarchical layout in Web Worker
-- **Job submission** now uses REST API with `requests` library (timeout protection, better error handling)
-- **Progress mapping** uses structured `BuildJobStatus` Pydantic model instead of dict returns
-- **Cache architecture**: moved from Streamlit `@st.cache_data` to thread-safe `TTLCache` with memory bounds
-- **Pipeline notebook path**: auto-derived from deployment location (no manual PIPELINE_NOTEBOOK_PATH required)
-- **Error handling**: all transform endpoints return sanitized errors (no internal paths)
-- **Input validation**: all transform API params validated with strict regex
-
-### Removed
-
-- Streamlit dependency (`streamlit>=1.28.0`)
-- D3.js force-directed graph renderer (`graph_renderer.py`)
-- Streamlit-specific session state management
-- `@st.cache_resource` / `@st.cache_data` patterns
-- External code references to `transformation-lineage_maincode/`
-- `WorkspaceClient` caching via Streamlit decorators
-
-### Performance
-
-- **Single-query freshness**: COUNT+MAX in one pass (2x vs sequential exists+count)
-- **Pre-indexed upstream adjacency**: O(1) neighbor lookup in BFS (vs O(n) scan)
-- **Parallel SQL execution**: 4-thread pool for transform queries
-- **Lightweight size estimation**: 10-50x faster cache sizing (heuristic vs JSON serialization)
-- **Single-flight coalescing**: bounded per-key lock pool (512 max) prevents thundering herd
-- **Early termination**: pipeline skips phases when no new/changed artifacts detected
-- **Batch version checking**: single SQL query checks all artifact SHAs at once
-- **Node deduplication**: reversed-scan dedup in Phase 4 prevents duplicate writes
-- **8-thread parse parallelism**: concurrent sqlparse calls (GIL released in C extensions)
+- **Operator visibility for all of the above.** `/api/admin/status` now reports the admission-control counters (including `shed_rate_pct`, the signal that the app is throttling), the build budget with recent submitters, the LLM budget, the lineage window and hop caps, and which read perimeter is currently in force. Six new bundle variables wire the ceilings for both `dev` and `prod` in `databricks.yml`, so tuning needs no code edit.
 
 ### Security
 
-- Input validation on all transform endpoints (`_IDENTIFIER_RE`, `_FULL_NAME_RE`)
-- Admin-only cache invalidation (identity-gated, not IP-gated)
-- Rate limiting per user identity (token-hashed)
-- CSP headers prevent XSS on user-supplied table/column names
-- Error sanitization strips internal paths from API responses
+> Two passes, in order. First a security review of the branch closed **eight** findings
+> (`bb2689b`); then a code review *of that commit* found several of its own controls
+> bypassable and its message over-claiming in three places (`0d43ab5`). Both are recorded
+> here — the second pass only makes sense against the first. Every finding in both passes was
+> reproduced by executing the code before being fixed.
+>
+> Context that framed every fix: **no `_execute_sql` variant supports bound parameters**, and
+> all SQL runs as the app service principal, never as the caller. So an injection is a
+> privilege escalation to the SP's entire UC and system-tables read scope, and a missing gate
+> is reachable by every app user — there is no auth middleware and no router-level
+> dependencies. All of `backend/routes/` and `backend/server/` is new on this branch, so this
+> was newly introduced surface rather than inherited debt.
+
+#### First pass — eight findings (`bb2689b`)
+
+- **Quote-doubling was not enough to escape a SQL literal, and ~130 call sites relied on it.**
+  Databricks SQL treats `\` as an escape inside single-quoted literals by default, so a value
+  beginning `\'` becomes `\''` — the second quote **closes** the literal and the remainder
+  executes as SQL. Only `analysis_store._sql_str` escaped the backslash first. New
+  `validators.sql_str(value, limit)` escapes **backslash before quote** and truncates *before*
+  escaping so a cap cannot split an escape pair, and was adopted across `capability_cache`,
+  `cache_service`, `analysis_store`, `graph_snapshots`, `external_sources`, `glossary`,
+  `notifications`, `openlineage` and `ml`. Enum-like parameters (`platform`, `severity`,
+  `status`, `status_filter`, `scope`) are additionally allow-listed rather than escaped.
+- **Any user could read any workspace source the app SP could reach.** `entity_id` is
+  free-form (`_ENTITY_ID_RE` permits `/`, `.`, `@`) and the fetch runs as the SP, so a
+  non-admin could aim `/api/analyze-producer/version` or `/compare` at an arbitrary notebook
+  and get it back verbatim — while the sibling `/history` was admin-gated and returned only
+  metadata. New `_assert_producer_of()` requires the `(entity_type, entity_id)` pair to be a
+  producer Unity Catalog actually recorded for the target table, **fails closed**, and is
+  applied to all eight producer-resolving endpoints; `_strip_source()` redacts `source_code`
+  for non-admins (the diff's `source_changed` signal is hash-derived, so it survives
+  redaction).
+- **Four of the eight were injection sites**, each confirmed exploitable by executing it.
+  `openlineage produce` interpolated
+  catalog/schema unvalidated (5-column UNION, with `events_produced` as an in-band oracle);
+  the notifications rules MERGE left `rule_id`/`rule_type`/`severity` unescaped while
+  `target_pattern`/`notes` *on the same statement* were escaped; glossary upserts left term,
+  domain and KPI ids unescaped in both the USING source and the INSERT VALUES; and ml
+  `tables-for-model` validated `model_name` but not `model_version` (a single-line query, so
+  `--` killed ORDER BY/LIMIT). Fixed with allow-lists, `Literal` enums, UUID checks and
+  `sql_str` respectively.
+- **Mutators and ingest endpoints shipped ungated.** Admin gates added to snapshot DELETE (a
+  hard delete with no per-user scoping — while auto-capture on the *same table* already
+  returned 403), external register + source DELETE, notifications scan/rules/rule-DELETE,
+  glossary term DELETE, openlineage import/produce/configure, closures enqueue-delivery,
+  ol-bridge sources listing, and dq metrics. Writes deliberately left open (snapshot capture,
+  glossary upserts — both UI-exposed to every user) now record the **real caller** instead of
+  a hardcoded `'app'`.
+- **Producer config could be hijacked.** `configure` keyed its MERGE on `endpoint_name` with
+  `WHEN MATCHED` overwriting `endpoint_url`, and the ungated GET disclosed the names to
+  target. Now admin-gated with https-only URL validation.
+Also in this pass, as mechanism rather than as findings of their own:
+**`validators.require_admin(request)`** replaced the copied four-line gate block, so a new
+endpoint cannot ship ungated by forgetting to paste it; and raw `SQL failed: …` text stopped
+being returned to callers across the routers this pass touched — the three modules it missed
+are the last item of the second pass below.
+
+#### Second pass — the review of that commit (`0d43ab5`)
+
+- **The DQ expression validator is rebuilt around a single lexer, closing three verified injection bypasses.** A `CUSTOM` expression lands at SQL *code* position inside `SUM(CASE WHEN (<expr>) …)`, so the allow-list grammar — not escaping — is the only control there. The previous implementation had three independent holes, all now closed by tokenizing **once** and running every check over that one token stream (`_tokenize`/`_significant`/`_code_only` in `backend/routes/dq.py`):
+  - **Back-quoted function names skipped the allow-list entirely.** The check was guarded by `if token[:1].isalpha() or token[:1] == "_"`, which is `False` for a back-quoted identifier — so ``` `reflect`('java.lang.System','getProperty','user.name') ``` passed while the identical bare `reflect(1) > 0` was correctly rejected. Spark resolves function references through delimited identifiers, so the backticks were transparent to the engine and opaque only to the validator. `reflect`/`java_method` are arbitrary static Java invocation.
+  - **Validation and execution scanned different strings.** `_strip_string_literals` was backtick-blind, so a `'` inside a back-quoted identifier opened a phantom literal and blanked an arbitrary region from every downstream check while that region still executed verbatim: ``` `a'` = 1 OR (SELECT 1 FROM main.hr.payroll) > 0 OR `b'` = 1 ``` validated as three harmless tokens. Matching literals and quoted identifiers as single units in one pass makes this class of divergence unrepresentable. Quoted identifiers containing a quote, backslash or semicolon are now rejected outright.
+  - **Qualified function names passed on their last part.** The token loop only tested the identifier immediately before `(`, so `maincat.mysch.abs(salary) > 0` cleared the grammar — but Databricks resolves a three-part name to a *Unity Catalog* function, not the builtin. Anyone with `CREATE FUNCTION` on a schema they own could define `mycat.mysch.abs` with a subquery body and restore the scalar-subquery read-oracle the commit set out to close. Qualified calls are now rejected.
+- **`column_name` is validated, not just escaped.** It reaches a code position via the back-quoted `safe_col` in `_build_check_sql`, and back-quoting alone is not a control: an embedded backtick closes the identifier early, so a stored `` x`) THEN 1 ELSE 0 END) AS passing_rows, (SELECT …) AS leak FROM … -- `` rewrote the whole projection — and `dict(zip(columns, row))` let the injected duplicate alias win, returning the leaked value as `passing_rows`. Now allow-listed at both the write site (`upsert_dq_rule`) and the build site, so rules stored before the check existed can't execute either.
+  - **That first `column_name` check then rejected columns Unity Catalog actually allows.**
+    It reused the module's local `_IDENTIFIER_RE` (`^[A-Za-z0-9_]{1,255}$`), which forbids
+    hyphens and spaces — but UC permits both, which is *why* the query builder back-quotes the
+    name. So `Order Date` and `my-col` were refused: writes 400'd, and any **existing** rule on
+    such a column was marked permanently invalid, silently dropping the check while reporting
+    coverage as incomplete. Replaced with `_validate_column_name`, which screens the actual
+    boundary rather than a name shape: the only character that can end back-quoting is the
+    backtick, so that is what is rejected (plus control characters, for log and SQL hygiene).
+    Hyphens, spaces, dots and unicode are inert once quoted and are accepted again; the
+    break-out payload is still refused, verified by test. Found by asking what would happen on
+    deploy rather than trusting a green suite — every existing test used a plain `snake_case`
+    column, so nothing failed.
+
+- **The admin gate on `GET /api/dq-rules/metrics` was decorative.** `root_cause._get_dq_violations` executed the same stored expressions with **no validation at all**, and it is reached from `POST /api/root-cause/analyze` and `POST /api/diagnostics/root-cause` — neither admin-gated. It now validates with the same grammar (forcing the code-position rules, since `NOT ({expr})` is a code position for *every* rule type, unlike dq.py's REGEX/RANGE literal slot) and skips any rule that fails. Its `table_fqn` and `column_name` literals, previously interpolated raw, are now escaped.
+- **`GET /api/openlineage/producer/config` is admin-gated and redacts `endpoint_url`.** The commit message claimed this endpoint was already gated; it was not. Dropping the `api_key_secret_*` columns was necessary but insufficient — `configure_producer` only checks https+host, so `https://marquez.internal.corp/api/v1/lineage?apiKey=…` is a valid registration, and an ungated read handed every app user the query string and internal hostname.
+- **`register_webhook` validates the URL scheme.** It previously did none at all — `urlparse` appeared in the module only inside `_redact_url` — so `http://` and `file://` were accepted and the delivery job would POST notification content (and the row's `secret`) in plaintext.
+- **Audit-only attribution columns are withheld from non-admins.** Recording the real caller was right, but it turned five ungated `SELECT *` reads into a directory of every editor's workspace email. `created_by`/`updated_by` are now stripped from glossary term/link reads for non-admins (`_strip_attribution`), and `captured_by` is projected in the snapshot list/fetch only for admins. `owner` is deliberately left visible — it is a user-typed business field the UI renders — and its leak is fixed at the write end instead.
+- **Any user could seize ownership of any data domain.** `upsert_domain` set `owner = body.owner or _caller(request)` into an unconditional `WHEN MATCHED THEN UPDATE SET`, while `domain_id` is caller-supplied and the ungated `GET /glossary/domains` hands out every id — so re-POSTing someone else's domain re-attributed it, a Delta overwrite leaving no trace of the previous owner. The UPDATE arm now preserves a non-empty `owner`, and a blank owner stays blank instead of silently becoming the caller's email (which also made "I left this blank" read as a positive claim).
+- **24 raw warehouse errors no longer reach clients.** The source-disclosure fix landed in six route modules and skipped three; `dq.py`, `capability_closures.py` and `lineage.py` still returned `detail=str(e)` at 24 sites, three of them on endpoints open to every user. All now log with a traceback and return a generic message. (31 sites remain in modules outside this review's scope — tracked, not yet done.)
+- **The producer authorization check was its own amplification primitive.** `_assert_producer_of` is a synchronous warehouse round-trip called bare from eight `async def` handlers, and at the multi-producer compare site it ran once per producer in a serial loop bounded only by "at least 2" — so 500 producers meant 500 sequential blocking queries on the event-loop thread. Added a batch `_assert_producers_of` (one query answers N), capped the fan-out at 10, and moved every call off the loop with `asyncio.to_thread`.
+- **Auto-capture wrote an unvalidated `scope` literal.** `capability_closures`'s auto-capture INSERT left `'{cat}'` raw — the one value in that hunk not escaped — and bypassed `_validate_scope`, so it could write a scope the snapshot endpoints then refuse to read back.
+
+### Fixed
+
+- **Governance silently reported zero Unity Catalog tags.** `get_table_governance` read `<catalog>.information_schema.column_tags` with `WHERE table_schema = … AND table_name = …`, but that view is keyed by **`schema_name`** (unlike `.tables`/`.columns`, which use `table_schema`). The bad column raised `UNRESOLVED_COLUMN` on every call and the wrapping `try/except` swallowed it, so `result["tags"]` was always `[]` and the entire tag-based classification path (`sensitivity_source = "tag_rule"`) was dead — the Governance panel under-reported UC-tagged/classified columns. Fixed the filter to `schema_name`; verified live (a `pii=address` tag now surfaces). Regression test added asserting the query uses `schema_name`.
+- **Deep framework analysis failed when the config table lives in a different schema.** For a metadata-driven target (e.g. `…mapping_factory_fin.fact_account_balance`) the detection LLM has to fully-qualify the config table, but frameworks set its catalog/schema from runtime Spark conf (`mf.config_catalog`/`mf.config_schema`) — unknowable from source — so the model fell back to the *target table's* schema, which didn't exist, producing `TABLE_OR_VIEW_NOT_FOUND` and "no columns derived". When a config read fails specifically because the table/schema isn't found, the real location is now resolved by the bare table name against the target catalog's `information_schema.tables` and retried (emitting a "Resolved X → Y" step). Permission errors and the happy path never touch the resolver; a prompt note tells the model not to assume the config shares the target's schema. Verified live: resolves `…mapping_factory.mf_pipeline_config` and derives 12 columns. (`_is_table_not_found` / `_resolve_config_alternates` in `backend/server/framework_analysis.py`.)
+
+- **Every "Generate transformation lineage" build failed on a fresh deploy — the app could not read its own source.** Clicking Generate submitted the serverless job fine, then ~a minute later the panel showed `Task build_lineage failed with message: Unable to access the notebook ".../.bundle/bricktrace/dev/files/notebooks/run_pipeline" ... the identity used to run this job, app-1bf12b bricktrace-dev (50d7a56f-…), lacks the required permissions.` The notebook existed; the ACL was the problem. `bundle deploy` uploads the source into the **deploying** identity's home (`/Workspace/Users/<deployer>/.bundle/<bundle>/<target>/files`), whose ACL is the deployer + `admins` and nothing else — verified on the live folder — while the build job runs `notebooks/run_pipeline` (and imports `transformation_lineage/`) **as the app's service principal**. Nothing in the deploy ever bridged the two, so this was broken for every deployment since `PIPELINE_NOTEBOOK_PATH` moved to `${workspace.file_path}`; table and column lineage were unaffected, which is why it stayed hidden. Fixed in three places:
+  - **`grant_build_source_access.sh`** (new) resolves the app's SPN + source path from `apps get` and grants that SPN **`CAN_RUN`** on the source folder, children inheriting. `CAN_READ` is *not* sufficient — a `notebook_task` has to execute the notebook, and read-only access fails with the same message. It runs as the *deploying* identity (which already holds `CAN_MANAGE` there): no metastore admin, warehouse, or account admin, unlike `grant_app_access.sh`. Idempotent — a `PATCH` that leaves every other ACL entry intact — and it verifies against the notebook object the job actually opens rather than trusting the write. **`make deploy` now runs it** (new `grant-source` target), since `bundle deploy` is exactly what re-creates the folder that needs the grant.
+  - **The build now preflights instead of paying to discover the problem.** `submit_build_job` probes the notebook with `workspace.get_status` before submitting, so a missing grant costs one API call instead of a serverless run that dies on its first task, and returns **503** with the exact remediation command (`BuildSourceAccessError`, surfaced verbatim rather than through `_safe_error`, which truncates at 200 chars). The probe latches **on success only**: a transient API failure can't permanently disable builds, and a grant applied while the app is running takes effect without a restart.
+  - **An already-failed run now explains itself.** `get_build_status` appends the fix to the platform's message when it matches the source-permission signature, so the panel says what to do instead of only what went wrong. Honest about its limit: `get_status` succeeds with `CAN_READ` while the job needs `CAN_RUN`, and the app SPN cannot read its own ACL — so the preflight catches the common "no access at all" case and this message-level hint covers the read-only remainder.
+
+- **A code review of the source-access work above found thirteen defects in it, each fixed here.** The feature worked on the happy path; every one of these is a failure mode the happy path never reaches.
+  - **`--cleanup --dry-run` really destroyed things.** `run_sql` and `api_post` short-circuit on `DRY_RUN`, but the DLT-pipeline delete and the `workspace delete --recursive` in `build_testbed.sh`'s cleanup block were direct CLI calls that inherited no guard — so a dry run printed `[dry-run]` for the job deletes and the `DROP SCHEMA`, while actually deleting both pipelines and recursively deleting the workspace folder, with `2>&1 >/dev/null` hiding that it had happened. Both are now explicitly guarded.
+  - **A grant failure stopped `make redeploy` before `run`.** `deploy` ended with `$(MAKE) grant-source`, make propagates a failing recipe's exit status, and `redeploy: build deploy run` processes prerequisites serially — so any grant-source failure (an expired profile, a wrong `--app`, a non-executable script after clone) skipped `bundle run`, which is what re-applies the app's env. A cosmetic ACL step could leave the app running old code with no warehouse configured. `grant-source` is now non-fatal *within* `deploy` — it warns and prints the exact re-run command — while `make grant-source` on its own still exits non-zero. A missing ACL breaks transformation-lineage **builds**; a skipped `run` breaks the whole app.
+  - **`make deploy TARGET=prod` granted on the dev app.** `APP_NAME` was pinned to `bricktrace-dev` independently of `TARGET`, so a prod deploy granted the dev app's SP on the dev app's folder (leaving prod builds broken), or — if `bricktrace-dev` did not exist in that workspace — failed `apps get` and reported a *successful* prod deploy as an error. `APP_NAME` is now derived from `TARGET` (`APP_NAME_dev` / `APP_NAME_prod`, matching `${var.app_name}` per target in `databricks.yml`), and an unknown target fails up front instead of acting on the wrong app.
+  - **`set -euo pipefail` made every curated error message in `grant_build_source_access.sh` unreachable.** `get_object_id` pipes a stderr-silenced `workspace get-status` into a stderr-silenced `python3`; on a failed stat, `json.load` raises, `pipefail` propagates non-zero, and `set -e` killed the script at the *assignment* — so the `/Workspace`-spelling fallback, the "run this as the identity that deployed the bundle" hint, the "did the bundle upload notebooks/?" warning and the ACL-verification error never ran. Since `make deploy` now depends on the script, the operator saw only `make: *** [grant-source] Error 1`. The failure-tolerant reads are now explicit (`|| true` plus JSON parsing that cannot raise), and each curated path is exercised against a stubbed CLI. The same abort-before-the-error-message bug in `grant_app_access.sh`'s SPN lookup is fixed too.
+  - **The script resolved the source folder from stale metadata, with the opposite precedence to the app's own resolver.** It preferred `active_deployment.source_code_path`, but `make deploy` runs it *between* `bundle deploy` and `bundle run`, so that field still describes the **previous** deployment — meaning that after any change to `workspace.root_path` (a different deploying identity, a renamed bundle or target, a redeploy after `bundle destroy`: exactly the cases the script exists to be re-run for) it granted on, or failed to stat, the old folder. `backend/build_service.py::_discover_from_app_source` reads `default_source_code_path` first, so the script and the app could disagree about which folder matters. The script now uses the app's precedence.
+  - **The path-spelling fallback covered the folder lookup but not the notebook verification.** The `/Workspace`-prefixed/bare retry lived at the folder call site, so for a source root whose resolvable spelling differed from the reported one (a `/Repos` root) the script granted on the folder successfully and then reported "did the bundle upload notebooks/?" about a notebook that was there all along. The retry moved inside `get_object_id`, so every lookup gets it.
+  - **A value-taking flag passed last died with bash's own error.** `./grant_build_source_access.sh --app` expanded unset `$2` under `set -u` and aborted with `line 53: $2: unbound variable`, never reaching the curated validation. Same shape for all seven value-taking flags in `build_testbed.sh` and all four in `grant_app_access.sh`. All three scripts now validate that a flag has a value.
+  - **`--tier` was never validated.** Only `all` was normalized, so `--tier 2x` reached `(( TIER >= 2 ))` and aborted with `invalid: unbound variable` — but *after* the tier-1 fixtures, ACL grants and workspace uploads had already been applied, leaving a half-built test bed and an error naming nothing the user typed; `--tier 9` silently meant tier 3. Both `--tier` and `--sleep` are now validated before anything is created.
+  - **`-h` dumped source code, including hardcoded workspace identifiers.** `sed -n '2,28p'` overshot a 22-line header, so `build_testbed.sh -h` ended with `set -euo pipefail`, the default catalog and a warehouse id; `grant_build_source_access.sh` and `grant_app_access.sh` had the same off-by-one. All three now end the range at the header's closing rule, so help text cannot drift into the source as the header grows.
+  - **The preflight widened the build-lock race it sat inside.** The per-table lock was read at the top of `submit_build_job` but written only after `runs/submit` returned, and the new `workspace.get_status` probe landed inside that window — so two requests for the same table could both clear the check, both submit, and both bill a serverless run, with only the second `run_id` surviving in `_build_locks` (defeating the A12 de-dup and leaking the first entry). The slot is now **reserved** inside the same critical section that checks it, and released on any failure before the real `run_id` is known.
+  - **The reachability latch never expired.** Latching on success only was deliberate, but nothing ever invalidated an entry, so a grant *revoked* under a long-lived app was undetectable for the process lifetime and every later build went back to dying a minute in on serverless compute — the exact cost the preflight exists to avoid. The latch is now scalar (one path is resolved per process), guarded by an explicit lock like the module's two sibling caches rather than relying on the GIL, and expires after 5 minutes.
+  - **The failure-message matcher claimed this cause for unrelated failures.** `"lacks the required permissions" in m and "notebook" in m` fired on any message containing both fragments, so any other notebook-permission failure inside the run had the source-folder remediation appended to it — stating the wrong cause and the wrong fix, with no hedging. It now keys on the platform's own identity clause (`the identity used to run this job, <sp>, lacks the required permissions`), which is what the real message says, and the loose branch is gone.
+  - **The new latch was not in the hermeticity reset.** `tests/conftest.py::_reset_global_state` promises each test is hermetic regardless of file order but did not know about `_source_access_ok`, and `test_cache_service` calls the real `submit_build_job` with a `MagicMock` client whose `workspace.get_status` auto-succeeds — latching that path with nothing to clear it, so a later test asserting the probe runs would pass vacuously depending on file order. Both build-service globals are now reset there, and the sibling test class's teardown is symmetric. Five regression tests added, each verified to fail against the pre-fix code.
+
+- **The snapshot diff feature was unreachable dead code.** `@router.get("/{snapshot_id}")` was registered before `@router.get("/diff")`, and Starlette matches in registration order — so `GET /api/snapshots/diff` bound `snapshot_id="diff"` and ran `get_snapshot`, returning **200** with `{"graph": {"nodes": [], "edges": []}}`. A caller could not distinguish that from "nothing changed", so the whole feature read as permanently empty rather than broken. Routes reordered, with a regression test that asserts the diff contract (`nodes_added`/`edges_removed`/`summary`) rather than just a status code. The existing test had hedged its assertion with the comment *"or 500 if the /{snapshot_id} route shadows /diff"* — the shadowing was suspected and the test loosened instead of the bug fixed; it now pins the exact behaviour.
+- **The producer guard 403'd legitimate non-admins.** `LINEAGE_WINDOW_DAYS` was read with a default of **90** in five modules while `lineage_service` — which *builds* the graph — defaults to **365**, off the same variable. With the variable unset (local runs, and after `databricks apps start` wipes the runtime env) the graph would render a producer whose last write was 120 days ago, offer Analyze on it, and 403 the click; invisible from an admin account, because the check is skipped for admins. `lineage_service` is now the single source of truth for all five (`routes/lineage`, `routes/impact`, `routes/scalability`, `server/root_cause`, `server/discovery`), and the guard uses the graph's own predicate form (`event_time > current_date() - INTERVAL N DAYS`) rather than a `dateadd` form up to 24h narrower.
+- **Over-length DQ rule ids were permanently undeletable.** The write path stored `rule_id` unbounded while `DELETE /{rule_id}` truncated to 64 chars, so a rule stored under a longer id could never be removed through the API — and its `CUSTOM` expression kept executing on every metrics call. Ids are now allow-listed (`_RULE_ID_RE`, ≤64 chars) at both ends. The handler also confirms the row exists: it previously returned `{"status": "deleted"}` whether or not anything matched, so a typo'd id looked like a successful delete.
+- **A broken DQ check used to raise the quality grade.** `quality_score = total_pass_rate / evaluated_count` counted only rules that evaluated successfully, so a rule that stopped running (invalid expression, SQL error, no data) simply dropped out of the average. The response now reports `rules_unevaluated` and `coverage_complete`, and withholds `quality_grade` when coverage is incomplete, so a partial result can't be read as a pass.
+- **The REGEX/RANGE keyword screen rejected legitimate patterns and protected nothing.** At a literal position the escaping is the control — `sql_str`'s backslash-first ordering, pinned by `test_regex_literal_is_escaped` — so screening for SQL keywords on top only cost real regexes: `^.*/v1/.*$` (`*/`), `^[0-9]{4}--[0-9]{2}$` (`--`) and `^(select|update)$` were all 400s. The screen is removed; a payload like `x' UNION SELECT 1 --` is now accepted and rendered inert by escaping, which the replacement test asserts directly.
+- **Two more false rejects in the CUSTOM grammar.** Parameterised CAST types (`cast(amount AS DECIMAL(18,2))`, `VARCHAR(10)`) were read as calls to non-allow-listed functions; and the reserved-word check scanned raw text with a word regex that ran straight through backticks, so `` `order` IS NOT NULL `` was rejected — killing the back-quoting escape hatch for exactly the words it exists for. Type names are now allow-listed and reserved words are checked on bare identifiers only.
+- **Glossary search 500'd on a backslash and treated `%`/`_` as wildcards.** A LIKE pattern is a second escape layer on top of the SQL literal, and `sql_str` only handles the literal — so `C:\data` produced the pattern `%c:\data%`, whose `\d` is an escape character mid-pattern (Spark raises `INVALID_FORMAT.ESC_IN_THE_MIDDLE`), surfaced as an undiagnosable *"Failed to list glossary terms"*. Before the escaping change, plain quote-doubling left the backslash to be swallowed and search worked. Added `_like_escape`, applied before `sql_str`, which also escapes `%` and `_` (`discovery.py:62` already did this for `%`).
+- **An alert threshold of `0` was silently rewritten to `0.9`, and `Infinity` produced a 500.** `float(body.threshold or 0.9)` swallowed a legitimate zero — `GET /rules` echoed back a value the admin never set and could not express — and `json.loads('{"v": 1e999}')` yields `inf`, which pydantic's `Optional[float]` accepts and the f-string rendered as the bare word `inf` into an unquoted SQL position, where Spark resolved it as a column reference and failed. Now `None`-tested and `math.isfinite`-guarded. `target_pattern: ""` had the same `or`-swallow, widening a rule from no tables to `*`.
+- **The schema-change detector always reported zero.** `_detect_schema_changes` selected `last_altered` from `system.information_schema.columns`, but that column lives on `.tables` — so the query raised `UNRESOLVED_COLUMN` on every run, was swallowed by the non-fatal `except`, and the scan reported success with nothing detected. Now joins `columns` to `tables` for the alter time.
+- **`record_dq_metrics` 500'd instead of 400'ing on an infinite count.** `int(float('inf'))` raises `OverflowError`, not `ValueError`, so it escaped the validation `except`.
+- **A producer secret reference was write-once-forever.** `configure_producer`'s `WHEN MATCHED` arm ignored `api_key_secret_scope`/`api_key_secret_key` unconditionally, which broke the ordinary "register now, add auth later" flow: the second call silently discarded the secret and returned 200 with a freshly minted `config_id` that was never stored — and with no DELETE endpoint or row-replace path for this table, the documented "delete and re-create" workaround did not exist. Omitting the refs still preserves them (the property the original rule was reaching for); supplying them now rotates them, which is legitimate on an admin-gated endpoint. The handler also reads the stored `config_id` back instead of inventing one.
+- **Rejected filters cost warehouse round-trips.** `get_ol_bridge_events`, `get_external_lineage` and `producer_events` called `_lazy_ensure*()` — two `CREATE TABLE IF NOT EXISTS` statements — *before* validating the platform/status filter, so an off-list value still hit the warehouse twice. This also made `test_platform_filter_allow_listed` **fail in a fresh process** (it passed only via leaked module state), which was the one genuinely red test on the branch. Validation now runs first.
+- **"Capture Now" was permanently unusable.** `ExportPanel` is mounted from `App.tsx` and was given no props, so `catalog` defaulted to `''` and the button's own `disabled={!catalog}` kept it greyed out forever — the snapshot feature was unreachable from the UI. Now mounted with the current catalog/schema, with an in-panel error banner and a `res.ok` check so a rejected capture reports the reason instead of `alert("Snapshot captured: undefined nodes, undefined edges")`.
+- **A non-admin scan reported a false all-clear.** `NotificationsPanel` had no `isAdmin` reference and no `res.ok` check, so the admin-gated `POST /api/notifications/scan` returned 403, `fetch` did not reject, the body parsed fine, and the user saw *"Scan complete: undefined"* over an unchanged list — reading as "the schema-change, DQ-degradation and sensitive-flow detectors found nothing". The control is now admin-only and failures surface as an error banner.
+
+- **Deep framework analysis now explains an empty config table** instead of a generic failure. When a metadata-driven framework's config table exists but currently has no rows (common for frameworks that write their config per run), `deep_analyze_stream` short-circuits with a specific `config_empty` reason — *"The config table(s) … are currently empty. This framework writes its column config per run, so run the producing pipeline for this target, then re-analyze."* — rather than calling the LLM and reporting "No columns could be derived." (`backend/server/framework_analysis.py`.)
+- **Deep analysis honours the framework's own config key column.** `_query_config_table` accepted the LLM-detected `target_key_columns` but never used them — matching was hardcoded to a fixed `_TARGET_KEYS` list, so a config table keyed by e.g. `tgt_tbl`/`dest_table` matched nothing, only a blind 10-row sample reached the derive LLM, and analysis reported "No columns could be derived" for config that was right there. The detected keys are now unioned with the defaults (`_target_keys`) and threaded through `_focus_on_target`.
+- **The `config_empty` short-circuit no longer fires on unproven assumptions.** It previously treated any empty table as proof that nothing could be derived, which produced a permanent dead end in three cases, all now fixed: (1) the detection prompt returns `certain: false` for a table name it only *guessed* from a variable — an empty guess proves nothing, so analysis falls through and the guess is called out; (2) a table that couldn't be `SELECT`ed was silently reported as "empty", sending the user to re-run their pipeline when the real fix was a `GRANT` — unreadable and empty tables are now tracked separately and each named with its own remediation (`_blockers_note`); (3) deriving from source + parameters alone — the documented fallback for the no-tables case — became unreachable whenever an empty table was present, so a framework passing its column map as a pipeline parameter stopped working; the guard now falls through when parameters are available.
+- **`reason_code` is now actually surfaced, and on every failure path.** The field was added to the deep-analyze result event but nothing read it (the panel showed only `detail`), and only 1 of 4 non-derived results set it. All four now carry a code (`no_source`/`detect_failed`/`config_empty`/`no_columns`), and the panel renders a reason-specific headline plus a next step (`DEEP_REASONS`/`DeepOutcome`) instead of appending one more line to the capped log — which also removes the triple-reported "config table is empty" message. The vocabulary is defined once (`TransformReasonCode` in `backend/models.py`, mirrored in `client.ts`) and shared by both carriers, so the panel's reason → label mapping can't silently fall through and `DeepAnalyzeResultEvent.reason_code` is no longer an open `string` while its sibling is a closed union.
+- **`config_tables` on the result event no longer changes meaning between branches** — it was the full detected list on success but only the empty subset on failure. It is always the full list now; `empty_config_tables` and `unreadable_config_tables` carry the subsets. Also: duplicate table names from the free-form detection JSON are de-duplicated (they were queried and named twice), `total_rows` is read defensively so a partial dict can't `KeyError` mid-stream, and entity types reach the UI as friendly nouns (`MATERIALIZED_VIEW` → "materialized view", missing → "producer") instead of raw upper-snake identifiers.
+- **Business "Data only" mesh fix now applies to the main canvas too.** `App.tsx`'s trace loader didn't forward `data.table_edges` into `setLineageData`, and the store defaults the field to `[]` — so every load through the app shell reset it and `LineageCanvas` took its cross-product fallback, reproducing the exact dense mesh the fix below was meant to remove. Only the Table Lineage workspace passed the field through. (Note `/api/lineage` — the schema-scoped endpoint — genuinely does not populate `table_edges`, since only `get_lineage_trace` builds the graph via `_build_graph_from_rows`; that path still uses the bridging fallback by design.)
+- **Business "Data only" view showed a dense "everything → everything" mesh** for hub tables (e.g. `…silver_dynamic.customers_validated`). Collapsing the processing steps reconstructed dataset edges by cross-producting each job/pipeline's inputs × outputs, fabricating pairs that were never real dependencies. The backend already reads a precise `(source_table → target_table)` pair for every `system.access.table_lineage` row but only kept the entity-routed edges; it now also returns those exact pairs as `table_edges` on `/api/lineage/trace`, and the Data-only view renders them directly instead of cross-producting. (`_build_graph_from_rows` in `lineage_service.py`, `table_edges` on `LineageResponse`.)
+- **Cross-source diff false positives** — `compare_transformation_versions` keyed on expression + source_columns, but the Spark-plan parser emits cosmetically different source-column sets for two captures of the SAME plan, so every column showed as "changed" against an identical expression. It now keys on the normalized expression (what the diff actually renders).
+- **Analyze producer scoping** — the Analyze tab's producer picker listed every entity in the lineage graph (the whole pipeline); it is now scoped to producers of the selected table (an edge into the focus table), matching the Producers tab.
+- **`llm.py` robustness across model endpoints** — retry-without-`temperature` for models that reject the parameter, flatten Anthropic content-block lists to text, decode base64/JSON config cells, and a meaningfulness gate that is all-or-nothing (reject only when EVERY column comes back UNKNOWN) so struct columns (`_lineage`/`_dq`) aren't dropped for some models. Specific `reason_code`s replace the generic "LLM unavailable".
+- **`build_service.py` runtime crash after the notebook-path refactor** — `submit_build_job` and `is_build_configured` still referenced the removed module-level `PIPELINE_NOTEBOOK_PATH` constant (`NameError` on build submit). Both now use `get_pipeline_notebook_path()` / the resolved local path.
 
 ---
 
-## [1.3.0] - 2025-06-15
+### Fixed (UI)
+
+- **Three sidebar/header controls looked operable and were not.** All in
+  `frontend/src/components/landing/Landing.tsx`, and all the same defect: an affordance
+  rendered with nothing wired behind it.
+  - **The notifications bell opened the global search palette.** Its handler was
+    `setGlobalSearchOpen(true)` — a mis-pointed handler, not a missing one, so clicking the
+    bell produced a search box over the landing page. `goNotifications()` already existed
+    (`useRouter.ts`) and `HeaderMenu` already used it; Landing never imported it. The bell is
+    now **disabled** pending the notifications view (see Known gaps), and its unread badge is
+    gone with it — a count you cannot open is an unresolvable nag, and the data is still on
+    `/api/notifications`.
+  - **A test was documenting this bug rather than catching it.** `Landing.test.tsx` had
+    `it("opens search from the notifications bell")` asserting exactly the wrong behaviour, so
+    it passed for as long as the bug existed. Replaced with tests that the bell is inert, that
+    no badge renders, that the workspace slot is disabled, and that the user chip is not a button.
+  - **The "All Workspaces" dropdown had no handler and nothing to list.** It was a plain
+    `<div>` with a `ChevronDown`. The app binds to exactly one workspace (a single
+    `WorkspaceClient`), so there is no set of workspaces to choose from — a dropdown would have
+    opened onto nothing. Left in place and **greyed out** so it reads as "not yet" instead of
+    "broken", reserving the slot for the real feature.
+  - **The user chip was a `<button>` with a chevron and no `onClick`.** Identifying the
+    signed-in user is the whole requirement, so it is now display-only: no button, no chevron,
+    no hover state, nothing inviting a click it cannot answer.
+
+- **The sidebar's Admin Dashboard replaced the view you were working in.** It was a
+  `<button onClick={goAdmin}>`, and `goAdmin` called `navigate()` — a `history.pushState` in
+  the current tab — so an admin checking warehouse-gate or budget counters lost whatever
+  lineage graph, DQ run, or impact analysis was on screen and had to rebuild it on the way
+  back. The header menu's own admin entry (`HeaderMenu.tsx`) had always opened a new tab, so
+  the two entry points to the same view behaved differently.
+  - The sidebar entry is now a real `<a href target="_blank" rel="noopener noreferrer">`, not
+    a button with a `window.open` handler. That distinction is the point: only an anchor gives
+    cmd/middle-click, the "open in new tab" context menu, a target URL on hover, and the link
+    role a screen reader announces. `NavItem` gained an `href` field, and the nav loop renders
+    an anchor for entries that set it.
+  - `goAdmin` is **removed** rather than left unused. A new tab parses its route from the
+    query string, so nothing can reach this view by `pushState` any more — leaving a same-tab
+    navigator in the router is how this quietly gets rewired back.
+  - New `routeHref(route)` in `useRouter.ts` builds link URLs from the same
+    route→query mapping `navigate` uses, so a link cannot drift from its route. It is
+    query-only, so it resolves against whatever path the app is served from rather than
+    hardcoding `/` the way `HeaderMenu` still does.
+  - Tests: the click-through test no longer asserts `goAdmin` fired; a new test pins the
+    `href`/`target`/`rel` triple *and* that the item is no longer a button, plus `routeHref`
+    coverage for the admin, parameterised, and empty-search cases. `dist/` rebuilt
+    (`index-1iSsiirw.js`).
+
+### Known gaps
+
+- **Notifications view is deferred.** The backend is complete and working —
+  `/api/notifications`, `/unread-count`, `/mark-read`, `/scan`, `/rules` (admin-gated), plus the
+  detectors behind them — and `NotificationsPanel.tsx` exists and is routed at
+  `route.view === "notifications"`. What is missing is the entry point: the bell is disabled, so
+  the only way in is the URL (`?view=notifications`) or `HeaderMenu`. Finishing it means deciding
+  whether notifications are a route or a dropdown panel, then re-enabling the bell and restoring
+  the unread badge. Nothing is broken; the door is just not connected.
+- **Multi-workspace / workspace switching is not implemented.** The sidebar reserves a greyed-out
+  slot for it. The nearest existing foundation is `federated_sync.py` with the
+  `federated_sync.cross_workspace` feature flag, which registers Delta Sharing peers — that is
+  peer-metadata cross-referencing, not a workspace switcher, and a real switcher would need the
+  single-`WorkspaceClient` assumption in `lineage_service` revisited first.
+- **The header `?` (Help) button has no handler.** Left exactly as it was, deliberately out of
+  scope for this pass — it needs a destination decided (docs link, tour, or removal) before it is
+  worth wiring.
+
+## [2.6.0] - 2026-07-29
+
+> **Operational lineage — cached capability panels, node-level run health, and multi-producer transformation comparison.** The Table Lineage workspace gets a persistent per-table cache with refresh + admin eviction, every job/pipeline node gains a run-health check with per-run cost, and tables written by more than one producer can be compared column-by-column to catch divergent logic. Plus fixes that make the LLM Column Transformation path work on modern (glob/file) pipelines and clearly explain permission gaps.
 
 ### Added
 
-- Catalog-wide lineage (omit schema for full catalog graph)
-- Cross-catalog trace via `system.access.table_lineage` BFS walk
-- Delta Sharing overlay (provider + recipient boundaries)
-- Excel export with styled multi-sheet workbook
-- Admin ops dashboard with P50/P95/P99 latency, memory, cache inventory
-- Live mode for admins (bypass cache for real-time system table reads)
-- Deep-link support (`?table=catalog.schema.table`)
+- **Per-table capability cache** — Impact, Root Cause, Governance, and Access panel results are persisted per `(table, tab)` in an app-owned Delta table (`capability_cache`) and served instantly on reopen (measured ~25× faster; cold Access ~78s → warm ~3s). Each panel shows a **"cached Xh ago / may be stale"** badge (24h TTL, `CAPABILITY_CACHE_TTL_SECONDS`) and a **Refresh** icon that forces a live recompute. (`backend/server/capability_cache.py`, `serve_or_compute()`.)
+- **Admin capability-cache controls** — `GET /api/admin/capability-cache` (inventory) and `POST /api/admin/capability-cache/evict?scope=entry|table|all`. The Admin dashboard gains a "Capability Cache" section with per-entry, per-table, and evict-all actions.
+- **Per-node run health check** — every **JOB** and **PIPELINE** graph node has an activity icon opening a health popover: verdict (Healthy / Degraded / Failing) + success rate, average duration with a slower/faster **trend arrow**, total cost over the window with a per-run **spike flag**, and the **last 5 runs** — each with status, duration, **real per-run cost** (joined from `system.billing.usage` on `job_run_id` / `dlt_update_id`), and a deep link to the run. `GET /api/observability/runs?entity_type=&entity_id=&limit=&refresh=` (cached via the capability cache). (`observability.get_recent_runs()`, `EntityNode.tsx` `HealthPopover`.)
+- **Multi-producer column-transformation comparison** — when a table is written by 2+ producers, the Column Transformation panel shows a **"Compare side-by-side"** matrix (rows = target columns, columns = producers) that flags where producers compute the same column differently. `POST /api/column-transformations/compare-producers`. Each producer is resolved from **its own** source (per-entity LLM), not the table-level captured plan — so genuine divergence is surfaced rather than masked. (`producer_source.compare_producers()`, `ProducerCompareMatrix`.)
+- **Actionable "access denied" on the Column Transformation panel** — when the app can't read a producer's source, the panel now names the exact resource(s) and the app service-principal to grant, instead of a generic "LLM unavailable". Backend returns a structured `reason_code` (`access_denied` / `entity_missing` / `no_source`) with `denied_paths` + `app_service_principal`.
 
 ### Changed
 
-- Per-user rate limiting (token-hashed, replaces IP-based)
-- Security headers middleware (CSP, X-Frame-Options)
-- 64-thread pool for blocking SDK calls
+- **`OBSERVABILITY_LOOKBACK_DAYS`** default 30 → 90 so recent-runs and health surface data in demo/low-activity workspaces.
+- **README Quick start** — documents Node/npm + Databricks CLI prerequisites, the `npm ci` frontend build step, the full set of required deploy `--var`s (not just `warehouse_id`), and that `bundle run` needs the same vars as `bundle deploy`.
+
+### Fixed
+
+- **"Build pipeline not configured" when env var resolved late** — `build_service.py` no longer uses a module-level `PIPELINE_NOTEBOOK_PATH` constant (which was empty if the env hadn’t propagated at import time). Replaced with `get_pipeline_notebook_path()` — a lazy-cached resolver with a 3-step discovery order: (a) `PIPELINE_NOTEBOOK_PATH` env (whitespace-stripped; empty/whitespace = unset), (b) if `DATABRICKS_APP_NAME` is set, calls `apps.get` to discover the deployed `source_code_path` and appends `/notebooks/run_pipeline`, normalizing `/Users` or `/Shared` prefixes to `/Workspace/...`, (c) else returns `""` (fail-closed). `GET /api/transform/build-configured` now also returns `notebook_path` for frontend diagnostics. Tests use `_reset_pipeline_notebook_path_cache()` instead of module reload.
+- **LLM Column Transformation was mislabeled "unavailable" on modern pipelines** — `_fetch_pipeline_source` only handled `notebook`-style pipeline libraries. Bundle/DLT pipelines that declare source via `glob.include` (a directory of `.py`/`.sql`) or `file.path` yielded no source → "No source code available". Now reads the **raw pipeline spec via REST** (older SDK versions in our pinned range silently drop the `glob` field on typed deserialization), walks the glob directory, and exports each file. Added `_fetch_workspace_file` (download API for plain files).
+- **Multi-producer comparison masked divergence** — first implementation resolved each producer via table-level precedence, so a table-keyed captured Spark plan returned identical results for every producer (0 divergent). Fixed to resolve each producer from its own source.
+- **Run-health duration formatting** — `avg_duration_seconds` is a float; unrounded `secs % 60` rendered as `29.6000000000000023s`. Now rounded.
+- **`grant_app_access.sh` aborted under `set -u`** — a bare `$LINEAGE_SCHEMA` abutting a multibyte ellipsis was parsed as part of the variable name, aborting before the app-owned schema was created. Braced the vars; also committed the script's executable bit so fresh clones can run it directly.
 
 ---
 
-## [1.2.0] - 2025-06-01
+## [2.5.6] - 2026-07-27
+
+> **Column Transformation Lineage — unified precedence + cross-source versioning.** The LLM Transform panel is reworked into **Column Transformation Lineage**, which resolves a table's per-column derivation best-source-first (mirroring the reference tool): captured Spark plan → captured CDC spec → stored LLM version → fresh LLM. Version history now spans both sources, and any two versions can be diffed — including a captured plan against an LLM deduction.
 
 ### Added
 
-- Column-level lineage from `system.access.column_lineage`
-- Lazy column loader (per-table on-demand)
-- Schema-wide column lineage for transitive tracing
-- Cache snapshot API for admin monitoring
+- **`POST /api/column-transformations`** — unified resolver. Returns columns + a `source` (`plan_capture` / `cdc_spec` / `stored` / `llm`) and a source label, picking the best available source. `force_rerun` skips captures/cache to a fresh LLM pass.
+- **`POST /api/column-transformations/versions`** — merged version list across sources (captured plans + LLM analyses), each with a `ref` (`plan_capture:2`, `llm:6`) and source tag.
+- **`POST /api/column-transformations/compare`** — diff any two version refs, including **cross-source** (captured plan vs LLM); per-column added/removed/changed with a `cross_source` flag.
+- **`plan_capture_service`**: `get_captured_columns()`, `list_captured_versions()`, `get_captured_columns_version()`, `get_captured_cdc_spec()` — table-level captured-plan reads used by the resolver.
+- **Configurable captured-plan tables** — `CAPTURED_PLANS_TABLE` / `CAPTURED_CDC_TABLE` env vars (bundle vars `captured_plans_table` / `captured_cdc_table`) let the reader point at wherever the offline `lineage_capture` wheel writes (e.g. the `lineage_explorer` schema), not just the app-owned schema.
+- **`PIPELINE_NOTEBOOK_PATH`** restored in `databricks.yml` as the portable `${workspace.file_path}/notebooks/run_pipeline` — fixes "Build pipeline not configured" without the empty-string value that previously broke the Apps config update.
+- **Makefile** — encodes the workspace `--var` overrides so a compute/config change or plain redeploy never drops env (`make redeploy` / `run` / `deploy` / `diagnostics` / `logs`).
+
+### Changed
+
+- **Column Transformation panel** — renamed from "LLM Transform"; adds a precedence-chain legend, a color-coded source-of-truth banner, richer per-column cards (category badge + `src → target` flow + expression), unified version history, and cross-source compare. (`ColumnTransformationPanel.tsx` replaces `LLMTransformPanel.tsx`.)
+- **`plan_capture_service`** — NULL `version` handled via `coalesce(version, 1)` when ordering/matching captured plans.
+- **`APP_VERSION` / package version → `2.5.6`**.
+
+### Fixed
+
+- Captured-plan lineage now actually resolves: the reader was pointed at the empty app-owned schema instead of the capture project's `lineage_explorer.captured_plans`, and the SP lacked `USE SCHEMA` on that schema.
 
 ---
 
-## [1.1.0] - 2025-05-15
+## [2.5.5] - 2026-07-24
+
+> **Table Lineage workspace + UI shell.** Adds a dedicated per-table analysis workspace (catalog tree · lineage graph · draggable capability panels) reached from a new Landing tile, a light/dark theme toggle, a redesigned sidebar-shell home, and a new logo across the app. Several backend capabilities were reworked to be service-principal-friendly and to match the reference tool (Data Lineage POC). No new scorecard capabilities — this session productizes the per-table UX over existing caps 08/09/12/13/14/39.
 
 ### Added
 
-- Entity resolution (job/pipeline/notebook display names)
-- Serverless cost per entity (30-day `system.billing` aggregation)
-- View modes (Tables, Pipelines, Full)
-- Memory-bounded LRU cache with TTL
+- **Table Lineage workspace** (`frontend/src/components/table-lineage/`) — 3-pane shell (catalog tree, cross-catalog lineage graph, top summary bar) with six capability panels opened as **draggable floating popups**: Impact, Root Cause, Governance, Access, ML Models, LLM Transform. Opened from the 4th Landing tile / `?view=tableLineage`. Double-click a graph table node to re-focus the workspace.
+- **`GET /api/root-cause/trace`** — health-based table-level root-cause trace (upstream table walk → producer run-health classification failed/stale/healthy/no-history → prime suspect + failure path). Auto-runs on table select. (`trace_root_cause_table()`)
+- **`DELETE /api/governance/config`** — delete a classification rule (`delete_governance_rule()`); Governance panel now adds/removes column-pattern and UC-tag → sensitivity rules.
+- **`GET /api/analyze-producer/models`**, **`/versions`**, **`/version`**, **`/compare`** — LLM model list (for the dropdown), per-target version history, single-version fetch, and version-to-version diff (source + per-column). Analyses are versioned per (entity_type, entity_id, target_table) with a stored source snapshot.
+- **Light/dark theme** — CSS-variable color tokens (`tailwind.config.ts`, `styles/globals.css`) + `themeStore` + `ThemeToggle`; persisted, applied before first paint, toggle top-right everywhere.
+- **New logo** across Landing/Toolbar/workspace/favicon, served via `GET /bricktrace-logo.png` (stored as `.logo` to survive the bundle sync's `*.png` exclusion).
+- **Impact consumers** — `/api/impact` now returns the reader entities (dashboards/jobs/pipelines) of the focus + downstream tables, grouped by type with resolved names + deep links; panel renders clickable consumer chips.
+
+### Changed
+
+- **#13 Security & Access** — grants read from `information_schema.table_privileges` (SP-readable) instead of `SHOW GRANTS`; audit query uses `service_name='unityCatalog'` + `event_date` partition pruning + `request_params['full_name_arg']`; a single audit scan feeds both the accessor rollup and the recent-events feed; identities (owner/created_by/last_altered) + reads/writes counts added.
+- **#14 AI/ML Lineage** — `get_models_for_table()` derives models live from the UC Model Registry → versions → MLflow run `dataset_inputs` (app-owned `model_lineage` table as fallback).
+- **#39 LLM Producer Analysis** — calls the serving endpoint via the SDK's OAuth client (no static token); default model `databricks-claude-sonnet-4-6`; prompt now requires an entry for every target column; `max_tokens` 1024 → 4000; notebook export uses `ExportFormat.SOURCE`.
+- **Observability** — fixed `system.lakeflow.pipeline_update_timeline` column names (`result_state`/`period_start_time`/`period_end_time`), which also unblocks pipeline run-health in the root-cause trace.
+- **`_execute_sql` polling** — `lineage_service.py` and `server/access.py` now poll past the 50s API wait cap instead of raising `SQL did not complete: PENDING` (fixed schema-lineage 500s and empty audit results).
+- **Home page redesigned** into a sidebar-shell layout (nav + workspace selector + user profile + top-right bell/help/theme, hero, tiles, global search, Recent Activity from `/api/notifications`); Admin Dashboard is an admin-gated sidebar item.
+- **`APP_VERSION` / package version → `2.5.5`**.
+
+### Known gaps
+
+- ML models resolve empty when a training run's notebook-scoped experiment notebook was deleted (SP can't read run inputs).
+- Access grants list is scoped to what the app SP can enumerate (needs catalog/schema `MANAGE`); audit-backed sections need account-admin `SELECT` on `system.access`.
+- ~20 service files still have a non-polling `_execute_sql` (only `access.py` + `lineage_service.py` fixed); latent, only affects >50s queries.
+- App deploy relies on runtime `--var lineage_catalog/lineage_schema` overrides (the default `lattice_lineage` catalog can't be created in the FEVM workspace); not persisted in `databricks.yml`.
 
 ---
 
-## [1.0.0] - 2025-05-01
+## [2.5.2] - 2026-07-19
+
+> **Capability bulk closure** — closes 8 scorecard items to HAVE status. Scorecard moves from 10/7/1 to **18 HAVE / 2 PARTIAL / 0 GAP**. Adds BI tool consumer detection, streaming topology view, auto-capture scheduling, DQ trend tracking, pipeline expectation sync, and webhook-based notification delivery.
 
 ### Added
 
-- Initial release: table-level lineage visualization
-- FastAPI + React + ReactFlow architecture
-- Databricks Apps deployment via DABs
-- Catalog/schema browsing with search
-- Global search across all tables
-- Table lineage DAG with ELK.js layout
+- **`GET /api/lineage/bi-consumers`** — detects Tableau, PowerBI, Looker, Mode, Metabase, Sigma, ThoughtSpot, dbt Cloud, Redash, and Superset consumers via `system.query.history` user-agent patterns. Returns tool type, query count, distinct users, and last access. (Closes #02 End-to-End Lineage)
+- **`GET /api/lineage/streaming-topology`** — discovers streaming tables from `information_schema` and their source edges from `system.access.table_lineage`. Returns streaming table inventory + source→target edge list. (Closes #02)
+- **`POST /api/snapshots/auto-capture`** — captures snapshots for all catalogs with recent lineage activity. Designed for scheduled execution via Databricks job. (Closes #07 Versioned Lineage)
+- **`GET /api/snapshots/timeline`** — node/edge count time series for a scope, enabling graph growth visualization. (Closes #07)
+- **`POST /api/dq-rules/record-metrics`** — stores DQ metric run results in `dq_metrics_history` for longitudinal trending. (Closes #11 Data Quality)
+- **`GET /api/dq-rules/trends`** — quality score trend over time with direction detection (improving/stable/degrading). (Closes #11)
+- **`GET /api/dq-rules/pipeline-expectations`** — syncs SDP pipeline expectations from `system.information_schema.table_properties` for streaming tables and materialized views. (Closes #11)
+- **`GET /api/notifications/webhooks`**, **`POST /api/notifications/webhooks`**, **`DELETE /api/notifications/webhooks/{id}`** — webhook registration CRUD for push notification delivery. Admin-gated. (Closes #20 Notifications)
+- **`POST /api/notifications/enqueue-delivery`** — queues unread notifications for webhook delivery (matched by event_type). Delivery queue consumed by external job. (Closes #20)
+- **`GET /api/notifications/delivery-status`** — webhook delivery queue inspection.
+- **`backend/routes/capability_closures.py`** — new route module consolidating all v2.5.2 gap-closure endpoints.
+- **New Delta tables**: `dq_metrics_history`, `notification_webhooks`, `webhook_delivery_queue` (auto-created on first use).
+- **`GET /api/glossary/propagate-suggestions`** — walks downstream lineage from a source table and identifies downstream tables missing business terms linked to the source. Enables term inheritance across the data estate. (Closes #10 Business Lineage)
+- **`GET /api/glossary/lineage-overlay`** — returns all glossary terms, domains, and KPI indicators scoped to a catalog/schema, grouped by table — ready for frontend graph node badge rendering. (Closes #10)
+- **`POST /api/openlineage/producer/configure`** — register an external OpenLineage-compatible endpoint (Marquez, Atlan, DataHub) for event delivery with Databricks secret-backed auth. (Closes #17 Open Standards)
+- **`POST /api/openlineage/producer/produce`** — scans `system.access.table_lineage` for recent writes, builds OL RunEvents, queues them for delivery. Designed for scheduled job invocation.
+- **`GET /api/openlineage/producer/events`** — view producer queue status (pending/delivered/failed) with summary counts. Monitors production health.
+
+### Changed
+
+- **#17 Open Standards → HAVE** — added live bidirectional producer: configure endpoint → detect writes → queue OL events → async delivery. Now fully bidirectional (export + import + produce).
+- **#10 Business Lineage → HAVE** — discovered that `routes/glossary.py` was a full 345-line implementation (not a stub): term CRUD, domain management, KPI definitions, and term→table/column linking. Added propagation suggestions + lineage overlay to close the gap.
+- **#01 Automatic Discovery → HAVE** — recognized that dbt manifest import + Airflow DAG import + foreign catalog crawl + manual registration already fully covers the scorecard requirement.
+- **#14 AI/ML Lineage → HAVE** — recognized that existing `routes/ml.py` already implements feature tables, vector indexes, vector lineage, prompt lineage, and model registry (endpoints existed since v2.5.0).
+- **`docs/capability_code_map.md`** updated to 16/2/1 scorecard summary with full closure history.
+- **`APP_VERSION` → `2.5.2`**.
+
+---
+
+## [2.5.1] - 2026-07-19
+
+> **Integration hardening** — upgrades the plan parser to the mature upstream version, adds the Federated Source Overlay endpoint from the design doc, and removes 7 non-contributing files.
+
+### Added
+
+- **`GET /api/lineage/federated-overlay`** — new endpoint returning `FederatedSourceOverlay` (foreign catalog nodes enriched with connection type, provider, and federation tier). Queries `system.information_schema.connections` + `information_schema.catalogs WHERE catalog_type = 'FOREIGN_CATALOG'`.
+- **`FederatedTableEntry` + `FederatedSourceOverlay` models** (`backend/models.py`) — Pydantic schemas for the federated overlay response.
+- **`get_federated_source_overlay()`** (`backend/federated_service.py`) — service function backing the new endpoint.
+- **`docs/capability_code_map.md`** — debugging index mapping each of the 20 capability-matrix items to primary backend files and routes.
+
+### Changed
+
+- **`backend/plan_capture/plan_parser.py` upgraded to mature version** — now includes:
+  - `LEAF_PREFIXES` tuple for identifying leaf nodes (Range, Relation, LogicalRelation, HiveTableRelation, etc.)
+  - `_table_context()` helper for qualified table name resolution via SubqueryAlias/Relation
+  - `clean_nodes()` with multi-line continuation folding (detects tree connectors via regex)
+  - `build_symbol_tables()` with parent-chain stack tracking (leaf columns inherit enclosing table context)
+  - `first_bracket()` / `attr_bracket()` helpers (skip non-attribute options brackets)
+  - `_udf_names()` fully implemented with `_UDF_CALL_RE`
+  - Streaming relation handling (StreamingRelationV2 bracket skipping)
+
+### Removed
+
+- `setup_full_demo.py`, `.github/`, `backend/tests/`, `monitoring/`, `requirements-dev.txt`, `pytest.ini`, `CODEOWNERS` — non-contributing to runtime; all imports verified passing after removal.
+
+---
+
+## [2.4.0]
+
+> Adds a new **Control Panel** — admin-gated toggles for three opt-in, higher-cost/higher-risk capabilities, all OFF by default: **Runtime Plan Capture** (captures Spark's exact Analyzed Logical Plan from opted-in pipelines, for transformation logic the static parser can't read from source), **Captured-Plan Precedence** (additively surfaces that captured expression in the existing transformation drill-down), and **Federated Sync** (an admin-curated registry of known peer workspaces layered on the existing Delta Sharing overlay — a v1 scaffold, not live cross-workspace sync). See [docs/architecture.md](docs/architecture.md), [docs/capabilites.md](docs/capabilites.md), and [docs/testing_plan_for_Combined_App.md](docs/testing_plan_for_Combined_App.md) for full detail, including an explicit Known Gaps / follow-ups list.

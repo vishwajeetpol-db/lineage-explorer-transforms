@@ -1,5 +1,5 @@
 bundle:
-  name: nexus-lineage
+  name: bricktrace
 
 variables:
   warehouse_id:
@@ -34,15 +34,39 @@ variables:
   pipeline_notebook_path:
     description: "Workspace path to the run_all notebook for building transformation lineage"
     default: ""
+  captured_plans_table:
+    description: "Delta table the lineage_capture wheel writes analyzed plans to (override if capture lands outside the app-owned schema)"
+    default: "lattice_lineage.lineage.captured_plans"
+  captured_cdc_table:
+    description: "Delta table for captured apply_changes/AUTO-CDC specs"
+    default: "lattice_lineage.lineage.captured_cdc_specs"
   transform_cache_ttl_seconds:
     description: "TTL (seconds) for transformation lineage cache (shorter than table lineage)"
     default: "3600"
   build_cache_ttl_hours:
     description: "Hours before transformation lineage is considered stale and needs rebuild"
     default: "24"
+  warehouse_max_concurrent_statements:
+    description: "Max SQL statements the app will run at once. Size to the WAREHOUSE's real concurrency (cluster size x max clusters), not to the app's thread count — the app can present ~84 and a warehouse cluster admits ~10."
+    default: "8"
+  enforce_user_identity:
+    description: "When true, data READS run as the calling user so Unity Catalog enforces them. Default false: every user currently sees whatever the app's service principal can read, and switching this on makes users see LESS. Validate against one catalog before enabling."
+    default: "false"
+  lineage_hop_max_rows:
+    description: "Row cap per BFS hop when tracing lineage. Bounds hop WIDTH (a shared conformed dimension can have very many edges); hitting it is reported as a truncated graph."
+    default: "5000"
+  max_builds_in_flight:
+    description: "Max concurrent transformation-lineage builds. Each is a serverless job."
+    default: "5"
+  max_builds_per_day:
+    description: "Daily cap on transformation-lineage builds, across all admins."
+    default: "200"
+  llm_max_calls_per_user_per_day:
+    description: "Daily per-user cap on AI analysis calls. The deep-analysis path is agentic, so one user action can be many model calls."
+    default: "500"
   app_name:
     description: "Databricks App name. Override to avoid collisions in a shared workspace or to run multiple instances."
-    default: "lineage-explorer"
+    default: "bricktrace"
 
 # Files excluded from `databricks bundle deploy` uploads.
 # `.databricksignore` is best-effort across CLI versions — `sync.exclude` is authoritative.
@@ -79,6 +103,8 @@ sync:
     - "setup_full_demo.py"
     - "setup.sql"
     - "grant_app_access.sh"
+    - "grant_build_source_access.sh"
+    - "testbed"
     - "*.png"
     - "ss_*"
     - "screenshot_*"
@@ -99,12 +125,12 @@ targets:
     #   databricks bundle deploy -t dev --profile <profile> --var warehouse_id=<id>
     variables:
       rate_limit_max_requests: "200"  # higher cap for dev (admin dashboard polls every 10s)
-      app_name: "lineage-explorer-direct"
+      app_name: "bricktrace-dev"
     resources:
       apps:
-        lineage-explorer:
+        bricktrace:
           name: ${var.app_name}
-          description: "Unity Catalog Lineage Explorer — Interactive DAG visualization"
+          description: "BrickTrace — Interactive Unity Catalog lineage visualization"
           source_code_path: .
           resources:
             - name: sql-warehouse
@@ -140,12 +166,41 @@ targets:
                 value: ${var.lineage_catalog}
               - name: LINEAGE_SCHEMA
                 value: ${var.lineage_schema}
+              # Portable path to the deployed run_pipeline notebook — workspace.file_path
+              # auto-resolves per-user, so this is team-safe and never empty.
+              # If this env var is unset/empty at runtime, the backend will fall back to
+              # discovering the path from the App's source_code_path (apps.get API).
               - name: PIPELINE_NOTEBOOK_PATH
-                value: ${var.pipeline_notebook_path}
+                value: ${workspace.file_path}/notebooks/run_pipeline
+              - name: CAPTURED_PLANS_TABLE
+                value: ${var.captured_plans_table}
+              - name: CAPTURED_CDC_TABLE
+                value: ${var.captured_cdc_table}
               - name: TRANSFORM_CACHE_TTL_SECONDS
                 value: ${var.transform_cache_ttl_seconds}
               - name: BUILD_CACHE_TTL_HOURS
                 value: ${var.build_cache_ttl_hours}
+              # --- Load, cost and data-boundary controls -------------------
+              # Admission control between the app's threads and the warehouse.
+              # Without it the app presents far more concurrent statements than a
+              # warehouse runs, and a QUEUED statement still holds an app thread for
+              # up to 170s — turning warehouse queuing into app-wide timeouts.
+              - name: WAREHOUSE_MAX_CONCURRENT_STATEMENTS
+                value: ${var.warehouse_max_concurrent_statements}
+              # Makes Unity Catalog the read perimeter instead of the Apps ACL.
+              # OFF by default because switching it on narrows what users see.
+              - name: ENFORCE_USER_IDENTITY
+                value: ${var.enforce_user_identity}
+              - name: LINEAGE_HOP_MAX_ROWS
+                value: ${var.lineage_hop_max_rows}
+              # Serverless spend ceilings. The admin gate stops non-admins spending;
+              # these stop a loop or a bulk pass spending without a ceiling.
+              - name: MAX_BUILDS_IN_FLIGHT
+                value: ${var.max_builds_in_flight}
+              - name: MAX_BUILDS_PER_DAY
+                value: ${var.max_builds_per_day}
+              - name: LLM_MAX_CALLS_PER_USER_PER_DAY
+                value: ${var.llm_max_calls_per_user_per_day}
 
   prod:
     mode: production
@@ -153,9 +208,9 @@ targets:
     #   databricks bundle deploy -t prod --profile <profile> --var warehouse_id=<id>
     resources:
       apps:
-        lineage-explorer:
+        bricktrace:
           name: ${var.app_name}
-          description: "Unity Catalog Lineage Explorer — Interactive DAG visualization"
+          description: "BrickTrace — Interactive Unity Catalog lineage visualization"
           source_code_path: .
           resources:
             - name: sql-warehouse
@@ -191,9 +246,37 @@ targets:
                 value: ${var.lineage_catalog}
               - name: LINEAGE_SCHEMA
                 value: ${var.lineage_schema}
+              # Portable path to the deployed run_pipeline notebook — workspace.file_path
+              # auto-resolves per-user, so this is team-safe and never empty (an empty
+              # value here previously broke the Apps config update).
               - name: PIPELINE_NOTEBOOK_PATH
-                value: ${var.pipeline_notebook_path}
+                value: ${workspace.file_path}/notebooks/run_pipeline
+              - name: CAPTURED_PLANS_TABLE
+                value: ${var.captured_plans_table}
+              - name: CAPTURED_CDC_TABLE
+                value: ${var.captured_cdc_table}
               - name: TRANSFORM_CACHE_TTL_SECONDS
                 value: ${var.transform_cache_ttl_seconds}
               - name: BUILD_CACHE_TTL_HOURS
                 value: ${var.build_cache_ttl_hours}
+              # --- Load, cost and data-boundary controls -------------------
+              # Admission control between the app's threads and the warehouse.
+              # Without it the app presents far more concurrent statements than a
+              # warehouse runs, and a QUEUED statement still holds an app thread for
+              # up to 170s — turning warehouse queuing into app-wide timeouts.
+              - name: WAREHOUSE_MAX_CONCURRENT_STATEMENTS
+                value: ${var.warehouse_max_concurrent_statements}
+              # Makes Unity Catalog the read perimeter instead of the Apps ACL.
+              # OFF by default because switching it on narrows what users see.
+              - name: ENFORCE_USER_IDENTITY
+                value: ${var.enforce_user_identity}
+              - name: LINEAGE_HOP_MAX_ROWS
+                value: ${var.lineage_hop_max_rows}
+              # Serverless spend ceilings. The admin gate stops non-admins spending;
+              # these stop a loop or a bulk pass spending without a ceiling.
+              - name: MAX_BUILDS_IN_FLIGHT
+                value: ${var.max_builds_in_flight}
+              - name: MAX_BUILDS_PER_DAY
+                value: ${var.max_builds_per_day}
+              - name: LLM_MAX_CALLS_PER_USER_PER_DAY
+                value: ${var.llm_max_calls_per_user_per_day}

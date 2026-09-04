@@ -28,6 +28,8 @@ export default function TransformPanel() {
   const freshness = useTransformStore((s) => s.freshness);
   const buildStatus = useTransformStore((s) => s.buildStatus);
   const traceResult = useTransformStore((s) => s.traceResult);
+  const capturedExpression = useTransformStore((s) => s.capturedExpression);
+  const capturedExpressionLoading = useTransformStore((s) => s.capturedExpressionLoading);
   const panelError = useTransformStore((s) => s.panelError);
   const closePanel = useTransformStore((s) => s.closePanel);
   const triggerBuild = useTransformStore((s) => s.triggerBuild);
@@ -59,6 +61,45 @@ export default function TransformPanel() {
     triggerBuild(selectedTable, isStale || isBuilt);
   };
 
+  const capturedExpressionCard = (capturedExpressionLoading || capturedExpression) ? (
+    <div className="rounded-xl border border-violet-700/40 bg-violet-950/20 p-4">
+      <div className="flex flex-wrap items-center gap-2 mb-3">
+        <span className="inline-flex items-center rounded-full border border-violet-500/40 bg-violet-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-violet-300">
+          Runtime-captured
+        </span>
+        {capturedExpression?.version != null && (
+          <span className="text-[10px] text-slate-500">version {capturedExpression.version}</span>
+        )}
+        {capturedExpression?.confidence != null && (
+          <span className="text-[10px] text-slate-500">confidence {Math.round(capturedExpression.confidence * 100)}%</span>
+        )}
+      </div>
+
+      {capturedExpressionLoading && !capturedExpression ? (
+        <p className="text-xs text-slate-400">Checking for a runtime-captured expression…</p>
+      ) : capturedExpression ? (
+        <>
+          <p className="text-[11px] text-slate-400 mb-2">
+            Executed expression for <span className="font-mono text-violet-300">{selectedColumn}</span>
+          </p>
+          <pre className="overflow-x-auto rounded-lg border border-slate-800 bg-slate-950/70 p-3 text-[11px] leading-relaxed text-slate-200 whitespace-pre-wrap break-words">
+            {capturedExpression.expression}
+          </pre>
+          <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-slate-500">
+            {capturedExpression.source_columns?.length > 0 && (
+              <span>sources: {capturedExpression.source_columns.join(', ')}</span>
+            )}
+            {capturedExpression.captured_via && <span>via: {capturedExpression.captured_via}</span>}
+            {capturedExpression.captured_at && <span>captured: {capturedExpression.captured_at}</span>}
+          </div>
+          {capturedExpression.notes && (
+            <p className="mt-2 text-[10px] text-slate-500">{capturedExpression.notes}</p>
+          )}
+        </>
+      ) : null}
+    </div>
+  ) : null;
+
   return (
     <AnimatePresence>
       {isOpen && (
@@ -78,7 +119,7 @@ export default function TransformPanel() {
               <div>
                 <h2 className="text-sm font-bold text-white tracking-wide">TRANSFORMATION LINEAGE</h2>
                 <p className="text-xs text-slate-400">
-                  {selectedColumn && selectedTable ? `${selectedTable} \u203A ${selectedColumn}` : 'Select a column'}
+                  {selectedColumn && selectedTable ? `${selectedTable} › ${selectedColumn}` : 'Select a column'}
                 </p>
               </div>
             </div>
@@ -138,9 +179,9 @@ export default function TransformPanel() {
                 {freshness && (
                   <div className={`inline-flex items-center gap-3 px-4 py-2.5 rounded-xl border mt-2 ${freshness.exists && !freshness.is_stale ? 'bg-emerald-950/50 border-emerald-700/50' : 'bg-amber-950/50 border-amber-700/50'}`}>
                     <span className={`text-xs font-bold ${freshness.exists && !freshness.is_stale ? 'text-emerald-400' : 'text-amber-400'}`}>
-                      {freshness.exists ? (freshness.is_stale ? 'STALE \u2014 rebuilding...' : 'FRESH \u2014 loading graph...') : 'NOT BUILT \u2014 building now...'}
+                      {freshness.exists ? (freshness.is_stale ? 'STALE — rebuilding...' : 'FRESH — loading graph...') : 'NOT BUILT — building now...'}
                     </span>
-                    <span className="text-xs text-slate-400">{freshness.edge_count} edges &middot; {freshness.age_str}</span>
+                    <span className="text-xs text-slate-400">{freshness.edge_count} edges · {freshness.age_str}</span>
                   </div>
                 )}
               </div>
@@ -167,6 +208,12 @@ export default function TransformPanel() {
                   </p>
                 </div>
 
+                {capturedExpressionCard && (
+                  <div className="w-full max-w-md text-left">
+                    {capturedExpressionCard}
+                  </div>
+                )}
+
                 {/* Cost warning */}
                 <div className="flex items-start gap-2.5 px-4 py-3 rounded-xl bg-amber-950/40 border border-amber-700/40 max-w-md text-left">
                   <AlertCircle size={16} className="text-amber-400 mt-0.5 shrink-0" />
@@ -180,7 +227,7 @@ export default function TransformPanel() {
 
                 {freshness?.exists && (
                   <p className="text-[10px] text-slate-500">
-                    Existing version: {freshness.edge_count} edges &middot; {freshness.age_str}
+                    Existing version: {freshness.edge_count} edges · {freshness.age_str}
                   </p>
                 )}
 
@@ -207,13 +254,15 @@ export default function TransformPanel() {
               <div className="space-y-4">
                 <div className="flex items-center gap-4 text-xs text-slate-400">
                   <span className="flex items-center gap-1.5"><Layers size={12} className="text-purple-400" />{traceResult.total_nodes} columns</span>
-                  <span>&middot;</span>
+                  <span>·</span>
                   <span>{traceResult.total_edges} transforms</span>
-                  <span>&middot;</span>
+                  <span>·</span>
                   <span>{traceResult.max_depth_reached} layers deep</span>
-                  {traceResult.fetch_duration_ms != null && (<><span>&middot;</span><span>{traceResult.fetch_duration_ms}ms</span></>)}
+                  {traceResult.fetch_duration_ms != null && (<><span>·</span><span>{traceResult.fetch_duration_ms}ms</span></>)}
                   {traceResult.cached && (<span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-500 text-[10px]">cached</span>)}
                 </div>
+
+                {capturedExpressionCard}
 
                 {!traceResult.is_source_column && traceResult.has_lineage && (
                   <p className="text-[10px] text-slate-600 italic">Click any upstream node to isolate its path to target. Use controls above to filter by depth or category.</p>
@@ -223,7 +272,7 @@ export default function TransformPanel() {
                   <div className="text-center py-12">
                     <div className="w-12 h-12 rounded-full bg-slate-800 flex items-center justify-center mx-auto mb-4"><Layers size={20} className="text-slate-500" /></div>
                     <h4 className="text-sm font-semibold text-slate-300 mb-1">Source Column</h4>
-                    <p className="text-xs text-slate-500"><span className="text-purple-400 font-mono font-bold">{selectedColumn}</span> has no upstream transformations \u2014 it originates here.</p>
+                    <p className="text-xs text-slate-500"><span className="text-purple-400 font-mono font-bold">{selectedColumn}</span> has no upstream transformations — it originates here.</p>
                   </div>
                 )}
 

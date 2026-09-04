@@ -5,6 +5,7 @@
  * - Freshness status for the selected table
  * - Build job lifecycle (submit → poll → complete)
  * - Backtrack trace results (levels, nodes, edges)
+ * - Optional runtime-captured expression enrichment for the selected target column
  * - UI state (panel open/closed, selected column, loading states)
  * - Pruning controls (depth slider, category filter, path isolation)
  */
@@ -14,11 +15,13 @@ import {
   type TransformResponse,
   type FreshnessInfo,
   type BuildJobStatus,
+  type CapturedExpression,
   getTransformFreshness,
   getTransformTrace,
   submitTransformBuild,
   getBuildStatus,
   getTransformCategories,
+  getCapturedExpression,
 } from '../api/transform';
 
 export type TransformPanelState =
@@ -51,6 +54,10 @@ interface TransformState {
   traceResult: TransformResponse | null;
   traceLoading: boolean;
 
+  // Optional runtime-captured expression for the selected target column
+  capturedExpression: CapturedExpression | null;
+  capturedExpressionLoading: boolean;
+
   // Categories (for legend)
   categories: Record<string, string>;
 
@@ -74,6 +81,7 @@ interface TransformState {
   triggerBuild: (tableFqn: string, forceRebuild?: boolean) => Promise<void>;
   pollBuild: () => Promise<void>;
   loadTrace: (catalog: string, schema: string, table: string, column: string, depth?: number) => Promise<void>;
+  loadCapturedExpression: (catalog: string, schema: string, table: string, column: string) => Promise<void>;
   loadCategories: () => Promise<void>;
   reset: () => void;
 
@@ -98,6 +106,8 @@ const INITIAL_STATE = {
   buildPolling: false,
   traceResult: null,
   traceLoading: false,
+  capturedExpression: null,
+  capturedExpressionLoading: false,
   categories: {} as Record<string, string>,
   maxDepth: 8,
   hiddenCategories: new Set<string>(),
@@ -121,6 +131,8 @@ export const useTransformStore = create<TransformState>((set, get) => ({
       selectedTable: tableFqn,
       selectedColumn: column,
       traceResult: null,
+      capturedExpression: null,
+      capturedExpressionLoading: false,
       buildPolling: false,
       buildRunId: null,
       buildStatus: null,
@@ -140,17 +152,22 @@ export const useTransformStore = create<TransformState>((set, get) => ({
       }
 
       set({ freshness });
+      void get().loadCapturedExpression(catalog, schema, table, column);
 
-      if (!freshness.exists || freshness.is_stale) {
-        // Do NOT auto-build. Transformation lineage is an explicit, opt-in,
-        // compute-cost action. The column (UC) lineage is already shown on the
-        // main graph; here we just surface a prompt + cost note and let the
-        // user decide to generate. The build only runs on an explicit click.
+      if (!freshness.exists) {
+        // Nothing built yet. Do NOT auto-build — transformation lineage is an
+        // explicit, opt-in, compute-cost action. The column (UC) lineage is
+        // already shown on the main graph; here we surface a prompt + cost note
+        // and let the user decide. The build only runs on an explicit click.
         set({ panelState: 'needs_build' });
         return;
       }
 
-      // 2. Lineage exists and is fresh — load trace (read-only, no build)
+      // 2. Lineage exists — always load and show the already-built graph, even
+      // when stale. Rebuilding is opt-in (a non-blocking "Regenerate" badge is
+      // shown alongside the graph via the freshness state); we never hide an
+      // existing result behind the build prompt just because it aged past the
+      // staleness TTL. Only a genuine absence (handled above) blocks on a build.
       await get().loadTrace(catalog, schema, table, column);
     } catch (err: any) {
       // Only set error if this is still the active panel request
@@ -267,12 +284,30 @@ export const useTransformStore = create<TransformState>((set, get) => ({
         traceLoading: false,
         panelState: 'ready',
       });
+      void get().loadCapturedExpression(catalog, schema, table, column);
     } catch (err: any) {
       set({
         traceLoading: false,
         panelState: 'error',
         panelError: err.message || 'Failed to load transformation trace',
       });
+    }
+  },
+
+  loadCapturedExpression: async (catalog: string, schema: string, table: string, column: string) => {
+    const tableFqn = `${catalog}.${schema}.${table}`;
+    set({ capturedExpressionLoading: true });
+    try {
+      const capturedExpression = await getCapturedExpression(catalog, schema, table, column);
+      if (get().selectedTable !== tableFqn || get().selectedColumn !== column || get().panelState === 'closed') {
+        return;
+      }
+      set({ capturedExpression, capturedExpressionLoading: false });
+    } catch {
+      if (get().selectedTable !== tableFqn || get().selectedColumn !== column || get().panelState === 'closed') {
+        return;
+      }
+      set({ capturedExpression: null, capturedExpressionLoading: false });
     }
   },
 

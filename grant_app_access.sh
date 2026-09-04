@@ -19,18 +19,27 @@
 # =============================================================================
 set -euo pipefail
 
-APP_NAME="${APP_NAME:-lineage-explorer-direct}"
+APP_NAME="${APP_NAME:-bricktrace-dev}"
 PROFILE="${PROFILE:-DEFAULT}"
 WAREHOUSE_ID="${WAREHOUSE_ID:-}"
 CATALOGS="${CATALOGS:-}"
 
+# A value-taking flag passed as the LAST argument (`--warehouse` with nothing after
+# it) would otherwise expand unset $2 and die with bash's own "unbound variable"
+# under `set -u`, never reaching the curated validation below.
+need_val() {  # need_val <flag> [remaining args...]
+  [[ $# -ge 2 && -n "${2:-}" ]] || { echo "ERROR: $1 requires a value." >&2; exit 2; }
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --app)       APP_NAME="$2"; shift 2 ;;
-    --profile)   PROFILE="$2"; shift 2 ;;
-    --warehouse) WAREHOUSE_ID="$2"; shift 2 ;;
-    --catalogs)  CATALOGS="$2"; shift 2 ;;
-    -h|--help)   sed -n '2,20p' "$0"; exit 0 ;;
+    --app)       need_val "$@"; APP_NAME="$2"; shift 2 ;;
+    --profile)   need_val "$@"; PROFILE="$2"; shift 2 ;;
+    --warehouse) need_val "$@"; WAREHOUSE_ID="$2"; shift 2 ;;
+    --catalogs)  need_val "$@"; CATALOGS="$2"; shift 2 ;;
+    # Range ends at the header's closing rule, so the help text cannot drift into
+    # the source below it as the header grows.
+    -h|--help)   sed -n '2,/^# =\{10,\}$/p' "$0"; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -41,8 +50,16 @@ if [[ -z "$WAREHOUSE_ID" ]]; then
 fi
 
 echo "Resolving service principal for app '$APP_NAME' (profile: $PROFILE)…"
-SPN="$(databricks apps get "$APP_NAME" --profile "$PROFILE" -o json \
-  | python3 -c 'import sys,json; print(json.load(sys.stdin).get("service_principal_client_id",""))')"
+# `|| true` and the try/except: under `set -e`/`pipefail` a failed lookup would abort
+# the script here, silently skipping the curated guidance immediately below.
+SPN="$(databricks apps get "$APP_NAME" --profile "$PROFILE" -o json 2>/dev/null \
+  | python3 -c '
+import sys, json
+try:
+    print(json.load(sys.stdin).get("service_principal_client_id", "") or "")
+except Exception:
+    pass
+' 2>/dev/null || true)"
 
 if [[ -z "$SPN" ]]; then
   echo "ERROR: could not resolve service_principal_client_id for app '$APP_NAME'." >&2
@@ -81,4 +98,20 @@ else
   echo "  (Lineage spans catalogs — grant BROWSE on every catalog you want visible.)"
 fi
 
+# A8 FIX: Grant system.query access (needed for BI consumer detection)
+echo "Granting access to system.query schema (BI consumer detection)…"
+run_sql "GRANT USE SCHEMA, SELECT ON SCHEMA system.query TO \`$SPN\`"
+
+# A8 FIX: Create and grant access to app-owned lineage schema
+LINEAGE_CATALOG="${LINEAGE_CATALOG:-lattice_lineage}"
+LINEAGE_SCHEMA="${LINEAGE_SCHEMA:-lineage}"
+echo "Creating app-owned schema ${LINEAGE_CATALOG}.${LINEAGE_SCHEMA}..."
+run_sql "CREATE CATALOG IF NOT EXISTS \`$LINEAGE_CATALOG\`"
+run_sql "CREATE SCHEMA IF NOT EXISTS \`$LINEAGE_CATALOG\`.\`$LINEAGE_SCHEMA\`"
+run_sql "GRANT USE CATALOG ON CATALOG \`$LINEAGE_CATALOG\` TO \`$SPN\`"
+run_sql "GRANT USE SCHEMA ON SCHEMA \`$LINEAGE_CATALOG\`.\`$LINEAGE_SCHEMA\` TO \`$SPN\`"
+run_sql "GRANT CREATE TABLE ON SCHEMA \`$LINEAGE_CATALOG\`.\`$LINEAGE_SCHEMA\` TO \`$SPN\`"
+run_sql "GRANT SELECT, MODIFY ON SCHEMA \`$LINEAGE_CATALOG\`.\`$LINEAGE_SCHEMA\` TO \`$SPN\`"
+
+echo ""
 echo "Done. Verify with: curl -s <app-url>/api/diagnostics | python3 -m json.tool"

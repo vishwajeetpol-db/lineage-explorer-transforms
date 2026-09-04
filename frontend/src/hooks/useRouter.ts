@@ -6,9 +6,18 @@ export type Route =
   | { view: "schemas"; catalog: string }
   | { view: "tables"; catalog: string; schema: string }
   | { view: "lineage"; table: string }
+  | { view: "tableLineage"; table?: string }
   | { view: "schemaLineage"; catalog: string; schema: string }
   | { view: "catalogLineage"; catalog: string }
-  | { view: "admin" };
+  | { view: "admin" }
+  | { view: "controlPanel" }
+  | { view: "dq"; table?: string }
+  | { view: "glossary" }
+  | { view: "notifications" }
+  | { view: "export" }
+  | { view: "rootCause" }
+  | { view: "biConsumers" }
+  | { view: "streaming" };
 
 const ROUTE_CHANGE_EVENT = "lineage-route-change";
 
@@ -16,6 +25,14 @@ function parseRoute(): Route {
   const params = new URLSearchParams(window.location.search);
 
   if (params.get("admin") === "true") return { view: "admin" };
+  if (params.get("controlPanel") === "true") return { view: "controlPanel" };
+
+  // Table Lineage workspace — checked before the bare `table` deep-link below so
+  // ?view=tableLineage&table=... opens the workspace, not the plain lineage graph.
+  if (params.get("view") === "tableLineage") {
+    const t = params.get("table");
+    return { view: "tableLineage", table: t && t.split(".").length === 3 ? t : undefined };
+  }
 
   const table = params.get("table");
   if (table && table.split(".").length === 3) {
@@ -43,6 +60,15 @@ function parseRoute(): Route {
     if (catalog) return { view: "catalogLineage", catalog };
   }
 
+  const viewParam = params.get("view");
+  if (viewParam === "dq") return { view: "dq", table: params.get("table") || undefined };
+  if (viewParam === "glossary") return { view: "glossary" };
+  if (viewParam === "notifications") return { view: "notifications" };
+  if (viewParam === "export") return { view: "export" };
+  if (viewParam === "rootCause") return { view: "rootCause" };
+  if (viewParam === "biConsumers") return { view: "biConsumers" };
+  if (viewParam === "streaming") return { view: "streaming" };
+
   return { view: "landing" };
 }
 
@@ -58,12 +84,34 @@ function routeToSearch(route: Route): string {
       return `?view=tables&catalog=${encodeURIComponent(route.catalog)}&schema=${encodeURIComponent(route.schema)}`;
     case "lineage":
       return `?table=${encodeURIComponent(route.table)}`;
+    case "tableLineage":
+      return route.table
+        ? `?view=tableLineage&table=${encodeURIComponent(route.table)}`
+        : "?view=tableLineage";
     case "schemaLineage":
       return `?view=schemaLineage&catalog=${encodeURIComponent(route.catalog)}&schema=${encodeURIComponent(route.schema)}`;
     case "catalogLineage":
       return `?view=catalogLineage&catalog=${encodeURIComponent(route.catalog)}`;
     case "admin":
       return "?admin=true";
+    case "controlPanel":
+      return "?controlPanel=true";
+    case "dq":
+      return route.table
+        ? `?view=dq&table=${encodeURIComponent(route.table)}`
+        : "?view=dq";
+    case "glossary":
+      return "?view=glossary";
+    case "notifications":
+      return "?view=notifications";
+    case "export":
+      return "?view=export";
+    case "rootCause":
+      return "?view=rootCause";
+    case "biConsumers":
+      return "?view=biConsumers";
+    case "streaming":
+      return "?view=streaming";
   }
 }
 
@@ -77,6 +125,16 @@ export function navigate(route: Route, replace = false) {
   }
   window.dispatchEvent(new CustomEvent(ROUTE_CHANGE_EVENT));
 }
+
+/** The URL for a route, for real links — `<a href>` and new-tab opens.
+ *
+ * Query-only, so it resolves against whatever path the app is served from
+ * (`navigate` does the same via `window.location.pathname`). Anything that opens
+ * a route in a NEW tab has to go through an href rather than `navigate`: a new
+ * document parses its route from the query string, and `history.pushState` only
+ * ever rewrites the current one.
+ */
+export const routeHref = (route: Route): string => routeToSearch(route) || "?";
 
 export function useRouter(): Route {
   const [route, setRoute] = useState<Route>(() => parseRoute());
@@ -100,7 +158,16 @@ export const goSchemas = (catalog: string) => navigate({ view: "schemas", catalo
 export const goTables = (catalog: string, schema: string) =>
   navigate({ view: "tables", catalog, schema });
 export const goLineage = (table: string) => navigate({ view: "lineage", table });
+export const goTableLineage = (table?: string) => navigate({ view: "tableLineage", table });
 export const goSchemaLineage = (catalog: string, schema: string) =>
   navigate({ view: "schemaLineage", catalog, schema });
 export const goCatalogLineage = (catalog: string) =>
   navigate({ view: "catalogLineage", catalog });
+export const goControlPanel = () => navigate({ view: "controlPanel" });
+export const goDQ = (table?: string) => navigate({ view: "dq", table });
+export const goGlossary = () => navigate({ view: "glossary" });
+export const goNotifications = () => navigate({ view: "notifications" });
+export const goExport = () => navigate({ view: "export" });
+export const goRootCause = () => navigate({ view: "rootCause" });
+export const goBiConsumers = () => navigate({ view: "biConsumers" });
+export const goStreaming = () => navigate({ view: "streaming" });

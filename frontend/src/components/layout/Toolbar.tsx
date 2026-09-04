@@ -1,10 +1,11 @@
 import { memo, useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { GitBranch, Search, ChevronDown, Columns3, Zap, Info, Lock, AlertTriangle, ArrowLeft, Percent, FolderTree, Layers, Download, SlidersHorizontal } from "lucide-react";
+import { Search, ChevronDown, Columns3, Zap, Info, Lock, AlertTriangle, ArrowLeft, Percent, FolderTree, Layers, Download, SlidersHorizontal } from "lucide-react";
 import { useLineageStore } from "../../store/lineageStore";
 import { api, setLiveMode } from "../../api/client";
 import { goLanding, goSchemas, goCatalogs } from "../../hooks/useRouter";
 import HeaderMenu from "./HeaderMenu";
+import ThemeToggle from "../ui/ThemeToggle";
 
 const VIEW_LABELS = { pipeline: "Pipelines", table: "Tables", full: "Full" } as const;
 
@@ -22,7 +23,10 @@ function Toolbar({ onGenerate }: Props) {
 
   const nodes = useLineageStore((s) => s.nodes);
   const truncated = useLineageStore((s) => s.truncated);
+  const graphWarnings = useLineageStore((s) => s.graphWarnings);
+  const healthWarning = useLineageStore((s) => s.healthWarning);
   const [toast, setToast] = useState<string | null>(null);
+  const [warningsDismissed, setWarningsDismissed] = useState(false);
   const orphanCount = useMemo(() => nodes.filter((n) => n.node_type === "table" && n.lineage_status === "orphan").length, [nodes]);
 
   // Whole-schema / whole-catalog lineage: no focused table, but a scope is active.
@@ -84,6 +88,9 @@ function Toolbar({ onGenerate }: Props) {
     return () => clearTimeout(t);
   }, [toast]);
 
+  // Reset banner dismiss whenever a new graph with fresh warnings loads
+  useEffect(() => { setWarningsDismissed(false); }, [graphWarnings]);
+
   useEffect(() => {
     api.getCatalogs().then((r) => setCatalogs(r.catalogs)).catch(console.error);
   }, [setCatalogs]);
@@ -131,12 +138,12 @@ function Toolbar({ onGenerate }: Props) {
         title="Back to home"
         aria-label="Back to home"
       >
-        <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-red-500 via-purple-500 to-blue-500 flex items-center justify-center shadow-[0_0_12px_rgba(255,54,33,0.3)]">
-          <GitBranch size={16} className="text-white" />
-        </div>
+        <span className="w-9 h-9 rounded-lg overflow-hidden inline-flex items-center justify-center shrink-0 shadow-[0_0_8px_rgba(255,85,32,0.45)]">
+          <img src="/bricktrace-logo.png" alt="" className="w-full h-full object-contain" />
+        </span>
         <div className="text-left">
           <div className="font-semibold text-[14px] text-white tracking-tight leading-none">
-            NEXUS Lineage
+            BrickTrace
           </div>
           <div className="text-[9px] text-slate-600 tracking-wider uppercase mt-0.5">
             Unity Catalog
@@ -157,9 +164,9 @@ function Toolbar({ onGenerate }: Props) {
       {focusTable ? (
         <>
           <button
-            onClick={() => setFocusTable(null)}
+            onClick={goLanding}
             className="flex items-center gap-1.5 px-2.5 py-1.5 flex-shrink-0 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] border border-white/[0.06] hover:border-white/[0.12] transition-all duration-200 group"
-            title="Back to search"
+            title="Back to home"
           >
             <ArrowLeft size={13} className="text-slate-500 group-hover:text-slate-300 transition-colors" />
             <span className="text-[11px] text-slate-500 group-hover:text-slate-300 font-medium transition-colors">Back</span>
@@ -417,7 +424,8 @@ function Toolbar({ onGenerate }: Props) {
         <Search size={14} className="text-slate-500" />
       </button>
 
-      {/* Shared menu */}
+      {/* Theme toggle + shared menu */}
+      <ThemeToggle />
       <HeaderMenu />
       </div>{/* end pinned right actions */}
     </motion.header>
@@ -470,11 +478,32 @@ function Toolbar({ onGenerate }: Props) {
       </div>
     )}
 
+    {/* R5: System-table / SP-grant health banner */}
+    {healthWarning && (
+      <div className="flex items-center justify-center gap-2 px-4 py-1 text-[10px] font-medium tracking-wide bg-red-500/10 text-red-400 border-b border-red-500/20">
+        <AlertTriangle size={10} className="flex-shrink-0" />
+        <span>{healthWarning}</span>
+      </div>
+    )}
+
     {/* Truncation banner — the trace hit the node cap, so the graph is partial */}
     {truncated && nodes.length > 0 && (
       <div className="flex items-center justify-center gap-2 px-4 py-1 text-[10px] font-medium tracking-wide bg-orange-500/10 text-orange-300 border-b border-orange-500/20">
         <AlertTriangle size={10} className="flex-shrink-0" />
         This lineage is very large and was capped — the graph shown is partial. Narrow your starting point to see a complete trace.
+      </div>
+    )}
+
+    {/* R3: Graph-warnings banner (C2–C5 diagnostics) */}
+    {graphWarnings && !warningsDismissed && Object.keys(graphWarnings).length > 0 && (
+      <div className="flex items-center gap-2 px-4 py-1 text-[10px] font-medium tracking-wide bg-yellow-500/10 text-yellow-300 border-b border-yellow-500/20">
+        <AlertTriangle size={10} className="flex-shrink-0" />
+        <span className="flex-1">Graph may be incomplete:{" "}
+          {Object.entries(graphWarnings).map(([code, msg]) => (
+            <span key={code} className="mr-3"><span className="opacity-60">{code}:</span> {String(msg)}</span>
+          ))}
+        </span>
+        <button onClick={() => setWarningsDismissed(true)} className="text-yellow-400/60 hover:text-yellow-300 ml-2 text-[12px] transition-colors">&times;</button>
       </div>
     )}
 
